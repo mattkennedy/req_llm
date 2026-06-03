@@ -1149,7 +1149,7 @@ defmodule ReqLLM.Providers.Google do
           all_tools = builtin_tools ++ user_tools
 
           %{tools: all_tools}
-          |> maybe_put(:toolConfig, tool_config)
+          |> maybe_put(:toolConfig, maybe_enable_server_side_tools(tool_config, builtin_tools))
 
         _ ->
           case builtin_tools do
@@ -1650,6 +1650,19 @@ defmodule ReqLLM.Providers.Google do
   defp build_google_tool_config("auto"), do: %{functionCallingConfig: %{mode: "AUTO"}}
   defp build_google_tool_config("none"), do: %{functionCallingConfig: %{mode: "NONE"}}
   defp build_google_tool_config(_), do: nil
+
+  # Gemini rejects built-in tools (Search grounding / URL context) combined with
+  # function calling unless toolConfig.includeServerSideToolInvocations is set,
+  # 400-ing with "Please enable tool_config.include_server_side_tool_invocations
+  # to use Built-in tools with Function calling." When both coexist, set the
+  # flag (merging into any tool_choice-derived config). Built-in-only requests
+  # don't need it, so leave their toolConfig untouched.
+  defp maybe_enable_server_side_tools(tool_config, []), do: tool_config
+
+  defp maybe_enable_server_side_tools(tool_config, _builtin_tools) do
+    (tool_config || %{})
+    |> Map.put(:includeServerSideToolInvocations, true)
+  end
 
   defp build_grounding_tools(nil), do: []
   defp build_grounding_tools(%{enable: true}), do: [%{google_search: %{}}]
