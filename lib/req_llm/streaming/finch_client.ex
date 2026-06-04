@@ -200,7 +200,13 @@ defmodule ReqLLM.Streaming.FinchClient do
                  :ok,
                  finch_stream_callback,
                  receive_timeout: receive_timeout,
-                 max_retries: Keyword.get(opts, :max_retries, 3)
+                 max_retries: Keyword.get(opts, :max_retries, 3),
+                 max_retry_after_ms:
+                   Keyword.get(
+                     opts,
+                     :max_retry_after_ms,
+                     Application.get_env(:req_llm, :max_retry_after_ms, :infinity)
+                   )
                ) do
             {:ok, _} ->
               :ok

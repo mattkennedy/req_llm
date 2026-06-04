@@ -7,6 +7,13 @@ defmodule ReqLLM.Streaming.Retry do
   This avoids duplicating partial model output when a stream has already begun.
 
   Also handles 429 rate limit errors with retry-after header support.
+
+  A 429 whose `Retry-After` exceeds `:max_retry_after_ms` (default `:infinity`,
+  i.e. no cap) is not slept through: the structured rate-limit error is delivered
+  immediately so the caller can decide, rather than blocking the streaming
+  process for the full provider-dictated wait. This matters when the caller has a
+  shorter deadline than the provider's `Retry-After` — otherwise the caller times
+  out mid-sleep and the honored backoff is wasted.
   """
 
   require Logger
@@ -29,6 +36,7 @@ defmodule ReqLLM.Streaming.Retry do
         ) :: {:ok, callback_acc()} | {:error, term(), callback_acc()}
   def stream(request, finch_name, acc, callback, opts, stream_fun \\ &Finch.stream/5) do
     max_retries = Keyword.get(opts, :max_retries, 3)
+    max_retry_after_ms = Keyword.get(opts, :max_retry_after_ms, :infinity)
     stream_opts = Keyword.take(opts, [:receive_timeout])
 
     do_stream(
@@ -39,7 +47,8 @@ defmodule ReqLLM.Streaming.Retry do
         callback: callback,
         stream_opts: stream_opts,
         stream_fun: stream_fun,
-        max_retries: max_retries
+        max_retries: max_retries,
+        max_retry_after_ms: max_retry_after_ms
       },
       0
     )
@@ -92,8 +101,14 @@ defmodule ReqLLM.Streaming.Retry do
     end
   end
 
-  defp maybe_retry(%{max_retries: max_retries} = params, attempt, callback_acc, reason, state) do
-    case classify_error(reason, state) do
+  defp maybe_retry(
+         %{max_retries: max_retries, max_retry_after_ms: cap, callback: callback} = params,
+         attempt,
+         callback_acc,
+         reason,
+         state
+       ) do
+    case classify_error(reason, state, cap) do
       {:retry, delay_ms} ->
         log_retry(reason, attempt + 1, max_retries, delay_ms)
 
@@ -102,6 +117,10 @@ defmodule ReqLLM.Streaming.Retry do
         end
 
         do_stream(params, attempt + 1)
+
+      {:rate_limit_too_long, delay_ms} ->
+        log_rate_limit_giveup(delay_ms, cap)
+        deliver_rate_limit_failure(state, callback)
 
       :no_retry ->
         {:error, reason, callback_acc}
@@ -146,21 +165,33 @@ defmodule ReqLLM.Streaming.Retry do
     %{wrapped_acc | callback_acc: callback.(event, callback_acc)}
   end
 
-  defp classify_error(%Mint.TransportError{reason: reason}, _state)
+  defp classify_error(%Mint.TransportError{reason: reason}, _state, _cap)
        when reason in @retryable_reasons,
        do: {:retry, 0}
 
-  defp classify_error(%Req.TransportError{reason: reason}, _state)
+  defp classify_error(%Req.TransportError{reason: reason}, _state, _cap)
        when reason in @retryable_reasons,
        do: {:retry, 0}
 
-  defp classify_error(_reason, %{status: 429} = state) do
-    {:retry, extract_retry_after_delay(state.headers)}
+  defp classify_error(_reason, %{status: 429} = state, cap) do
+    delay = extract_retry_after_delay(state.headers)
+
+    # A provider may ask us to wait minutes. If that exceeds the caller's budget
+    # (`cap`), don't sleep through it — surface the 429 now so the caller isn't
+    # left blocked past its own deadline (where the sleep is wasted anyway).
+    if exceeds_cap?(delay, cap) do
+      {:rate_limit_too_long, delay}
+    else
+      {:retry, delay}
+    end
   end
 
-  defp classify_error(_reason, _state) do
+  defp classify_error(_reason, _state, _cap) do
     :no_retry
   end
+
+  defp exceeds_cap?(_delay, :infinity), do: false
+  defp exceeds_cap?(delay, cap) when is_integer(cap), do: delay > cap
 
   defp extract_retry_after_delay(headers) when is_list(headers) do
     retry_after =
@@ -242,6 +273,13 @@ defmodule ReqLLM.Streaming.Retry do
       {:ok, decoded} -> decoded
       {:error, _} -> body
     end
+  end
+
+  defp log_rate_limit_giveup(delay_ms, cap) do
+    Logger.warning(
+      "Rate limited (429): Retry-After #{delay_ms}ms exceeds max_retry_after_ms #{cap}ms; " <>
+        "surfacing the error instead of waiting"
+    )
   end
 
   defp log_retry(reason, attempt, max_retries, delay_ms) do

@@ -210,4 +210,66 @@ defmodule ReqLLM.Streaming.RetryTest do
              :done
            ]
   end
+
+  test "delivers the 429 immediately when Retry-After exceeds max_retry_after_ms" do
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+    stream_fun = fn _request, _finch_name, acc, callback, _opts ->
+      Agent.update(counter, &(&1 + 1))
+      acc = callback.({:status, 429}, acc)
+      acc = callback.({:headers, [{"retry-after", "300"}]}, acc)
+      {:ok, acc}
+    end
+
+    callback = fn event, acc -> [event | acc] end
+
+    # 300s Retry-After but only a 5s budget: surface the rate-limit error now
+    # rather than sleeping through it, and don't consume the remaining retries.
+    assert {:error, %ReqLLM.Error.API.Request{status: 429}, _events} =
+             Retry.stream(
+               Finch.build(:post, "https://example.com/stream"),
+               ReqLLM.Finch,
+               [],
+               callback,
+               [max_retries: 3, max_retry_after_ms: 5_000],
+               stream_fun
+             )
+
+    assert Agent.get(counter, & &1) == 1
+  end
+
+  test "still retries a 429 whose Retry-After is within max_retry_after_ms" do
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+    stream_fun = fn _request, _finch_name, acc, callback, _opts ->
+      attempt = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
+
+      case attempt do
+        1 ->
+          acc = callback.({:status, 429}, acc)
+          acc = callback.({:headers, [{"retry-after", "0"}]}, acc)
+          {:ok, acc}
+
+        2 ->
+          acc = callback.({:status, 200}, acc)
+          acc = callback.({:data, "ok"}, acc)
+          acc = callback.(:done, acc)
+          {:ok, acc}
+      end
+    end
+
+    callback = fn event, acc -> [event | acc] end
+
+    assert {:ok, _events} =
+             Retry.stream(
+               Finch.build(:post, "https://example.com/stream"),
+               ReqLLM.Finch,
+               [],
+               callback,
+               [max_retries: 3, max_retry_after_ms: 5_000],
+               stream_fun
+             )
+
+    assert Agent.get(counter, & &1) == 2
+  end
 end
