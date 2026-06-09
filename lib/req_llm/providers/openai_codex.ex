@@ -108,6 +108,12 @@ defmodule ReqLLM.Providers.OpenAICodex do
     verbosity: [
       type: {:or, [:atom, :string]},
       doc: "Text verbosity. Defaults to medium."
+    ],
+    web_search: [
+      type: {:or, [:boolean, :map]},
+      doc:
+        "Enable the server-side `web_search` builtin tool. `true` for defaults, or a map " <>
+          "like %{mode: :cached | :live} (cached = OpenAI's indexed snapshot, live = fresh fetch)."
     ]
   ]
 
@@ -415,8 +421,32 @@ defmodule ReqLLM.Providers.OpenAICodex do
     |> Map.put("include", ["reasoning.encrypted_content"])
     |> Map.put_new("text", %{"verbosity" => normalize_codex_verbosity(provider_opts[:verbosity])})
     |> Map.put("instructions", instructions)
+    |> maybe_put_web_search(provider_opts[:web_search])
     |> maybe_put_parallel_tool_calls(provider_opts[:openai_parallel_tool_calls])
   end
+
+  # Append the server-side `web_search` builtin to the request `tools` array.
+  # The Codex backend honors the same hosted tool the Codex CLI uses; `tools`
+  # is otherwise empty for jidoka turns (it drives operations via its JSON
+  # protocol, not native function tools), so this is normally the only entry.
+  # `external_web_access`: false = cached snapshot (CLI default), true = live fetch.
+  defp maybe_put_web_search(body, nil), do: body
+  defp maybe_put_web_search(body, false), do: body
+
+  defp maybe_put_web_search(body, web_search) do
+    tool = encode_web_search_tool(web_search)
+    Map.put(body, "tools", List.wrap(body["tools"]) ++ [tool])
+  end
+
+  defp encode_web_search_tool(opts) when is_map(opts) do
+    case Map.get(opts, :mode) do
+      :live -> %{"type" => "web_search", "external_web_access" => true}
+      :cached -> %{"type" => "web_search", "external_web_access" => false}
+      _ -> %{"type" => "web_search"}
+    end
+  end
+
+  defp encode_web_search_tool(_), do: %{"type" => "web_search"}
 
   defp ensure_provider_options(opts) when is_list(opts),
     do: Keyword.put_new(opts, :provider_options, [])

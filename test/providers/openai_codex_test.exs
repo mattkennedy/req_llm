@@ -73,6 +73,27 @@ defmodule ReqLLM.Providers.OpenAICodexTest do
     end
   end
 
+  describe "web_search tool injection" do
+    test "live mode sets external_web_access true" do
+      assert [tool] = web_search_tools(encoded_body(web_search: %{mode: :live}))
+      assert tool == %{"type" => "web_search", "external_web_access" => true}
+    end
+
+    test "cached mode sets external_web_access false" do
+      assert [tool] = web_search_tools(encoded_body(web_search: %{mode: :cached}))
+      assert tool == %{"type" => "web_search", "external_web_access" => false}
+    end
+
+    test "bare true enables the tool with backend default access" do
+      assert [%{"type" => "web_search"} = tool] = web_search_tools(encoded_body(web_search: true))
+      refute Map.has_key?(tool, "external_web_access")
+    end
+
+    test "no web_search option leaves tools without a web_search entry" do
+      assert [] = web_search_tools(encoded_body([]))
+    end
+  end
+
   describe "attach_stream/4" do
     test "builds SSE request against codex backend with combined instructions" do
       {:ok, model} = ReqLLM.model("openai_codex:gpt-5.3-codex-spark")
@@ -373,4 +394,19 @@ defmodule ReqLLM.Providers.OpenAICodexTest do
   defp future_expiry do
     System.system_time(:millisecond) + 60_000
   end
+
+  defp encoded_body(provider_options) do
+    {:ok, model} = ReqLLM.model("openai_codex:gpt-5.3-codex-spark")
+
+    {:ok, request} =
+      OpenAICodex.prepare_request(:chat, model, "Who funded Acme in 2026?",
+        provider_options:
+          [auth_mode: :oauth, access_token: jwt_with_account_id("acct_123")] ++ provider_options
+      )
+
+    OpenAICodex.encode_body(request).body |> Jason.decode!()
+  end
+
+  defp web_search_tools(body),
+    do: Enum.filter(body["tools"] || [], &(&1["type"] == "web_search"))
 end
