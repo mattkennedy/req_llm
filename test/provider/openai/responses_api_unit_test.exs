@@ -1594,6 +1594,70 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert detail.provider_data == %{"id" => "rs_123", "type" => "reasoning"}
     end
 
+    test "surfaces web_search url_citation annotations on provider_meta", %{model: model} do
+      event = %{
+        data: %{
+          "event" => "response.completed",
+          "response" => %{
+            "id" => "resp_123",
+            "output" => [
+              %{"id" => "ws_1", "type" => "web_search_call", "status" => "completed"},
+              %{
+                "type" => "message",
+                "content" => [
+                  %{
+                    "type" => "output_text",
+                    "text" => "Elixir 1.18 shipped in December 2024.",
+                    "annotations" => [
+                      %{
+                        "type" => "url_citation",
+                        "url" => "https://elixir-lang.org/blog/2024/12/19/elixir-v1-18-0-released/",
+                        "title" => "Elixir v1.18 released",
+                        "start_index" => 0,
+                        "end_index" => 37
+                      },
+                      %{"type" => "file_citation", "file_id" => "file_xyz"}
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      }
+
+      assert [chunk] = ResponsesAPI.decode_stream_event(event, model)
+      assert chunk.type == :meta
+
+      assert chunk.metadata.provider_meta.citations == [
+               %{
+                 url: "https://elixir-lang.org/blog/2024/12/19/elixir-v1-18-0-released/",
+                 title: "Elixir v1.18 released",
+                 start_index: 0,
+                 end_index: 37
+               }
+             ]
+    end
+
+    test "omits citations key when completed event has no url_citation annotations", %{
+      model: model
+    } do
+      event = %{
+        data: %{
+          "event" => "response.completed",
+          "response" => %{
+            "id" => "resp_123",
+            "output" => [
+              %{"type" => "message", "content" => [%{"type" => "output_text", "text" => "Hi"}]}
+            ]
+          }
+        }
+      }
+
+      assert [chunk] = ResponsesAPI.decode_stream_event(event, model)
+      refute Map.has_key?(Map.get(chunk.metadata, :provider_meta, %{}), :citations)
+    end
+
     test "decodes incomplete event", %{model: model} do
       event = %{data: %{"event" => "response.incomplete", "reason" => "length"}}
 

@@ -268,7 +268,63 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
     meta = merge_response_provider_meta(meta, data["response"] || %{})
 
+    meta = maybe_put_citations(meta, extract_url_citations(response_output))
+
     [ReqLLM.StreamChunk.meta(meta)]
+  end
+
+  # Web-search `url_citation` annotations ride on the assistant message's
+  # `output_text` content parts. The default response builder concatenates text
+  # and drops per-part metadata, so the cited URLs would otherwise be lost.
+  # Surface them on `provider_meta[:citations]` instead — the one bag that
+  # survives intact into the final `Response` (see `merge_response_provider_meta`).
+  defp extract_url_citations(output) when is_list(output) do
+    output
+    |> Enum.flat_map(&message_content_parts/1)
+    |> Enum.flat_map(&part_annotations/1)
+    |> Enum.filter(&(annotation_type(&1) == "url_citation"))
+    |> Enum.map(&normalize_url_citation/1)
+    |> Enum.uniq()
+  end
+
+  defp extract_url_citations(_), do: []
+
+  defp message_content_parts(%{"type" => "message", "content" => content}) when is_list(content),
+    do: content
+
+  defp message_content_parts(%{type: "message", content: content}) when is_list(content),
+    do: content
+
+  defp message_content_parts(_), do: []
+
+  defp part_annotations(part) when is_map(part) do
+    case part["annotations"] || part[:annotations] do
+      annotations when is_list(annotations) -> annotations
+      _ -> []
+    end
+  end
+
+  defp part_annotations(_), do: []
+
+  defp annotation_type(annotation) when is_map(annotation),
+    do: annotation["type"] || annotation[:type]
+
+  defp annotation_type(_), do: nil
+
+  defp normalize_url_citation(annotation) do
+    %{
+      url: annotation["url"] || annotation[:url],
+      title: annotation["title"] || annotation[:title],
+      start_index: annotation["start_index"] || annotation[:start_index],
+      end_index: annotation["end_index"] || annotation[:end_index]
+    }
+  end
+
+  defp maybe_put_citations(meta, []), do: meta
+
+  defp maybe_put_citations(meta, citations) do
+    provider_meta = Map.get(meta, :provider_meta, %{})
+    Map.put(meta, :provider_meta, Map.put(provider_meta, :citations, citations))
   end
 
   defp maybe_put_reasoning_details(meta, []), do: meta
