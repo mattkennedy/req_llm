@@ -289,34 +289,29 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
   defp extract_url_citations(_), do: []
 
+  # `output` comes from `get_in(data, ["response", "output"])` — always
+  # JSON-decoded string keys, matching the sibling `assistant_message_segment?`
+  # walker. Match string keys only (no atom fallback) so a future key-shape
+  # change fails loud here instead of silently yielding zero citations.
   defp message_content_parts(%{"type" => "message", "content" => content}) when is_list(content),
-    do: content
-
-  defp message_content_parts(%{type: "message", content: content}) when is_list(content),
     do: content
 
   defp message_content_parts(_), do: []
 
-  defp part_annotations(part) when is_map(part) do
-    case part["annotations"] || part[:annotations] do
-      annotations when is_list(annotations) -> annotations
-      _ -> []
-    end
-  end
+  defp part_annotations(%{"annotations" => annotations}) when is_list(annotations),
+    do: annotations
 
   defp part_annotations(_), do: []
 
-  defp annotation_type(annotation) when is_map(annotation),
-    do: annotation["type"] || annotation[:type]
-
+  defp annotation_type(%{"type" => type}), do: type
   defp annotation_type(_), do: nil
 
   defp normalize_url_citation(annotation) do
     %{
-      url: annotation["url"] || annotation[:url],
-      title: annotation["title"] || annotation[:title],
-      start_index: annotation["start_index"] || annotation[:start_index],
-      end_index: annotation["end_index"] || annotation[:end_index]
+      url: annotation["url"],
+      title: annotation["title"],
+      start_index: annotation["start_index"],
+      end_index: annotation["end_index"]
     }
   end
 

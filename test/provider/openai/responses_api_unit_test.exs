@@ -1611,7 +1611,8 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
                     "annotations" => [
                       %{
                         "type" => "url_citation",
-                        "url" => "https://elixir-lang.org/blog/2024/12/19/elixir-v1-18-0-released/",
+                        "url" =>
+                          "https://elixir-lang.org/blog/2024/12/19/elixir-v1-18-0-released/",
                         "title" => "Elixir v1.18 released",
                         "start_index" => 0,
                         "end_index" => 37

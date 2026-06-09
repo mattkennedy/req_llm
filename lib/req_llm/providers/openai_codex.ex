@@ -434,8 +434,15 @@ defmodule ReqLLM.Providers.OpenAICodex do
   defp maybe_put_web_search(body, false), do: body
 
   defp maybe_put_web_search(body, web_search) do
-    tool = encode_web_search_tool(web_search)
-    Map.put(body, "tools", List.wrap(body["tools"]) ++ [tool])
+    tools = List.wrap(body["tools"])
+
+    # `ResponsesAPI.build_request_body` already injects a web_search entry for
+    # deep_research-category models; don't add a second one.
+    if Enum.any?(tools, &(is_map(&1) and (&1["type"] || &1[:type]) == "web_search")) do
+      body
+    else
+      Map.put(body, "tools", tools ++ [encode_web_search_tool(web_search)])
+    end
   end
 
   defp encode_web_search_tool(opts) when is_map(opts) do
