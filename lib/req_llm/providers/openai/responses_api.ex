@@ -672,7 +672,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     store = Keyword.get(provider_opts, :store, default_store(model_name))
 
     previous_response_id =
-      if store != false do
+      if include_previous_response_id?(store, opts_map) do
         provider_opts[:previous_response_id] ||
           extract_previous_response_id_from_context(context)
       end
@@ -772,7 +772,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       if previous_response_id do
         body
         |> Map.put("previous_response_id", previous_response_id)
-        |> Map.put("store", true)
+        |> maybe_put_store_true(store)
       else
         body
       end
@@ -783,6 +783,13 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       body
     end
   end
+
+  defp include_previous_response_id?(false, %{responses_transport: :websocket}), do: true
+  defp include_previous_response_id?(false, _opts), do: false
+  defp include_previous_response_id?(_store, _opts), do: true
+
+  defp maybe_put_store_true(body, false), do: body
+  defp maybe_put_store_true(body, _store), do: Map.put(body, "store", true)
 
   defp default_store(model_name) do
     !ReqLLM.Providers.OpenAI.AdapterHelpers.codex_model?(model_name)
@@ -911,6 +918,18 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   end
 
   defp encode_input_content_part(
+         %ReqLLM.Message.ContentPart{type: :file, file_id: file_id, filename: filename},
+         _type
+       )
+       when is_binary(file_id) and file_id != "" do
+    file =
+      %{"type" => "input_file", "file_id" => file_id}
+      |> maybe_put_string("filename", filename)
+
+    [file]
+  end
+
+  defp encode_input_content_part(
          %ReqLLM.Message.ContentPart{
            type: :file,
            data: data,
@@ -1020,6 +1039,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       |> Keyword.delete(:compiled_schema)
       |> Keyword.put(:provider_options, Keyword.get(opts, :provider_options, []))
       |> Keyword.put(:stream, nil)
+      |> Keyword.put(:responses_transport, :websocket)
       |> Keyword.put(:model, model.id)
       |> Keyword.put(:context, context)
       |> Keyword.put(
@@ -1401,8 +1421,6 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       }
     end)
   end
-
-  defp encode_tool_outputs(_), do: []
 
   defp encode_tool_calls_as_function_calls(tool_calls) do
     tool_calls

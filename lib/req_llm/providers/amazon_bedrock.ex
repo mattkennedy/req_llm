@@ -380,7 +380,7 @@ defmodule ReqLLM.Providers.AmazonBedrock do
         # Otherwise use Converse formatter directly
         formatter =
           if function_exported?(family_formatter, :requires_converse_api?, 0) and
-               family_formatter.requires_converse_api?() do
+               call_formatter(family_formatter, :requires_converse_api?, []) do
             family_formatter
           else
             ReqLLM.Providers.AmazonBedrock.Converse
@@ -564,7 +564,7 @@ defmodule ReqLLM.Providers.AmazonBedrock do
         # Otherwise use Converse formatter directly
         formatter =
           if function_exported?(family_formatter, :requires_converse_api?, 0) and
-               family_formatter.requires_converse_api?() do
+               call_formatter(family_formatter, :requires_converse_api?, []) do
             family_formatter
           else
             ReqLLM.Providers.AmazonBedrock.Converse
@@ -728,9 +728,10 @@ defmodule ReqLLM.Providers.AmazonBedrock do
   defp maybe_translate_reasoning_params(model, opts) do
     model_id = model.provider_model_id || model.id
 
-    # Check if this is a Claude model with reasoning capability
     is_claude = String.contains?(model_id, "anthropic.claude")
-    has_reasoning = ModelHelpers.reasoning_enabled?(model)
+
+    has_reasoning =
+      ModelHelpers.reasoning_enabled?(model) or ModelHelpers.adaptive_thinking_required?(model)
 
     if is_claude and has_reasoning do
       {reasoning_effort, opts} = Keyword.pop(opts, :reasoning_effort)
@@ -738,20 +739,16 @@ defmodule ReqLLM.Providers.AmazonBedrock do
 
       cond do
         reasoning_budget && is_integer(reasoning_budget) ->
-          # Explicit budget_tokens provided
-          PlatformReasoning.add_reasoning_to_additional_fields(opts, reasoning_budget)
+          PlatformReasoning.add_reasoning_to_additional_fields(opts, reasoning_budget, model)
 
         reasoning_effort && reasoning_effort != :none ->
-          # Map effort to budget using canonical Anthropic mappings
           budget = Anthropic.map_reasoning_effort_to_budget(reasoning_effort)
-          PlatformReasoning.add_reasoning_to_additional_fields(opts, budget)
+          PlatformReasoning.add_reasoning_to_additional_fields(opts, budget, model)
 
         true ->
-          # No reasoning params or :none (disable reasoning)
           opts
       end
     else
-      # Not a Claude reasoning model, pass through
       opts
     end
   end
@@ -778,7 +775,7 @@ defmodule ReqLLM.Providers.AmazonBedrock do
     formatter = get_formatter_module(model_family)
 
     if function_exported?(formatter, :extract_usage, 2) do
-      formatter.extract_usage(body, model)
+      call_formatter(formatter, :extract_usage, [body, model])
     else
       {:error, :no_usage_extractor}
     end
@@ -894,7 +891,6 @@ defmodule ReqLLM.Providers.AmazonBedrock do
   defp extract_region(aws_creds) do
     case aws_creds do
       %{region: r} when is_binary(r) -> r
-      %AWSAuth.Credentials{region: r} when is_binary(r) -> r
       _ -> "us-east-1"
     end
   end
@@ -1199,12 +1195,16 @@ defmodule ReqLLM.Providers.AmazonBedrock do
       model_family = req.options[:model_family]
       formatter = Map.get(@embedding_families, model_family)
 
-      case formatter.parse_embedding_response(parsed_body) do
-        {:ok, normalized_response} ->
-          {req, inject_usage_from_headers(%{resp | body: normalized_response})}
+      if function_exported?(formatter, :parse_embedding_response, 1) do
+        case call_formatter(formatter, :parse_embedding_response, [parsed_body]) do
+          {:ok, normalized_response} ->
+            {req, inject_usage_from_headers(%{resp | body: normalized_response})}
 
-        {:error, error} ->
-          {req, error}
+          {:error, error} ->
+            {req, error}
+        end
+      else
+        {req, ReqLLM.Error.API.Response.exception(reason: "Unsupported embedding model family")}
       end
     end
   end
@@ -1276,6 +1276,10 @@ defmodule ReqLLM.Providers.AmazonBedrock do
     end
   end
 
+  defp call_formatter(formatter, function, args) do
+    apply(formatter, function, args)
+  end
+
   # Private helper: Determine whether to use Converse API with caching optimization
   defp determine_use_converse(model_id, opts) do
     # Check if model's formatter requires Converse API
@@ -1284,7 +1288,7 @@ defmodule ReqLLM.Providers.AmazonBedrock do
 
     requires_converse =
       function_exported?(formatter, :requires_converse_api?, 0) &&
-        formatter.requires_converse_api?()
+        call_formatter(formatter, :requires_converse_api?, [])
 
     # Check if formatter is Converse (fallback for unsupported families)
     is_fallback_to_converse = formatter == ReqLLM.Providers.AmazonBedrock.Converse

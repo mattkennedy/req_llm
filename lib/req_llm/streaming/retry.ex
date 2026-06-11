@@ -37,7 +37,9 @@ defmodule ReqLLM.Streaming.Retry do
   def stream(request, finch_name, acc, callback, opts, stream_fun \\ &Finch.stream/5) do
     max_retries = Keyword.get(opts, :max_retries, 3)
     max_retry_after_ms = Keyword.get(opts, :max_retry_after_ms, :infinity)
-    stream_opts = Keyword.take(opts, [:receive_timeout])
+
+    stream_opts =
+      Keyword.take(opts, [:pool_timeout, :receive_timeout, :request_timeout, :pool_strategy])
 
     do_stream(
       %{
@@ -172,6 +174,8 @@ defmodule ReqLLM.Streaming.Retry do
   defp classify_error(%Req.TransportError{reason: reason}, _state, _cap)
        when reason in @retryable_reasons,
        do: {:retry, 0}
+
+  defp classify_error(%Finch.Error{reason: :pool_not_available}, _state, _cap), do: {:retry, 250}
 
   defp classify_error(_reason, %{status: 429} = state, cap) do
     delay = extract_retry_after_delay(state.headers)

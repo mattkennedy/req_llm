@@ -564,6 +564,29 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
       assert request.url.path =~ "/model/cohere.embed-english-v3/invoke"
     end
 
+    test "preserves inference profile prefix for Cohere embedding model" do
+      warning =
+        ExUnit.CaptureIO.capture_io(:stderr, fn ->
+          send(self(), {:model_result, ReqLLM.model("amazon-bedrock:global.cohere.embed-v4:0")})
+        end)
+
+      assert warning =~ "Using unverified model: amazon_bedrock:global.cohere.embed-v4:0"
+      assert_received {:model_result, {:ok, model}}
+
+      text = "Hello, world!"
+
+      opts = [
+        access_key_id: "AKIATEST",
+        secret_access_key: "secretTEST",
+        region: "us-east-1"
+      ]
+
+      {:ok, request} = AmazonBedrock.prepare_request(:embedding, model, text, opts)
+
+      assert model.provider_model_id == "global.cohere.embed-v4:0"
+      assert request.url.path == "/model/global.cohere.embed-v4:0/invoke"
+    end
+
     test "includes text in Cohere format" do
       {:ok, model} = ReqLLM.model("amazon-bedrock:cohere.embed-english-v3")
       text = "Test embedding text"
@@ -796,6 +819,60 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
       {:error, error} = Cohere.parse_embedding_response("not a map")
 
       assert %ReqLLM.Error.API.Response{} = error
+    end
+  end
+
+  describe "adaptive thinking for hosted Claude models" do
+    test "encodes adaptive thinking when sparse Opus platform metadata requests reasoning" do
+      model = %LLMDB.Model{
+        id: "anthropic.claude-opus-4-7-v1:0",
+        model: "anthropic.claude-opus-4-7-v1:0",
+        provider: :amazon_bedrock,
+        provider_model_id: "us.anthropic.claude-opus-4-7-v1:0",
+        capabilities: %{chat: true, reasoning: %{enabled: true}},
+        extra: %{family: "claude-opus"}
+      }
+
+      context = Context.new([Context.user("Hello")])
+
+      opts = [
+        access_key_id: "AKIATEST",
+        secret_access_key: "secretTEST",
+        region: "us-east-1",
+        max_tokens: 2000,
+        reasoning_effort: :high
+      ]
+
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+
+      body = ReqLLM.Test.Helpers.json_body(request)
+      assert body["thinking"] == %{"display" => "summarized", "type" => "adaptive"}
+      assert request.url.path == "/model/us.anthropic.claude-opus-4-7-v1:0/invoke"
+    end
+
+    test "does not auto-enable adaptive thinking without reasoning params" do
+      model = %LLMDB.Model{
+        id: "anthropic.claude-opus-4-7-v1:0",
+        model: "anthropic.claude-opus-4-7-v1:0",
+        provider: :amazon_bedrock,
+        provider_model_id: "us.anthropic.claude-opus-4-7-v1:0",
+        capabilities: %{chat: true, reasoning: %{enabled: true}},
+        extra: %{family: "claude-opus"}
+      }
+
+      context = Context.new([Context.user("Hello")])
+
+      opts = [
+        access_key_id: "AKIATEST",
+        secret_access_key: "secretTEST",
+        region: "us-east-1",
+        max_tokens: 2000
+      ]
+
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+
+      body = ReqLLM.Test.Helpers.json_body(request)
+      refute Map.has_key?(body, "thinking")
     end
   end
 

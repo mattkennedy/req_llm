@@ -34,6 +34,8 @@ defmodule ReqLLM.ModelHelpers do
     {:chat?, [:chat]}
   ]
 
+  @bedrock_inference_prefixes ~w(us eu ap apac ca au jp us-gov global)
+
   for {function_name, path} <- @capability_checks do
     path_str = Enum.map_join(path, ".", &to_string/1)
     example_path = Enum.map_join(path, ": %{", fn key -> "#{key}" end)
@@ -76,4 +78,96 @@ defmodule ReqLLM.ModelHelpers do
     |> Enum.map(fn {name, _path} -> name end)
     |> Enum.sort()
   end
+
+  @doc """
+  Check if the model's thinking request must use the `adaptive` type.
+
+  Used to select the correct `type: "adaptive"` form for models that do not support
+  the standard `enabled` thinking type.
+
+  ## Examples
+
+      iex> model = %LLMDB.Model{extra: %{capabilities: %{thinking: %{types: %{adaptive: %{supported: true}, enabled: %{supported: false}}}}}}
+      iex> ReqLLM.ModelHelpers.adaptive_thinking_required?(model)
+      true
+  """
+  def adaptive_thinking_required?(%LLMDB.Model{} = model) do
+    adaptive_thinking_metadata?(model.extra) or
+      hosted_anthropic_adaptive_thinking_required?(model)
+  end
+
+  def adaptive_thinking_required?(_), do: false
+
+  defp hosted_anthropic_adaptive_thinking_required?(%LLMDB.Model{} = model) do
+    model
+    |> hosted_anthropic_model_ids()
+    |> Enum.any?(&native_anthropic_adaptive_thinking_required?/1)
+  end
+
+  defp native_anthropic_adaptive_thinking_required?(model_id) do
+    case LLMDB.model(:anthropic, model_id) do
+      {:ok, %LLMDB.Model{} = model} -> adaptive_thinking_metadata?(model.extra)
+      _ -> false
+    end
+  end
+
+  defp adaptive_thinking_metadata?(extra) do
+    adaptive_supported =
+      nested_value(extra, [:capabilities, :thinking, :types, :adaptive, :supported]) == true
+
+    enabled_supported =
+      nested_value(extra, [:capabilities, :thinking, :types, :enabled, :supported])
+
+    adaptive_supported and enabled_supported == false
+  end
+
+  defp hosted_anthropic_model_ids(model) do
+    [model.provider_model_id, model.id, model.model]
+    |> Enum.filter(&is_binary/1)
+    |> Enum.flat_map(&native_anthropic_model_id_candidates/1)
+    |> Enum.uniq()
+  end
+
+  defp native_anthropic_model_id_candidates(model_id) do
+    normalized =
+      model_id
+      |> strip_bedrock_inference_prefix()
+      |> strip_bedrock_anthropic_prefix()
+      |> strip_vertex_revision()
+      |> strip_bedrock_version_suffix()
+
+    [normalized]
+  end
+
+  defp strip_bedrock_inference_prefix(model_id) do
+    case String.split(model_id, ".", parts: 2) do
+      [prefix, rest] when prefix in @bedrock_inference_prefixes -> rest
+      _ -> model_id
+    end
+  end
+
+  defp strip_bedrock_anthropic_prefix("anthropic." <> model_id), do: model_id
+  defp strip_bedrock_anthropic_prefix(model_id), do: model_id
+
+  defp strip_vertex_revision(model_id) do
+    model_id
+    |> String.split("@", parts: 2)
+    |> hd()
+  end
+
+  defp strip_bedrock_version_suffix(model_id) do
+    Regex.replace(~r/-v\d(?::\d)?$/, model_id, "")
+  end
+
+  defp nested_value(value, []), do: value
+
+  defp nested_value(value, [key | rest]) when is_map(value) do
+    cond do
+      Map.has_key?(value, key) -> nested_value(Map.get(value, key), rest)
+      Map.has_key?(value, to_string(key)) -> nested_value(Map.get(value, to_string(key)), rest)
+      true -> nil
+    end
+  end
+
+  defp nested_value(_value, _path), do: nil
 end

@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- changelog -->
 
+## [v1.15.0](https://github.com/agentjido/req_llm/compare/v1.14.0...v1.15.0) (2026-06-09)
+
+
+
+
+### Features:
+
+* anthropic: support adaptive thinking for hosted Claude by dl-alexandre
+
+* add thinking and reasoning options to deepseek (#754) by Bill Huang
+
+* google-vertex: grammar-constrained structured output for Claude via output_config.format by Arthur Valingot
+
+* anthropic: honor explicit cache_control from ContentPart metadata by Arthur Valingot
+
+### Bug Fixes:
+
+* google: pass thinking config to Gemini image generation (#757) by Shawn Vo
+
+* ci: clear Elixir 1.20 compile warnings (#758) by mikehostetler
+
+* openai_codex: keep HTTP responses stateless (#756) by BlueHotDog
+
+* bedrock: preserve Cohere inference profile IDs by dl-alexandre
+
+* remove deepseek's max reasoning level, and use xhigh instead by Bill Huang
+
+* anthropic: map refusal/pause_turn/model_context_window_exceeded stop_reasons instead of collapsing to :error (#749) by Arthur Valingot
+
+* Fix reasoning_effort not being passed through to OpenAI Chat Completions API (#753) by green-david
+
+* google_vertex: Allow for specifying google_thinking_level for Google Vertex (#752) by green-david
+
+* mistral: parse nested thinking chunks (#744) by mikehostetler
+
+* openai: preserve Responses file_id inputs (#740) by mikehostetler
+
+* anthropic: return adaptive thinking text by green-david
+
+* openai: send previous_response_id with store: false on Responses API by bowd
+
 ## [v1.14.0](https://github.com/agentjido/req_llm/compare/v1.13.0...v1.14.0) (2026-05-30)
 
 

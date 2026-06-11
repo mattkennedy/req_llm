@@ -14,7 +14,7 @@ defmodule ReqLLM.Providers.Anthropic.PlatformReasoning do
   ## Shared Functionality
 
   This module provides:
-  - `add_reasoning_to_additional_fields/2` - Adds thinking config to provider_options
+  - `add_reasoning_to_additional_fields/3` - Adds thinking config to provider_options (model optional for adaptive detection)
   - `maybe_clean_thinking_after_translation/2` - Removes thinking when incompatible
 
   ## Platform-Specific Functionality
@@ -30,23 +30,32 @@ defmodule ReqLLM.Providers.Anthropic.PlatformReasoning do
   This is the format used by Bedrock, Vertex, and other third-party platforms
   that host Anthropic models.
 
+  Automatically uses `type: "adaptive"` (with display: "summarized") for
+  "adaptive-thinking only" Claude models (e.g. certain Opus 4.x variants),
+  otherwise falls back to `type: "enabled"` with budget_tokens.
+
   ## Example
 
-      opts = add_reasoning_to_additional_fields(opts, 4000)
+      opts = add_reasoning_to_additional_fields(opts, 4000, model)
       # Adds to provider_options:
       # additional_model_request_fields: %{
       #   thinking: %{type: "enabled", budget_tokens: 4000}
       # }
   """
-  def add_reasoning_to_additional_fields(opts, budget_tokens) do
-    # Get existing additional_model_request_fields from provider_options (if any)
+  def add_reasoning_to_additional_fields(opts, budget_tokens, model \\ nil) do
     provider_opts = Keyword.get(opts, :provider_options, [])
+
+    thinking =
+      if model && ReqLLM.ModelHelpers.adaptive_thinking_required?(model) do
+        %{type: "adaptive", display: "summarized"}
+      else
+        %{type: "enabled", budget_tokens: budget_tokens}
+      end
 
     additional_fields =
       Keyword.get(provider_opts, :additional_model_request_fields, %{})
-      |> Map.put(:thinking, %{type: "enabled", budget_tokens: budget_tokens})
+      |> Map.put(:thinking, thinking)
 
-    # Put it back into provider_options
     updated_provider_opts =
       Keyword.put(provider_opts, :additional_model_request_fields, additional_fields)
 

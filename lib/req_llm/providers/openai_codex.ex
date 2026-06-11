@@ -363,6 +363,7 @@ defmodule ReqLLM.Providers.OpenAICodex do
       |> Keyword.delete(:compiled_schema)
       |> Keyword.put(:provider_options, Keyword.get(opts, :provider_options, []))
       |> Keyword.put(:stream, nil)
+      |> Keyword.put(:responses_transport, :websocket)
       |> Keyword.put(:model, model.id)
       |> Keyword.put(:context, context)
       |> Keyword.put(:base_url, base_url)

@@ -66,10 +66,9 @@ defmodule ReqLLM.Providers.AnthropicTest do
       decoded = request |> Anthropic.encode_body() |> ReqLLM.Test.Helpers.json_body()
 
       assert decoded["model"] == "claude-opus-4-8"
-      assert decoded["thinking"] == %{"type" => "adaptive"}
+      assert decoded["thinking"] == %{"type" => "adaptive", "display" => "summarized"}
       assert decoded["output_config"] == %{"effort" => "low"}
       refute Map.has_key?(decoded, "temperature")
-      refute Map.has_key?(request.headers, "anthropic-beta")
     end
 
     test "attach configures authentication and pipeline" do
@@ -1138,6 +1137,33 @@ defmodule ReqLLM.Providers.AnthropicTest do
       assert List.last(response.context.messages).role == :assistant
     end
 
+    test "decode_response normalizes the full set of Anthropic stop_reasons" do
+      {:ok, model} = ReqLLM.model("anthropic:claude-sonnet-4-5-20250929")
+
+      decode = fn stop_reason ->
+        data = %{
+          "id" => "msg_01ABC123",
+          "type" => "message",
+          "role" => "assistant",
+          "content" => [%{"type" => "text", "text" => "ok"}],
+          "stop_reason" => stop_reason,
+          "usage" => %{"input_tokens" => 5, "output_tokens" => 2}
+        }
+
+        {:ok, response} = ReqLLM.Providers.Anthropic.Response.decode_response(data, model)
+        response.finish_reason
+      end
+
+      assert decode.("end_turn") == :stop
+      assert decode.("stop_sequence") == :stop
+      assert decode.("max_tokens") == :length
+      assert decode.("model_context_window_exceeded") == :length
+      assert decode.("tool_use") == :tool_calls
+      assert decode.("pause_turn") == :incomplete
+      assert decode.("refusal") == :content_filter
+      assert decode.("some_future_reason") == :unknown
+    end
+
     test "decode_response handles API errors with non-200 status" do
       # Create error response
       error_body = %{
@@ -1367,10 +1393,31 @@ defmodule ReqLLM.Providers.AnthropicTest do
           max_tokens: 100
         )
 
-      assert Keyword.get(translated_opts, :thinking) == %{type: "adaptive"}
+      assert Keyword.get(translated_opts, :thinking) == %{type: "adaptive", display: "summarized"}
       assert Keyword.get(translated_opts, :output_config) == %{effort: "max"}
       refute Keyword.has_key?(translated_opts, :top_p)
       refute Keyword.has_key?(translated_opts, :temperature)
+    end
+
+    test "translate_options defaults direct adaptive thinking display to summarized" do
+      {:ok, model} = ReqLLM.model("anthropic:claude-opus-4-8")
+
+      cases = [
+        {%{type: "adaptive"}, %{type: "adaptive", display: "summarized"}},
+        {%{"type" => "adaptive"}, %{"type" => "adaptive", "display" => "summarized"}}
+      ]
+
+      for {thinking, expected} <- cases do
+        {translated_opts, []} =
+          Anthropic.translate_options(:chat, model,
+            thinking: thinking,
+            temperature: 0.0,
+            max_tokens: 100
+          )
+
+        assert Keyword.get(translated_opts, :thinking) == expected
+        refute Keyword.has_key?(translated_opts, :temperature)
+      end
     end
 
     test "translate_options removes Claude Opus 4.8 sampling params without reasoning" do

@@ -142,7 +142,10 @@ defmodule ReqLLM.Providers.OpenAICodexTest do
       {:ok, config} =
         OpenAICodex.attach_websocket_stream(
           model,
-          ReqLLM.context([ReqLLM.Context.user("Say hi")]),
+          ReqLLM.context([
+            ReqLLM.Context.assistant("Previous answer", metadata: %{response_id: "resp_ws_789"}),
+            ReqLLM.Context.user("Say hi")
+          ]),
           provider_options: [
             auth_mode: :oauth,
             access_token: jwt_with_account_id("acct_ws"),
@@ -162,6 +165,7 @@ defmodule ReqLLM.Providers.OpenAICodexTest do
       assert payload["model"] == "gpt-5.3-codex-spark"
       assert payload["store"] == false
       assert payload["stream"] == true
+      assert payload["previous_response_id"] == "resp_ws_789"
       refute Map.has_key?(payload, "max_completion_tokens")
       refute Map.has_key?(payload, "response")
     end
@@ -235,7 +239,7 @@ defmodule ReqLLM.Providers.OpenAICodexTest do
              )
     end
 
-    test "omits previous_response_id from context metadata while keeping store=false" do
+    test "omits previous_response_id from HTTP context metadata while keeping store=false" do
       {:ok, model} = ReqLLM.model("openai_codex:gpt-5.3-codex-spark")
 
       context =
@@ -264,6 +268,10 @@ defmodule ReqLLM.Providers.OpenAICodexTest do
     end
 
     test "omits previous_response_id for explicit tool_outputs resume while keeping store=false" do
+      # Tool-resume turns (those carrying function_call_output items) follow a
+      # distinct backend contract that deliberately drops previous_response_id
+      # (see #613). That is independent of the store/previous_response_id
+      # coupling fixed in ResponsesAPI.build_request_body/4 and is preserved here.
       {:ok, model} = ReqLLM.model("openai_codex:gpt-5.3-codex-spark")
       context = ReqLLM.context([ReqLLM.Context.user("Use the provided tool output")])
 

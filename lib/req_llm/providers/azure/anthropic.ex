@@ -50,6 +50,7 @@ defmodule ReqLLM.Providers.Azure.Anthropic do
   Usage information is automatically included in streaming responses.
   """
 
+  alias ReqLLM.ModelHelpers
   alias ReqLLM.Providers.Anthropic
   alias ReqLLM.Providers.Anthropic.AdapterHelpers
   alias ReqLLM.Providers.Anthropic.PlatformReasoning
@@ -218,23 +219,18 @@ defmodule ReqLLM.Providers.Azure.Anthropic do
     model_id = ReqLLM.ModelId.normalize(model_id, "azure-anthropic")
     anthropic_model = LLMDB.Model.new!(%{id: model_id, provider: :anthropic})
 
-    case Anthropic.Response.decode_response(body, anthropic_model) do
-      {:ok, response} ->
-        input_context = opts[:context] || %ReqLLM.Context{messages: []}
-        merged_response = ReqLLM.Context.merge_response(input_context, response)
+    {:ok, response} = Anthropic.Response.decode_response(body, anthropic_model)
+    input_context = opts[:context] || %ReqLLM.Context{messages: []}
+    merged_response = ReqLLM.Context.merge_response(input_context, response)
 
-        final_response =
-          if opts[:operation] == :object do
-            AdapterHelpers.extract_and_set_object(merged_response)
-          else
-            merged_response
-          end
+    final_response =
+      if opts[:operation] == :object do
+        AdapterHelpers.extract_and_set_object(merged_response)
+      else
+        merged_response
+      end
 
-        {:ok, final_response}
-
-      error ->
-        error
-    end
+    {:ok, final_response}
   end
 
   @doc """
@@ -299,13 +295,12 @@ defmodule ReqLLM.Providers.Azure.Anthropic do
     {reasoning_budget, opts} = Keyword.pop(opts, :reasoning_token_budget)
 
     has_reasoning =
-      get_in(model, [Access.key(:capabilities), Access.key(:reasoning), Access.key(:enabled)]) ==
-        true
+      ModelHelpers.reasoning_enabled?(model) or ModelHelpers.adaptive_thinking_required?(model)
 
     cond do
       has_reasoning && reasoning_budget && is_integer(reasoning_budget) ->
         opts
-        |> PlatformReasoning.add_reasoning_to_additional_fields(reasoning_budget)
+        |> PlatformReasoning.add_reasoning_to_additional_fields(reasoning_budget, model)
         |> ensure_min_max_tokens(reasoning_budget)
         |> set_reasoning_temperature(model)
 
@@ -313,7 +308,7 @@ defmodule ReqLLM.Providers.Azure.Anthropic do
         budget = Anthropic.map_reasoning_effort_to_budget(reasoning_effort)
 
         opts
-        |> PlatformReasoning.add_reasoning_to_additional_fields(budget)
+        |> PlatformReasoning.add_reasoning_to_additional_fields(budget, model)
         |> ensure_min_max_tokens(budget)
         |> set_reasoning_temperature(model)
 

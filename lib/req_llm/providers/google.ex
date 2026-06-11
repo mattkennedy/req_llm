@@ -964,6 +964,10 @@ defmodule ReqLLM.Providers.Google do
       |> maybe_put_google_aspect_ratio(request.options[:aspect_ratio])
       |> maybe_put_google_response_modalities(request.options[:response_modalities])
       |> maybe_put(:candidateCount, image_candidate_count(request.options))
+      |> maybe_add_thinking_config(
+        request.options[:google_thinking_budget],
+        request.options[:google_thinking_level]
+      )
 
     generation_config = if generation_config != %{}, do: generation_config
 
@@ -2913,7 +2917,7 @@ defmodule ReqLLM.Providers.Google do
     case depth - 1 do
       0 ->
         length = offset + 1
-        <<json::binary-size(length), remaining::binary>> = original
+        <<json::binary-size(^length), remaining::binary>> = original
         {:ok, json, remaining}
 
       next_depth when next_depth > 0 ->

@@ -580,6 +580,58 @@ defmodule ReqLLM.Providers.GoogleVertex.GeminiTest do
     end
   end
 
+  describe "adaptive thinking for Claude on Vertex" do
+    test "prepared request includes adaptive thinking for sparse Opus platform metadata" do
+      model = %LLMDB.Model{
+        id: "claude-opus-4-7@20260414",
+        model: "claude-opus-4-7@20260414",
+        provider: :google_vertex_anthropic,
+        capabilities: %{chat: true, reasoning: %{enabled: true}},
+        extra: %{family: "claude-opus"}
+      }
+
+      {:ok, request} =
+        GoogleVertex.prepare_request(
+          :chat,
+          model,
+          "Hello",
+          access_token: "test-token",
+          project_id: "test-project",
+          region: "global",
+          max_tokens: 2000,
+          reasoning_effort: :high
+        )
+
+      body = request.options[:json]
+      assert body[:thinking] == %{type: "adaptive", display: "summarized"}
+      assert body[:temperature] == 1.0
+      assert body[:max_tokens] == 4297
+    end
+
+    test "prepared request does not auto-enable adaptive thinking" do
+      model = %LLMDB.Model{
+        id: "claude-opus-4-7@20260414",
+        model: "claude-opus-4-7@20260414",
+        provider: :google_vertex_anthropic,
+        capabilities: %{chat: true, reasoning: %{enabled: true}},
+        extra: %{family: "claude-opus"}
+      }
+
+      {:ok, request} =
+        GoogleVertex.prepare_request(
+          :chat,
+          model,
+          "Hello",
+          access_token: "test-token",
+          project_id: "test-project",
+          region: "global",
+          max_tokens: 2000
+        )
+
+      refute Map.has_key?(request.options[:json], :thinking)
+    end
+  end
+
   describe "option translation for Gemini thinking" do
     alias ReqLLM.Providers.GoogleVertex
 
@@ -588,7 +640,12 @@ defmodule ReqLLM.Providers.GoogleVertex.GeminiTest do
       assert :google_thinking_budget in schema_keys
     end
 
-    test "translate_options maps reasoning_token_budget to google_thinking_budget for Gemini" do
+    test "google_thinking_level is in the Vertex provider schema" do
+      schema_keys = GoogleVertex.provider_schema().schema |> Keyword.keys()
+      assert :google_thinking_level in schema_keys
+    end
+
+    test "translate_options maps reasoning_token_budget to google_thinking_budget for Gemini 2.5 models" do
       model = %LLMDB.Model{
         id: "gemini-2.5-pro",
         provider: :google_vertex,
@@ -601,7 +658,7 @@ defmodule ReqLLM.Providers.GoogleVertex.GeminiTest do
       assert Keyword.get(translated, :google_thinking_budget) == 16_384
     end
 
-    test "translate_options maps reasoning_effort levels to google_thinking_budget for Gemini" do
+    test "translate_options maps reasoning_effort levels to google_thinking_budget for Gemini 2.5 models" do
       model = %LLMDB.Model{
         id: "gemini-2.5-flash",
         provider: :google_vertex,
@@ -623,6 +680,31 @@ defmodule ReqLLM.Providers.GoogleVertex.GeminiTest do
 
         assert Keyword.get(translated, :google_thinking_budget) == expected_budget,
                "Expected reasoning_effort #{inspect(effort)} to map to budget #{expected_budget}"
+      end
+    end
+
+    test "translate_options maps reasoning_effort levels to google_thinking_level for Gemini 3 models" do
+      model = %LLMDB.Model{
+        id: "gemini-3.1-pro-preview",
+        provider: :google_vertex,
+        capabilities: %{chat: true}
+      }
+
+      test_cases = [
+        {:none, :minimal},
+        {:minimal, :minimal},
+        {:low, :low},
+        {:medium, :medium},
+        {:high, :high},
+        {:xhigh, :high}
+      ]
+
+      for {effort, expected_level} <- test_cases do
+        opts = [reasoning_effort: effort]
+        {translated, _warnings} = GoogleVertex.translate_options(:chat, model, opts)
+
+        assert Keyword.get(translated, :google_thinking_level) == expected_level,
+               "Expected reasoning_effort #{inspect(effort)} to map to level #{expected_level}"
       end
     end
 

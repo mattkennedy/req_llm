@@ -925,6 +925,56 @@ defmodule ReqLLM.Providers.AzureTest do
       assert additional_fields[:thinking][:budget_tokens] == 10_000
     end
 
+    test "Claude adaptive-only platform models include adaptive thinking in prepared request" do
+      model = %LLMDB.Model{
+        id: "claude-opus-4-7",
+        model: "claude-opus-4-7",
+        provider: :azure,
+        capabilities: %{chat: true, reasoning: %{enabled: true}},
+        extra: %{family: "claude-opus", wire_protocol: "anthropic_messages"}
+      }
+
+      {:ok, request} =
+        Azure.prepare_request(
+          :chat,
+          model,
+          "Hello",
+          api_key: "test-key",
+          base_url: "https://my-resource.services.ai.azure.com/anthropic",
+          deployment: "claude-opus-4-7",
+          max_tokens: 2000,
+          reasoning_effort: :high
+        )
+
+      body = request.options[:json]
+      assert body[:thinking] == %{type: "adaptive", display: "summarized"}
+      assert body[:temperature] == 1.0
+      assert body[:max_tokens] == 4297
+    end
+
+    test "Claude adaptive-only platform models do not auto-enable thinking" do
+      model = %LLMDB.Model{
+        id: "claude-opus-4-7",
+        model: "claude-opus-4-7",
+        provider: :azure,
+        capabilities: %{chat: true, reasoning: %{enabled: true}},
+        extra: %{family: "claude-opus", wire_protocol: "anthropic_messages"}
+      }
+
+      {:ok, request} =
+        Azure.prepare_request(
+          :chat,
+          model,
+          "Hello",
+          api_key: "test-key",
+          base_url: "https://my-resource.services.ai.azure.com/anthropic",
+          deployment: "claude-opus-4-7",
+          max_tokens: 2000
+        )
+
+      refute Map.has_key?(request.options[:json], :thinking)
+    end
+
     test "reasoning parameters ignored for non-reasoning models with warning" do
       context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
       opts = [stream: false, max_tokens: 500]

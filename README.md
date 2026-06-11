@@ -10,46 +10,46 @@
 
 > **Join the community!** Come chat about building AI tools with Elixir and coding Elixir with LLMs in [The Swarm: Elixir AI Collective](https://jido.run/discord) Discord server.
 
-A [Req](https://github.com/wojtekmach/req)-based package to call LLM APIs that standardizes the API calls and responses for LLM providers.
+A [Req](https://github.com/wojtekmach/req)- and [Finch](https://github.com/sneako/finch)-backed package to call LLM APIs that standardizes requests and responses across providers.
 
 ## Why Req LLM?
 
 LLM APIs are inconsistent. ReqLLM provides a unified, idiomatic Elixir interface with standardized requests and responses across providers.
 
-**Two-layer architecture:**
+**Unified architecture:**
 
-- **High-level API** – Vercel AI SDK-inspired functions (`generate_text/3`, `stream_text/3`, `generate_object/4` and more) that work uniformly across providers. Standard features, minimal configuration.
-- **Low-level API** – Direct Req plugin access for full HTTP control. Built around OpenAI Chat Completions baseline with provider-specific callbacks for non-compatible APIs (e.g., Anthropic).
+- **High-level API** – Vercel AI SDK-inspired functions (`generate_text/3`, `stream_text/3`, `generate_object/4` and more) that normalize requests and responses across providers.
+- **Provider transports** – Req powers request/response calls; Finch powers streaming. Provider callbacks translate model metadata, options, bodies, and responses behind the same public API.
 
 **Model Support Snapshot**
 
-ReqLLM currently exposes **1,205 models across 21 implemented provider integrations** from the [models.dev](https://models.dev) catalog via `llm_db`. Counting the cataloged-but-not-separate `google_vertex_anthropic` namespace, the registry contains **1,218 models across 22 provider namespaces**.
+ReqLLM currently exposes **1,205 models across 21 implemented provider integrations** from [LLMDB](https://llmdb.xyz), the model catalog maintained through `llm_db`. Counting the cataloged-but-not-separate `google_vertex_anthropic` namespace, the registry contains **1,218 models across 22 provider namespaces**.
 
 That breadth extends well beyond chat: ReqLLM tracks **92 non-text operation models** across embedding, image generation, text-to-speech, transcription, rerank, and OCR APIs. The fixture suite currently contains **619 unique recorded model specs**, giving ReqLLM a compatibility ledger for text and multi-modal provider behavior.
 
 | Provider | ID | Catalog models | Operation surface | Recorded specs | Guide |
 |---|---|---:|---|---:|---|
-| [Alibaba Cloud Bailian](https://www.alibabacloud.com/help/en/model-studio) | `alibaba` | 50 | text, OCR 1, transcription 1 | 0 | — |
-| [Alibaba Cloud Bailian (China)](https://www.alibabacloud.com/help/en/model-studio) | `alibaba_cn` | 82 | text, OCR 1, transcription 1 | 0 | — |
-| [Amazon Bedrock](https://aws.amazon.com/bedrock/) | `amazon_bedrock` | 92 | text, embedding 3 | 7 | [Guide](guides/amazon_bedrock.md) |
-| [Anthropic](https://anthropic.com) | `anthropic` | 11 | text | 11 | [Guide](guides/anthropic.md) |
-| [Azure OpenAI](https://azure.microsoft.com/en-us/products/ai-services/openai-service) | `azure` | 103 | text, embedding 6 | 26 | [Guide](guides/azure.md) |
-| [Cerebras](https://cerebras.ai) | `cerebras` | 5 | text | 2 | [Guide](guides/cerebras.md) |
-| [Cohere](https://cohere.com) | `cohere` | 17 | text, rerank 5 | 5 | — |
-| [ElevenLabs](https://elevenlabs.io) | `elevenlabs` | 4 | speech 4 | 4 | — |
-| [Fireworks AI](https://fireworks.ai) | `fireworks_ai` | 12 | text | 12 | [Guide](guides/fireworks_ai.md) |
-| [Google Gemini](https://ai.google.dev) | `google` | 50 | text, embedding 2, image 8 | 24 | [Guide](guides/google.md) |
-| [Google Vertex AI](https://cloud.google.com/vertex-ai) | `google_vertex` | 40 | text | 11 | [Guide](guides/google_vertex.md) |
-| [Groq](https://groq.com) | `groq` | 18 | text, speech 2, transcription 2 | 11 | [Guide](guides/groq.md) |
-| [MiniMax](https://www.minimax.io) | `minimax` | 6 | text | 6 | — |
-| [OpenAI](https://openai.com) | `openai` | 86 | text, embedding 3, image 5, speech 6, transcription 7 | 64 | [Guide](guides/openai.md) |
-| [OpenRouter](https://openrouter.ai) | `openrouter` | 364 | text, embedding 25, image 5 | 234 | [Guide](guides/openrouter.md) |
-| [Venice](https://venice.ai) | `venice` | 67 | text | 67 | — |
-| [xAI](https://x.ai) | `xai` | 26 | text, image 3 | 21 | [Guide](guides/xai.md) |
-| [Z.AI](https://z.ai) | `zai` | 13 | text | 2 | [Guide](guides/zai.md) |
-| [Z.AI Coder](https://z.ai) | `zai_coder` | 5 | text | 1 | [Guide](guides/zai_coder.md) |
-| [Z.AI Coding Plan](https://z.ai) | `zai_coding_plan` | 5 | text | 4 | — |
-| [Zenmux](https://zenmux.ai) | `zenmux` | 149 | text, image 2 | 107 | [Guide](guides/zenmux.md) |
+| [Alibaba Cloud Bailian](https://llmdb.xyz/?providers=alibaba) | `alibaba` | 50 | text, OCR 1, transcription 1 | 0 | — |
+| [Alibaba Cloud Bailian (China)](https://llmdb.xyz/?providers=alibaba_cn) | `alibaba_cn` | 82 | text, OCR 1, transcription 1 | 0 | — |
+| [Amazon Bedrock](https://llmdb.xyz/?providers=amazon_bedrock) | `amazon_bedrock` | 92 | text, embedding 3 | 7 | [Guide](guides/amazon_bedrock.md) |
+| [Anthropic](https://llmdb.xyz/?providers=anthropic) | `anthropic` | 11 | text | 11 | [Guide](guides/anthropic.md) |
+| [Azure OpenAI](https://llmdb.xyz/?providers=azure) | `azure` | 103 | text, embedding 6 | 26 | [Guide](guides/azure.md) |
+| [Cerebras](https://llmdb.xyz/?providers=cerebras) | `cerebras` | 5 | text | 2 | [Guide](guides/cerebras.md) |
+| [Cohere](https://llmdb.xyz/?providers=cohere) | `cohere` | 17 | text, rerank 5 | 5 | — |
+| [ElevenLabs](https://llmdb.xyz/?providers=elevenlabs) | `elevenlabs` | 4 | speech 4 | 4 | — |
+| [Fireworks AI](https://llmdb.xyz/?providers=fireworks_ai) | `fireworks_ai` | 12 | text | 12 | [Guide](guides/fireworks_ai.md) |
+| [Google Gemini](https://llmdb.xyz/?providers=google) | `google` | 50 | text, embedding 2, image 8 | 24 | [Guide](guides/google.md) |
+| [Google Vertex AI](https://llmdb.xyz/?providers=google_vertex) | `google_vertex` | 40 | text | 11 | [Guide](guides/google_vertex.md) |
+| [Groq](https://llmdb.xyz/?providers=groq) | `groq` | 18 | text, speech 2, transcription 2 | 11 | [Guide](guides/groq.md) |
+| [MiniMax](https://llmdb.xyz/?providers=minimax) | `minimax` | 6 | text | 6 | — |
+| [OpenAI](https://llmdb.xyz/?providers=openai) | `openai` | 86 | text, embedding 3, image 5, speech 6, transcription 7 | 64 | [Guide](guides/openai.md) |
+| [OpenRouter](https://llmdb.xyz/?providers=openrouter) | `openrouter` | 364 | text, embedding 25, image 5 | 234 | [Guide](guides/openrouter.md) |
+| [Venice](https://llmdb.xyz/?providers=venice) | `venice` | 67 | text | 67 | — |
+| [xAI](https://llmdb.xyz/?providers=xai) | `xai` | 26 | text, image 3 | 21 | [Guide](guides/xai.md) |
+| [Z.AI](https://llmdb.xyz/?providers=zai) | `zai` | 13 | text | 2 | [Guide](guides/zai.md) |
+| [Z.AI Coder](https://llmdb.xyz/?providers=zai_coder) | `zai_coder` | 5 | text | 1 | [Guide](guides/zai_coder.md) |
+| [Z.AI Coding Plan](https://llmdb.xyz/?providers=zai_coding_plan) | `zai_coding_plan` | 5 | text | 4 | — |
+| [Zenmux](https://llmdb.xyz/?providers=zenmux) | `zenmux` | 149 | text, image 2 | 107 | [Guide](guides/zenmux.md) |
 
 \* _Streaming uses Finch directly due to known Req limitations with SSE responses._
 
@@ -141,7 +141,7 @@ usage = ReqLLM.StreamResponse.usage(response)
 ## Features
 
 - **Provider-agnostic model registry**
-  - 21 implemented providers / 1,205 models sourced from [models.dev](https://models.dev) via the `llm_db` dependency
+  - 21 implemented providers / 1,205 models sourced from [LLMDB](https://llmdb.xyz) via the `llm_db` dependency
   - Text, embedding, image generation, speech, transcription, rerank and OCR operation metadata
   - Cost, context length, modality, capability and deprecation metadata included
 
@@ -150,9 +150,10 @@ usage = ReqLLM.StreamResponse.usage(response)
   - Multi-modal content parts (text, image URL, tool call, binary)
   - All structs implement `Jason.Encoder` for simple persistence / inspection
 
-- **Two client layers**
-  - Low-level Req plugin with full HTTP control (`Provider.prepare_request/4`, `attach/3`)
+- **Unified client surface**
   - High-level Vercel-AI style helpers (`generate_text/3`, `stream_text/3`, `generate_object/4`, bang variants)
+  - Req-backed request/response calls and Finch-backed streaming behind the same provider abstraction
+  - Advanced Req request customization available for non-streaming use cases
 
 - **Structured object generation**
   - `generate_object/4` renders JSON-compatible Elixir maps validated by a NimbleOptions-compiled schema
@@ -171,7 +172,7 @@ usage = ReqLLM.StreamResponse.usage(response)
 
 - **Production-grade streaming**
   - `stream_text/3` returns a `StreamResponse` with both real-time tokens and async metadata
-  - Finch-based streaming with HTTP/2 multiplexing and automatic connection pooling
+  - Finch-based streaming with automatic connection pooling and configurable checkout timeouts
   - OpenAI Responses models can opt into WebSocket mode with `provider_options: [openai_stream_transport: :websocket]`
   - Concurrent metadata collection (usage, finish_reason) without blocking token flow
   - Works uniformly across providers with internal SSE / chunked-response adaptation
@@ -346,50 +347,63 @@ See `examples/scripts/usage_cost_search_image.exs` and run it from `examples/` w
 
 ## Streaming Configuration
 
-ReqLLM uses Finch for streaming connections with automatic connection pooling. By default, we use HTTP/1-only pools to work around a known Finch bug with large request bodies:
+ReqLLM uses Finch for streaming connections with automatic connection pooling. By default, we use HTTP/1-only pools to avoid a known Finch mixed-protocol ALPN bug with large request bodies:
 
 ```elixir
 # Default configuration (automatic)
 config :req_llm,
-  finch: [
-    name: ReqLLM.Finch,
-    pools: %{
-      :default => [protocols: [:http1], size: 1, count: 8]
-    }
-  ]
+  stream_pool_timeout: 120_000,
+  stream_pool_protocols: [:http1],
+  stream_pool_size: 1,
+  stream_pool_count: 8
 ```
 
 ### HTTP/2 Configuration (Advanced)
 
-**Important:** Due to [Finch issue #265](https://github.com/sneako/finch/issues/265), HTTP/2 pools may fail when sending request bodies larger than 64KB (large prompts, extensive context windows). This is a bug in Finch's HTTP/2 flow control implementation, not a limitation of HTTP/2 itself.
+**Important:** Due to [Finch issue #265](https://github.com/sneako/finch/issues/265), mixed HTTP/1+HTTP/2 ALPN pools may fail when sending request bodies larger than 64KB (large prompts, extensive context windows). This is a bug in Finch's mixed-protocol flow control path, not a limitation of HTTP/2 itself.
 
-If you want to use HTTP/2 pools (e.g., for performance testing or if you know your prompts are small), you can configure it:
+If you know all target providers support HTTP/2, you can configure HTTP/2-only pools:
 
 ```elixir
-# HTTP/2 configuration (use with caution)
+# HTTP/2-only configuration
 config :req_llm,
-  finch: [
-    name: ReqLLM.Finch,
-    pools: %{
-      :default => [protocols: [:http2, :http1], size: 1, count: 8]
-    }
-  ]
+  stream_pool_protocols: [:http2],
+  stream_pool_count: 8
 ```
 
-**ReqLLM will error with a helpful message if you try to send a large request body with HTTP/2 pools.** The error will reference this section for configuration guidance.
+**ReqLLM will error with a helpful message if you try to send a large request body with mixed HTTP/1+HTTP/2 pools.** The error will reference this section for configuration guidance.
 
-For high-scale deployments with small prompts, you can increase the connection count:
+Streaming responses hold a connection until completion. For high-scale deployments, tune both the Finch pool capacity and the stream checkout timeout:
 
 ```elixir
 # High-scale configuration
+# config/runtime.exs
+round_robin = Finch.Pool.Strategy.RoundRobin.new()
+
+config :req_llm,
+  stream_pool_timeout: 300_000,
+  stream_pool_protocols: [:http1],
+  stream_pool_size: 1,
+  stream_pool_count: 32,
+  stream_pool_strategy: {Finch.Pool.Strategy.RoundRobin, round_robin}
+```
+
+With the default HTTP/1 transport, concurrent streams per origin are roughly `stream_pool_size * stream_pool_count`. Prefer increasing `stream_pool_count` first when a single pool worker is under pressure; increase `stream_pool_size` when each worker should hold more concurrent HTTP/1 connections. For high worker counts, a round-robin `stream_pool_strategy` spreads stream starts more evenly than Finch's default random selection. These settings configure ReqLLM's default Finch pool; an explicit `finch: [pools: ...]` configuration takes precedence.
+
+If you need origin-specific pools, HTTP/2, connection options, or pool metrics, configure Finch directly:
+
+```elixir
+# Advanced Finch configuration
 config :req_llm,
   finch: [
     name: ReqLLM.Finch,
     pools: %{
-      :default => [protocols: [:http1], size: 1, count: 32]  # More connections
+      :default => [protocols: [:http1], size: 1, count: 32]
     }
   ]
 ```
+
+Use `pool_timeout: ...` on an individual `stream_text/3` or `stream_object/4` call when one workload needs a longer connection checkout window than the global `stream_pool_timeout` setting.
 
 Advanced users can specify custom Finch instances per request:
 
@@ -424,15 +438,15 @@ text = ReqLLM.StreamResponse.text(response)
 
 ## Adding a Provider
 
-ReqLLM uses OpenAI Chat Completions as the baseline API standard. Providers that support this format (like Groq, OpenRouter, xAI) require minimal overrides using the `ReqLLM.Provider.DSL`. Model metadata is automatically synced from [models.dev](https://models.dev).
+ReqLLM uses OpenAI Chat Completions as the baseline API standard. Providers that support this format (like Groq, OpenRouter, xAI) require minimal overrides using the `ReqLLM.Provider.DSL`. Model metadata is automatically synced from [LLMDB](https://llmdb.xyz).
 
 Providers implement the `ReqLLM.Provider` behavior with functions like `encode_body/1`, `decode_response/1`, and optional parameter translation via `translate_options/3`.
 
 See the [Adding a Provider Guide](guides/adding_a_provider.md) for detailed implementation instructions.
 
-## Lower-Level Req Plugin API
+## Advanced Req Plugin API
 
-For advanced use cases, you can use ReqLLM providers directly as Req plugins. This is the canonical implementation used by `ReqLLM.generate_text/3`:
+For advanced non-streaming use cases, you can use ReqLLM providers directly as Req plugins. This is the canonical implementation used by `ReqLLM.generate_text/3`:
 
 ```elixir
 # The canonical pattern from ReqLLM.Generation.generate_text/3
@@ -457,7 +471,7 @@ custom_request =
 {:ok, response} = Req.request(custom_request)
 ```
 
-This approach gives you full control over the Req pipeline, allowing you to add custom middleware, modify requests, or integrate with existing Req-based applications. Native ReqLLM telemetry still applies to this low-level Req path, and it is the recommended observability surface if you also need streaming coverage.
+This approach gives you full control over the Req pipeline, allowing you to add custom middleware, modify requests, or integrate with existing Req-based applications. Streaming uses Finch through `stream_text/3`.
 
 ## Documentation
 

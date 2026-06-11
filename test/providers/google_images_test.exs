@@ -147,6 +147,23 @@ defmodule ReqLLM.Providers.GoogleImagesTest do
     assert get_in(body, ["generationConfig", "responseModalities"]) == ["TEXT", "IMAGE"]
   end
 
+  test "prepare_request/4 passes google_thinking_level into generationConfig.thinkingConfig" do
+    {:ok, model} = ReqLLM.model("google:gemini-3.1-flash-image")
+
+    {:ok, request} =
+      Google.prepare_request(
+        :image,
+        model,
+        "A cat in space",
+        provider_options: [google_thinking_level: :high]
+      )
+
+    encoded = Google.encode_body(request)
+    body = ReqLLM.Test.Helpers.json_body(encoded)
+
+    assert get_in(body, ["generationConfig", "thinkingConfig", "thinkingLevel"]) == "high"
+  end
+
   test "decode_response/1 converts inlineData to ContentPart.image" do
     req =
       Req.new(url: "/models/gemini-2.0-flash-exp-image-generation:generateContent")

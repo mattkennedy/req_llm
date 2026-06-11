@@ -179,3 +179,7 @@ Use GitHub PR labels to track review state after triage:
 gh pr edit <number> --add-label ready_to_merge --remove-label needs_work
 gh pr edit <number> --add-label needs_work --remove-label ready_to_merge
 ```
+
+## Release Hygiene
+
+- Do not modify `CHANGELOG.md`; release notes are generated from Git history during release, so keep changes focused on proper Conventional Commits.
