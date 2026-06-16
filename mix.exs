@@ -1,7 +1,7 @@
 defmodule ReqLLM.MixProject do
   use Mix.Project
 
-  @version "1.15.0"
+  @version "1.16.0"
   @source_url "https://github.com/agentjido/req_llm"
 
   def project do
@@ -66,6 +66,7 @@ defmodule ReqLLM.MixProject do
           "guides/deepseek.md",
           "guides/fireworks_ai.md",
           "guides/meta.md",
+          "guides/github_copilot.md",
           "guides/nearai.md",
           "guides/zenmux.md",
           "guides/zai.md",
@@ -111,6 +112,7 @@ defmodule ReqLLM.MixProject do
             "guides/deepseek.md",
             "guides/fireworks_ai.md",
             "guides/meta.md",
+            "guides/github_copilot.md",
             "guides/nearai.md",
             "guides/zenmux.md",
             "guides/zai.md",
@@ -196,7 +198,7 @@ defmodule ReqLLM.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      extra_applications: [:logger, :xmerl],
+      extra_applications: [:logger, :crypto],
       included_applications: [:llm_db],
       mod: {ReqLLM.Application, []}
     ]
@@ -209,14 +211,14 @@ defmodule ReqLLM.MixProject do
       {:dotenvy, "~> 1.1"},
       {:nimble_options, "~> 1.1"},
       {:req, "~> 0.5"},
-      {:ex_aws_auth, "~> 1.3"},
+      {:goth, "~> 1.4"},
+      {:ex_aws_auth, "~> 1.4"},
       {:server_sent_events, "~> 1.1.0"},
       {:splode, "~> 0.3.0"},
-      {:uniq, "~> 0.6"},
       {:websockex, "~> 0.5.1"},
       {:zoi, "~> 0.14"},
       {:jsv, "~> 0.11"},
-      {:llm_db, "~> 2026.5.2"},
+      {:llm_db, "~> 2026.6.1"},
 
       # Dev/test dependencies
       {:bandit, "~> 1.8", only: [:dev, :test], runtime: false},

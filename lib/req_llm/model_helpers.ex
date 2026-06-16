@@ -92,11 +92,23 @@ defmodule ReqLLM.ModelHelpers do
       true
   """
   def adaptive_thinking_required?(%LLMDB.Model{} = model) do
-    adaptive_thinking_metadata?(model.extra) or
+    model_adaptive_thinking_required?(model) or
       hosted_anthropic_adaptive_thinking_required?(model)
   end
 
   def adaptive_thinking_required?(_), do: false
+
+  defp model_adaptive_thinking_required?(%LLMDB.Model{} = model) do
+    adaptive_thinking_types_required?(
+      nested_value(model.capabilities, [:reasoning, :thinking, :types])
+    ) or
+      adaptive_thinking_types_required?(
+        nested_value(model.extra, [:provider_capabilities, :thinking, :types])
+      ) or
+      adaptive_thinking_types_required?(
+        nested_value(model.extra, [:capabilities, :thinking, :types])
+      )
+  end
 
   defp hosted_anthropic_adaptive_thinking_required?(%LLMDB.Model{} = model) do
     model
@@ -106,20 +118,43 @@ defmodule ReqLLM.ModelHelpers do
 
   defp native_anthropic_adaptive_thinking_required?(model_id) do
     case LLMDB.model(:anthropic, model_id) do
-      {:ok, %LLMDB.Model{} = model} -> adaptive_thinking_metadata?(model.extra)
+      {:ok, %LLMDB.Model{} = model} -> model_adaptive_thinking_required?(model)
       _ -> false
     end
   end
 
-  defp adaptive_thinking_metadata?(extra) do
-    adaptive_supported =
-      nested_value(extra, [:capabilities, :thinking, :types, :adaptive, :supported]) == true
+  defp adaptive_thinking_types_required?(types) when is_list(types) do
+    normalized_types = Enum.map(types, &normalize_thinking_type/1)
 
-    enabled_supported =
-      nested_value(extra, [:capabilities, :thinking, :types, :enabled, :supported])
+    "adaptive" in normalized_types and "enabled" not in normalized_types
+  end
+
+  defp adaptive_thinking_types_required?(types) when is_map(types) do
+    adaptive_supported = thinking_type_supported?(types, :adaptive)
+    enabled_supported = thinking_type_supported?(types, :enabled)
 
     adaptive_supported and enabled_supported == false
   end
+
+  defp adaptive_thinking_types_required?(_types), do: false
+
+  defp thinking_type_supported?(types, key) do
+    case nested_value(types, [key, :supported]) do
+      supported when is_boolean(supported) -> supported
+      _ -> direct_thinking_type_supported?(types, key)
+    end
+  end
+
+  defp direct_thinking_type_supported?(types, key) do
+    case nested_value(types, [key]) do
+      supported when is_boolean(supported) -> supported
+      _ -> nil
+    end
+  end
+
+  defp normalize_thinking_type(type) when is_atom(type), do: Atom.to_string(type)
+  defp normalize_thinking_type(type) when is_binary(type), do: type
+  defp normalize_thinking_type(_type), do: nil
 
   defp hosted_anthropic_model_ids(model) do
     [model.provider_model_id, model.id, model.model]

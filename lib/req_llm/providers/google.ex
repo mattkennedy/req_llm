@@ -1251,7 +1251,8 @@ defmodule ReqLLM.Providers.Google do
       |> maybe_put(:topK, request.options[:top_k])
       |> maybe_add_thinking_config(
         request.options[:google_thinking_budget],
-        request.options[:google_thinking_level]
+        request.options[:google_thinking_level],
+        false
       )
       |> put_schema_for_model(model_name, compiled_schema)
 
@@ -1717,7 +1718,7 @@ defmodule ReqLLM.Providers.Google do
 
   defp extract_grounding_metadata(_), do: nil
 
-  defp maybe_add_thinking_config(config, budget, level) do
+  defp maybe_add_thinking_config(config, budget, level, include_thoughts \\ true) do
     case {budget, level} do
       {b, l} when not is_nil(b) and not is_nil(l) ->
         raise ArgumentError,
@@ -1730,12 +1731,15 @@ defmodule ReqLLM.Providers.Google do
         Map.put(config, :thinkingConfig, %{thinkingBudget: 0})
 
       {budget, nil} when is_integer(budget) and budget > 0 ->
-        Map.put(config, :thinkingConfig, %{thinkingBudget: budget, includeThoughts: true})
+        Map.put(config, :thinkingConfig, %{
+          thinkingBudget: budget,
+          includeThoughts: include_thoughts
+        })
 
       {nil, level} ->
         Map.put(config, :thinkingConfig, %{
           thinkingLevel: to_string(level),
-          includeThoughts: true
+          includeThoughts: include_thoughts
         })
     end
   end

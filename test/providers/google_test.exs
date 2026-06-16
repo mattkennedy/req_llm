@@ -1875,6 +1875,30 @@ defmodule ReqLLM.Providers.GoogleTest do
       refute Map.has_key?(decoded, "toolConfig")
     end
 
+    test "encode_object_body disables thought summaries when thinking is enabled" do
+      {:ok, model} = ReqLLM.model("google:gemini-3-flash")
+      context = context_fixture()
+      {:ok, schema} = ReqLLM.Schema.compile(name: [type: :string, required: true])
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          operation: :object,
+          compiled_schema: schema,
+          google_thinking_level: :low,
+          provider_options: [google_api_version: "v1beta"]
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = ReqLLM.Test.Helpers.json_body(updated_request)
+
+      thinking_config = decoded["generationConfig"]["thinkingConfig"]
+      assert thinking_config["thinkingLevel"] == "low"
+      assert thinking_config["includeThoughts"] == false
+    end
+
     test "encode_object_body uses responseSchema for non-2.5 models" do
       context = context_fixture()
 

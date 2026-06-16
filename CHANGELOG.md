@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- changelog -->
 
+## [v1.16.0](https://github.com/agentjido/req_llm/compare/v1.15.0...v1.16.0) (2026-06-11)
+
+
+
+
+### Features:
+
+* schema: support nimble options' `:non_neg_integer` (#759) by Federico Ravasio
+
+### Bug Fixes:
+
+* remove stale deep_merge lock entry by mikehostetler
+
+* context: improve error handling around tool calls by Federico Ravasio
+
+* streaming: don't finalize OpenAI-compatible streams at finish_reason by Michelle Tilley
+
+* support google vertex app config credentials by mikehostetler
+
+* streaming: preserve empty tool argument fragments by mikehostetler
+
+* google: disable thought summaries for object generation by Shawn Vo
+
+* streaming: expose stream pool configuration by mikehostetler
+
 ## [v1.15.0](https://github.com/agentjido/req_llm/compare/v1.14.0...v1.15.0) (2026-06-09)
 
 

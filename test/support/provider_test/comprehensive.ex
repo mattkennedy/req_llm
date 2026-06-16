@@ -88,9 +88,15 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
   end
 
   defp structured_outputs_supported?(%LLMDB.Model{provider: :anthropic, extra: extra}) do
-    case get_in(extra || %{}, [:capabilities, :structured_outputs, :supported]) do
-      false -> false
-      _ -> true
+    cond do
+      get_in(extra || %{}, [:provider_capabilities, :structured_outputs, :supported]) == false ->
+        false
+
+      get_in(extra || %{}, [:capabilities, :structured_outputs, :supported]) == false ->
+        false
+
+      true ->
+        true
     end
   end
 

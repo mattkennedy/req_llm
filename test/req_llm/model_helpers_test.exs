@@ -317,6 +317,41 @@ defmodule ReqLLM.ModelHelpersTest do
       assert ModelHelpers.adaptive_thinking_required?(model)
     end
 
+    test "returns true for normalized adaptive-only thinking capabilities" do
+      model = %LLMDB.Model{
+        id: "claude-opus-4-8",
+        provider: :anthropic,
+        capabilities: %{
+          reasoning: %{
+            thinking: %{
+              types: ["adaptive"]
+            }
+          }
+        }
+      }
+
+      assert ModelHelpers.adaptive_thinking_required?(model)
+    end
+
+    test "returns true for provider adaptive-only thinking metadata" do
+      model = %LLMDB.Model{
+        id: "claude-opus-4-8",
+        provider: :anthropic,
+        extra: %{
+          provider_capabilities: %{
+            thinking: %{
+              types: %{
+                adaptive: %{supported: true},
+                enabled: %{supported: false}
+              }
+            }
+          }
+        }
+      }
+
+      assert ModelHelpers.adaptive_thinking_required?(model)
+    end
+
     test "returns false when both supported or neither" do
       model_both = %LLMDB.Model{
         id: "test",

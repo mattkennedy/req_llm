@@ -509,11 +509,21 @@ defmodule ReqLLM.Context do
           append(ctx, tool_result_msg)
 
         {:error, error} ->
-          error_result = %{error: to_string(error)}
+          error_result = %{error: tool_error_message(error)}
+
           tool_result_msg = tool_result_message(name, id, error_result, %{is_error: true})
           append(ctx, tool_result_msg)
       end
     end)
+  end
+
+  defp tool_error_message(error) when is_exception(error), do: Exception.message(error)
+
+  defp tool_error_message(error) do
+    case String.Chars.impl_for(error) do
+      nil -> inspect(error)
+      _impl -> to_string(error)
+    end
   end
 
   defp extract_tool_call_info(%ReqLLM.ToolCall{id: id, function: %{name: name}}), do: {name, id}
@@ -746,7 +756,7 @@ defmodule ReqLLM.Context do
   end
 
   defp generate_id do
-    Uniq.UUID.uuid7()
+    ReqLLM.ID.uuid7()
   end
 
   defp to_parts(s) when is_binary(s) do

@@ -12,6 +12,19 @@
       }
     }
   },
+  "github_copilot:gpt-4.1": {
+    "scenarios": {
+      "basic": {
+        "error": null,
+        "fixtures": [
+          "basic"
+        ],
+        "last_checked": "2026-06-12T21:58:25Z",
+        "mode": "record",
+        "status": "pass"
+      }
+    }
+  },
   "openrouter:xiaomi/mimo-v2-flash": {
     "scenarios": {
       "basic": {
@@ -8656,7 +8669,7 @@
         "fixtures": [
           "object_basic"
         ],
-        "last_checked": "2026-05-29T22:24:48Z",
+        "last_checked": "2026-06-10T21:03:14Z",
         "mode": "record",
         "status": "pass"
       },

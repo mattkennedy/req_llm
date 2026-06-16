@@ -1473,12 +1473,32 @@ defmodule ReqLLM.Providers.Anthropic do
   defp adaptive_effort(:default, _model), do: "medium"
 
   defp max_effort(model) do
-    if model_extra(model, [:capabilities, :effort, :max, :supported]) == true do
+    if max_effort_supported?(model) do
       "max"
     else
       "high"
     end
   end
+
+  defp max_effort_supported?(%LLMDB.Model{} = model) do
+    model_capability(model, [:reasoning, :effort, :values])
+    |> normalized_effort_values()
+    |> Enum.member?("max") or
+      model_extra(model, [:provider_capabilities, :effort, :max, :supported]) == true or
+      model_extra(model, [:capabilities, :effort, :max, :supported]) == true
+  end
+
+  defp max_effort_supported?(_model), do: false
+
+  defp normalized_effort_values(values) when is_list(values) do
+    Enum.map(values, fn
+      value when is_atom(value) -> Atom.to_string(value)
+      value when is_binary(value) -> value
+      _ -> nil
+    end)
+  end
+
+  defp normalized_effort_values(_values), do: []
 
   defp remove_model_unsupported_parameters(opts, model) do
     if model_extra(model, [:temperature]) == false do
@@ -1487,6 +1507,9 @@ defmodule ReqLLM.Providers.Anthropic do
       opts
     end
   end
+
+  defp model_capability(%LLMDB.Model{capabilities: capabilities}, path),
+    do: get_nested(capabilities, path)
 
   defp model_extra(%LLMDB.Model{extra: extra}, path), do: get_nested(extra, path)
   defp model_extra(_, _path), do: nil
