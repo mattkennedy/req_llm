@@ -96,6 +96,37 @@ defmodule ReqLLM.Providers.OpenRouterTest do
       assert :llm_decode_response in response_steps
     end
 
+    test "prepare_request uses JSON payload for transcription" do
+      {:ok, model} = ReqLLM.model("openrouter:openai/gpt-4o-mini-transcribe")
+
+      {:ok, request} =
+        OpenRouter.prepare_request(:transcription, model, "audio-bytes",
+          language: "en",
+          media_type: "audio/wav",
+          provider_options: [
+            openrouter_provider: %{order: ["OpenAI"], require_parameters: true},
+            temperature: 0.1
+          ]
+        )
+
+      body = ReqLLM.Test.Helpers.json_body(request)
+
+      assert request.url.path == "/audio/transcriptions"
+      assert request.method == :post
+      assert Req.Request.get_header(request, "content-type") == ["application/json"]
+      refute request.options[:form_multipart]
+      assert body["model"] == "openai/gpt-4o-mini-transcribe"
+      assert body["input_audio"]["data"] == Base.encode64("audio-bytes")
+      assert body["input_audio"]["format"] == "wav"
+      assert body["language"] == "en"
+      assert body["temperature"] == 0.1
+
+      assert body["provider"] == %{
+               "order" => ["OpenAI"],
+               "require_parameters" => true
+             }
+    end
+
     test "error handling for invalid configurations" do
       {:ok, model} = ReqLLM.model("openrouter:openai/gpt-4")
       context = context_fixture()

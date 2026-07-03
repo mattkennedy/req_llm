@@ -43,6 +43,65 @@ defmodule ReqLLM.StreamServer.CoreTest do
       StreamServer.cancel(server)
       refute Process.alive?(server)
     end
+
+    test "cancels stream resources when monitored consumer exits" do
+      server = start_server()
+      task = mock_http_task(server)
+
+      consumer =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      assert :ok = StreamServer.monitor_consumer(server, consumer)
+      server_ref = Process.monitor(server)
+      task_ref = Process.monitor(task.pid)
+
+      Process.exit(consumer, :cancelled)
+
+      assert_receive {:DOWN, ^server_ref, :process, ^server, :normal}
+      assert_receive {:DOWN, ^task_ref, :process, task_pid, :cancelled} when task_pid == task.pid
+    end
+
+    test "keeps completed streams alive for metadata when consumer exits" do
+      server = start_server()
+      _task = mock_http_task(server)
+
+      consumer =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      assert :ok = StreamServer.monitor_consumer(server, consumer)
+
+      sse_content = ~s(data: {"choices": [{"delta": {"content": "Done"}}]}\n\n)
+      sse_done = ~s(data: [DONE]\n\n)
+      assert :ok = GenServer.call(server, {:http_event, {:data, sse_content}})
+      assert :ok = GenServer.call(server, {:http_event, {:data, sse_done}})
+      assert :ok = GenServer.call(server, {:http_event, :done})
+
+      consumer_ref = Process.monitor(consumer)
+      send(consumer, :stop)
+      assert_receive {:DOWN, ^consumer_ref, :process, ^consumer, :normal}
+
+      assert {:ok, metadata} = StreamServer.await_metadata(server, 100)
+      assert metadata.finish_reason == :stop
+
+      StreamServer.cancel(server)
+    end
+
+    test "cancel is idempotent after StreamServer exits normally" do
+      server = start_server()
+      ref = Process.monitor(server)
+
+      assert :ok = StreamServer.cancel(server)
+      assert_receive {:DOWN, ^ref, :process, ^server, :normal}
+      assert :ok = StreamServer.cancel(server)
+    end
   end
 
   describe "HTTP event processing" do

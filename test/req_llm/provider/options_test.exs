@@ -93,6 +93,30 @@ defmodule ReqLLM.Provider.OptionsTest do
       assert processed[:stream] == false
       assert processed[:n] == 1
     end
+
+    test "rejects reasoning_summary for providers that do not support it" do
+      model = %LLMDB.Model{provider: :mock, id: "test-model"}
+      opts = [reasoning_summary: "auto"]
+
+      assert {:error, %ReqLLM.Error.Unknown.Unknown{}} =
+               Options.process(MockProvider, :chat, model, opts)
+    end
+
+    test "validates and auto-hoists reasoning_summary for OpenAI" do
+      {:ok, model} = ReqLLM.model("openai:gpt-5")
+      opts = [reasoning_summary: "auto"]
+
+      assert {:ok, processed} = Options.process(OpenAI, :chat, model, opts)
+      assert processed[:provider_options][:reasoning_summary] == "auto"
+    end
+
+    test "rejects invalid reasoning_summary values for OpenAI" do
+      {:ok, model} = ReqLLM.model("openai:gpt-5")
+      opts = [reasoning_summary: :invalid]
+
+      assert {:error, %ReqLLM.Error.Unknown.Unknown{}} =
+               Options.process(OpenAI, :chat, model, opts)
+    end
   end
 
   describe "Options.process/4 - provider-specific options" do

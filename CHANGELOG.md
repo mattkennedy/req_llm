@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- changelog -->
 
+## [v1.17.0](https://github.com/agentjido/req_llm/compare/v1.16.0...v1.17.0) (2026-06-26)
+
+
+
+
+### Features:
+
+* openai: support reasoning.summary parameter in Responses API by OmarGoubail
+
+* openai: pass through code_interpreter tool in Responses API by OmarGoubail
+
+* bedrock: add bidirectional streaming (Nova Sonic speech-to-speech) by neilberkman
+
+* github_copilot: add provider by mikehostetler
+
+* google_vertex: support Application Default Credentials by Philip Munksgaard
+
+### Bug Fixes:
+
+* openai: capture trailing streamed usage chunk after finish_reason by Valentin
+
+* openrouter: send transcription audio as JSON (#787) by Susan
+
+* harden object support metadata detection (#788) by mikehostetler
+
+* groq: omit reasoning fields from assistant history by mikehostetler
+
+* ollama: provider sent an empty request body (Content-Length: 0) â Ollama 400 EOF (#782) by cash-mckeeman
+
+* streaming: cleanup killed stream consumers (#779) by BlueHotDog
+
 ## [v1.16.0](https://github.com/agentjido/req_llm/compare/v1.15.0...v1.16.0) (2026-06-11)
 
 

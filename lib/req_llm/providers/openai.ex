@@ -34,6 +34,7 @@ defmodule ReqLLM.Providers.OpenAI do
   ### Responses API (ResponsesAPI)
   - Extended reasoning for o-series and GPT-5 models
   - Reasoning effort control (minimal, low, medium, high)
+  - Reasoning summary control (`:auto`, `:concise`, `:detailed`)
   - Streaming with reasoning token tracking
   - Tool calling with responses-specific format
   - Enhanced usage metrics including `:reasoning_tokens`
@@ -154,6 +155,11 @@ defmodule ReqLLM.Providers.OpenAI do
       type: {:list, :string},
       doc:
         "Responses API include values, such as reasoning.encrypted_content for reasoning signatures"
+    ],
+    reasoning_summary: [
+      type: {:or, [:string, {:in, [:auto, :concise, :detailed]}]},
+      doc:
+        "Controls whether the model returns a human-readable summary of its reasoning (auto, concise, detailed)"
     ],
     openai_structured_output_mode: [
       type: {:in, [:auto, :json_schema, :tool_strict]},

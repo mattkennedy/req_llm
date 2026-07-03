@@ -336,6 +336,7 @@ config :req_llm, :sample_speech_models, ~w(
 config :req_llm, :sample_transcription_models, ~w(
     openai:whisper-1
     groq:whisper-large-v3-turbo
+    openrouter:openai/gpt-4o-mini-transcribe
   )
 config :req_llm, :sample_rerank_models, ~w(
     cohere:rerank-v3.5

@@ -50,6 +50,17 @@ defmodule ReqLLM.ModelOperationTest do
       refute ModelOperation.supported?(model, :text)
     end
 
+    test "classifies OpenRouter transcription models by audio input" do
+      model =
+        model("openai/gpt-4o-mini-transcribe",
+          provider: :openrouter,
+          modalities: %{input: [:audio], output: [:text]}
+        )
+
+      assert ModelOperation.supported?(model, :transcription)
+      refute ModelOperation.supported?(model, :text)
+    end
+
     test "classifies rerank models by capability" do
       model = model("rerank-v3.5", provider: :cohere, capabilities: %{rerank: true})
 

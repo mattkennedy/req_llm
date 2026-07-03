@@ -17,6 +17,21 @@ defmodule ReqLLM.Providers.OllamaTest do
     %Req.Request{options: Map.new(opts)}
   end
 
+  defp materialize_body_through_request_steps(%Req.Request{} = request) do
+    skip = [:run_finch, :put_plug, :cache, :llm_telemetry_start]
+
+    Enum.reduce(request.request_steps, request, fn {name, step}, acc ->
+      if name in skip do
+        acc
+      else
+        case step.(acc) do
+          %Req.Request{} = req -> req
+          {%Req.Request{} = req, _resp_or_err} -> req
+        end
+      end
+    end)
+  end
+
   defp simple_context do
     %ReqLLM.Context{
       messages: [
@@ -90,6 +105,34 @@ defmodule ReqLLM.Providers.OllamaTest do
 
       refute Map.has_key?(body, "tools")
       refute Map.has_key?(body, "tool_choice")
+    end
+  end
+
+  describe "request body materialization" do
+    test "llm_encode_body runs before Req's encode_body so the body is materialized" do
+      {:ok, request} = Ollama.prepare_request(:chat, ollama_model(), "ping", [])
+
+      step_keys = Keyword.keys(request.request_steps)
+
+      assert Enum.find_index(step_keys, &(&1 == :llm_encode_body)) <
+               Enum.find_index(step_keys, &(&1 == :encode_body)),
+             "llm_encode_body must precede Req's encode_body, got: #{inspect(step_keys)}"
+    end
+
+    test "outgoing request carries a non-empty JSON body with model + messages" do
+      {:ok, request} = Ollama.prepare_request(:chat, ollama_model(), "ping", [])
+
+      materialized = materialize_body_through_request_steps(request)
+
+      body = materialized.body
+      assert is_binary(body) or is_list(body)
+      body_string = IO.iodata_to_binary(body)
+      refute body_string == "", "outgoing request body must not be empty"
+
+      decoded = Jason.decode!(body_string)
+      assert decoded["model"] == "qwen2.5-coder:14b"
+      assert is_list(decoded["messages"])
+      assert decoded["messages"] != []
     end
   end
 

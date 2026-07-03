@@ -210,7 +210,57 @@ defmodule ReqLLM.Providers.OpenRouter do
     )
   end
 
-  # Delegate other operations to default implementation
+  def prepare_request(:transcription, model_spec, audio_data, opts) do
+    with {:ok, model} <- ReqLLM.model(model_spec) do
+      http_opts = Keyword.get(opts, :req_http_options, [])
+      media_type = Keyword.get(opts, :media_type, "audio/mpeg")
+      language = Keyword.get(opts, :language)
+      provider_options = Keyword.get(opts, :provider_options, [])
+      timeout = Keyword.get(opts, :receive_timeout, 120_000)
+
+      body =
+        %{
+          model: model.provider_model_id || model.id,
+          input_audio: %{
+            data: Base.encode64(audio_data),
+            format: ReqLLM.Provider.Defaults.media_type_to_extension(media_type)
+          }
+        }
+        |> maybe_put(:language, language)
+        |> add_transcription_provider_options(provider_options)
+
+      api_key = ReqLLM.Keys.get!(model, opts)
+
+      request =
+        Req.new(
+          [
+            url: "/audio/transcriptions",
+            method: :post,
+            base_url: Keyword.get(opts, :base_url, base_url()),
+            receive_timeout: timeout,
+            pool_timeout: timeout,
+            json: body,
+            auth: {:bearer, api_key}
+          ] ++ http_opts
+        )
+        |> Req.Request.put_header("content-type", "application/json")
+        |> Req.Request.put_header("authorization", "Bearer #{api_key}")
+        |> maybe_add_attribution_headers(opts)
+        |> ReqLLM.Step.Retry.attach()
+        |> ReqLLM.Step.Error.attach()
+        |> ReqLLM.Step.Telemetry.attach(
+          model,
+          opts
+          |> Keyword.put(:operation, :transcription)
+          |> Keyword.put(:audio_bytes, byte_size(audio_data))
+          |> Keyword.put(:media_type, media_type)
+        )
+        |> ReqLLM.Step.Fixture.maybe_attach(model, opts)
+
+      {:ok, request}
+    end
+  end
+
   def prepare_request(operation, model_spec, input, opts) do
     ReqLLM.Provider.Defaults.prepare_request(__MODULE__, operation, model_spec, input, opts)
   end
@@ -530,6 +580,22 @@ defmodule ReqLLM.Providers.OpenRouter do
   defp embedding_option(request_options, key) do
     request_options[key] || get_in(request_options, [:provider_options, key])
   end
+
+  defp add_transcription_provider_options(body, opts) do
+    body
+    |> maybe_put(:provider, option_value(opts, :openrouter_provider))
+    |> maybe_put(:temperature, option_value(opts, :temperature))
+  end
+
+  defp option_value(opts, key) when is_list(opts) do
+    if Keyword.keyword?(opts), do: Keyword.get(opts, key), else: nil
+  end
+
+  defp option_value(opts, key) when is_map(opts) do
+    Map.get(opts, key) || Map.get(opts, Atom.to_string(key))
+  end
+
+  defp option_value(_opts, _key), do: nil
 
   # Helper function for adding OpenRouter-specific body options not covered by defaults
   defp add_openrouter_specific_options(body, request_options) do

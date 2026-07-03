@@ -4,7 +4,7 @@ defmodule ReqLLM.ModelOperation do
   @operations ~w(text embedding image speech transcription rerank ocr all)a
   @image_providers ~w(openai google xai)a
   @speech_providers ~w(openai elevenlabs)a
-  @transcription_providers ~w(openai groq elevenlabs)a
+  @transcription_providers ~w(openai groq elevenlabs openrouter)a
   @rerank_providers ~w(cohere)a
   @operation_map for operation <- @operations,
                      into: %{},
