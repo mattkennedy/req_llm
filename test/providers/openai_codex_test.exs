@@ -94,6 +94,39 @@ defmodule ReqLLM.Providers.OpenAICodexTest do
     end
   end
 
+  describe "reasoning_summary passthrough" do
+    test "atom option encodes the body's reasoning.summary" do
+      body = encoded_body(reasoning_summary: :auto)
+      assert body["reasoning"] == %{"summary" => "auto"}
+    end
+
+    test "string option encodes verbatim" do
+      body = encoded_body(reasoning_summary: "detailed")
+      assert body["reasoning"] == %{"summary" => "detailed"}
+    end
+
+    test "no option leaves the body without a reasoning key" do
+      refute Map.has_key?(encoded_body([]), "reasoning")
+    end
+
+    test "composes with reasoning_effort into one reasoning object" do
+      {:ok, model} = ReqLLM.model("openai_codex:gpt-5.3-codex-spark")
+
+      {:ok, request} =
+        OpenAICodex.prepare_request(:chat, model, "Who funded Acme in 2026?",
+          reasoning_effort: :low,
+          provider_options: [
+            auth_mode: :oauth,
+            access_token: jwt_with_account_id("acct_123"),
+            reasoning_summary: :concise
+          ]
+        )
+
+      body = OpenAICodex.encode_body(request).body |> Jason.decode!()
+      assert body["reasoning"] == %{"effort" => "low", "summary" => "concise"}
+    end
+  end
+
   describe "attach_stream/4" do
     test "builds SSE request against codex backend with combined instructions" do
       {:ok, model} = ReqLLM.model("openai_codex:gpt-5.3-codex-spark")

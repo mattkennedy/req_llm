@@ -114,6 +114,14 @@ defmodule ReqLLM.Providers.OpenAICodex do
       doc:
         "Enable the server-side `web_search` builtin tool. `true` for defaults, or a map " <>
           "like %{mode: :cached | :live} (cached = OpenAI's indexed snapshot, live = fresh fetch)."
+    ],
+    reasoning_summary: [
+      type: {:or, [:string, {:in, [:auto, :concise, :detailed]}]},
+      doc:
+        "Request human-readable reasoning summaries (auto, concise, detailed). Encoded as " <>
+          "the request body's reasoning.summary by the Responses API body builder; the " <>
+          "backend streams response.reasoning_summary_text.delta events decoded as " <>
+          "thinking chunks."
     ]
   ]
 
