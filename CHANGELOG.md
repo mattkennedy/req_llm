@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- changelog -->
 
+## [v1.17.1](https://github.com/agentjido/req_llm/compare/v1.17.0...v1.17.1) (2026-07-06)
+
+
+
+
+### Bug Fixes:
+
+* openrouter: preserve reasoning details by Danila Poyarkov
+
+* openrouter: encode audio files as input_audio by mikehostetler
+
+* clarify tool call response contract by mikehostetler
+
+* make goth and ex_aws_auth optional dependencies by Dave Lucia
+
+* keys: support default options for get by schwarz
+
+* streaming: preserve leading tool call argument fragments by anagrius
+
+* retry transport errors wrapped in ReqLLM.Error.API.Request by mark-a-12
+
+* ollama: streaming provider also sent an empty request body by cash-mckeeman
+
+* context: encode provider-specific content blocks by Danila Poyarkov
+
 ## [v1.17.0](https://github.com/agentjido/req_llm/compare/v1.16.0...v1.17.0) (2026-06-26)
 
 

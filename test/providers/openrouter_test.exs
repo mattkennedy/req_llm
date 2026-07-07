@@ -433,6 +433,70 @@ defmodule ReqLLM.Providers.OpenRouterTest do
              }
     end
 
+    test "encode_body encodes mp3 file parts as OpenRouter input_audio" do
+      {:ok, model} = ReqLLM.model("openrouter:openai/gpt-4")
+      audio_data = "audio bytes"
+
+      context =
+        Context.new([
+          Context.user([
+            ContentPart.text("Transcribe this audio"),
+            ContentPart.file(audio_data, "speech.mp3", "audio/mpeg")
+          ])
+        ])
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false
+        ]
+      }
+
+      updated_request = OpenRouter.encode_body(mock_request)
+      decoded = ReqLLM.Test.Helpers.json_body(updated_request)
+
+      [message] = decoded["messages"]
+      [text_part, audio_part] = message["content"]
+
+      assert text_part == %{"type" => "text", "text" => "Transcribe this audio"}
+
+      assert audio_part == %{
+               "type" => "input_audio",
+               "input_audio" => %{
+                 "data" => Base.encode64(audio_data),
+                 "format" => "mp3"
+               }
+             }
+
+      refute Map.has_key?(audio_part, "image_url")
+    end
+
+    test "encode_body rejects unsupported audio file formats" do
+      {:ok, model} = ReqLLM.model("openrouter:openai/gpt-4")
+
+      context =
+        Context.new([
+          Context.user([
+            ContentPart.file("audio bytes", "speech.ogg", "audio/ogg")
+          ])
+        ])
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false
+        ]
+      }
+
+      assert_raise ReqLLM.Error.Invalid.Message,
+                   ~r/OpenRouter chat audio input supports only mp3 and wav/,
+                   fn ->
+                     OpenRouter.encode_body(mock_request)
+                   end
+    end
+
     test "attach_stream with file-parser plugin encodes PDF files in OpenRouter format" do
       model = ReqLLM.model!("openrouter:openai/gpt-4")
       pdf_data = "%PDF stream"
@@ -468,6 +532,51 @@ defmodule ReqLLM.Providers.OpenRouterTest do
              }
     end
 
+    test "attach_stream encodes wav file parts as OpenRouter input_audio" do
+      model = ReqLLM.model!("openrouter:openai/gpt-4")
+      audio_data = "wav bytes"
+
+      context =
+        Context.new([
+          Context.user([
+            ContentPart.text("Describe the audio"),
+            ContentPart.file(audio_data, "clip.wav", "audio/wav")
+          ])
+        ])
+
+      {:ok, finch_request} = OpenRouter.attach_stream(model, context, [], MyApp.Finch)
+
+      decoded = Jason.decode!(finch_request.body)
+      [message] = decoded["messages"]
+      [_, audio_part] = message["content"]
+
+      assert decoded["stream"] == true
+
+      assert audio_part == %{
+               "type" => "input_audio",
+               "input_audio" => %{
+                 "data" => Base.encode64(audio_data),
+                 "format" => "wav"
+               }
+             }
+    end
+
+    test "attach_stream rejects unsupported audio file formats" do
+      model = ReqLLM.model!("openrouter:openai/gpt-4")
+
+      context =
+        Context.new([
+          Context.user([
+            ContentPart.file("audio bytes", "speech.ogg", "audio/ogg")
+          ])
+        ])
+
+      assert {:error, %ReqLLM.Error.Invalid.Message{} = error} =
+               OpenRouter.attach_stream(model, context, [], MyApp.Finch)
+
+      assert Exception.message(error) =~ "OpenRouter chat audio input supports only mp3 and wav"
+    end
+
     test "encode_body with response_format" do
       {:ok, model} = ReqLLM.model("openrouter:openai/gpt-4")
       context = context_fixture()
@@ -487,6 +596,67 @@ defmodule ReqLLM.Providers.OpenRouterTest do
       decoded = ReqLLM.Test.Helpers.json_body(updated_request)
 
       assert decoded["response_format"] == %{"type" => "json_object"}
+    end
+
+    test "encode_body enforces strict requirements for raw JSON schema response_format" do
+      {:ok, model} = ReqLLM.model("openrouter:openai/gpt-4")
+      context = context_fixture()
+
+      response_format = %{
+        "type" => "json_schema",
+        "json_schema" => %{
+          "name" => "response",
+          "strict" => true,
+          "schema" => %{
+            "type" => "object",
+            "properties" => %{
+              "receipt" => %{
+                "anyOf" => [
+                  %{
+                    "type" => "object",
+                    "properties" => %{
+                      "items" => %{
+                        "type" => "array",
+                        "items" => %{
+                          "type" => "object",
+                          "properties" => %{"item_name" => %{"type" => "string"}}
+                        }
+                      }
+                    }
+                  },
+                  %{"type" => "null"}
+                ]
+              },
+              "error" => %{"anyOf" => [%{"type" => "string"}, %{"type" => "null"}]}
+            }
+          }
+        }
+      }
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false,
+          response_format: response_format
+        ]
+      }
+
+      updated_request = OpenRouter.encode_body(mock_request)
+
+      schema =
+        ReqLLM.Test.Helpers.json_body(updated_request)["response_format"]["json_schema"]["schema"]
+
+      assert Enum.sort(schema["required"]) == ["error", "receipt"]
+      assert schema["additionalProperties"] == false
+
+      [receipt_object, %{"type" => "null"}] = schema["properties"]["receipt"]["anyOf"]
+      assert receipt_object["required"] == ["items"]
+      assert receipt_object["additionalProperties"] == false
+
+      item_schema = receipt_object["properties"]["items"]["items"]
+      assert item_schema["required"] == ["item_name"]
+      assert item_schema["additionalProperties"] == false
     end
 
     test "encode_body OpenRouter-specific options" do
@@ -1415,7 +1585,7 @@ defmodule ReqLLM.Providers.OpenRouterTest do
       assert log =~ "anthropic"
     end
 
-    test "encodes ReasoningDetails with signature field" do
+    test "encodes ReasoningDetails with signature and provider data fields" do
       message_with_signature = %ReqLLM.Message{
         role: :assistant,
         content: [ReqLLM.Message.ContentPart.text("The answer")],
@@ -1427,7 +1597,7 @@ defmodule ReqLLM.Providers.OpenRouterTest do
             provider: :openrouter,
             format: "google-gemini-v1",
             index: 0,
-            provider_data: %{"type" => "reasoning.text"}
+            provider_data: %{"type" => "reasoning.text", "id" => "rs_123"}
           }
         ]
       }
@@ -1453,7 +1623,9 @@ defmodule ReqLLM.Providers.OpenRouterTest do
         Enum.find(decoded_body["messages"], fn msg -> msg["role"] == "assistant" end)
 
       [detail] = assistant_message["reasoning_details"]
+      assert detail["id"] == "rs_123"
       assert detail["signature"] == "encrypted-sig-token"
+      assert detail["signature_encrypted"] == true
       assert detail["text"] == "Reasoning text"
     end
   end

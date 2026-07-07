@@ -266,6 +266,32 @@ defmodule ReqLLM.Providers.OpenRouter do
   end
 
   @impl ReqLLM.Provider
+  def attach_stream(model, context, opts, finch_name) do
+    processed_opts =
+      ReqLLM.Provider.Options.process_stream!(
+        __MODULE__,
+        opts[:operation] || :chat,
+        model,
+        context,
+        opts
+      )
+
+    case validate_openrouter_stream_content(context) do
+      :ok ->
+        ReqLLM.Provider.Defaults.default_attach_stream(
+          __MODULE__,
+          model,
+          context,
+          processed_opts,
+          finch_name
+        )
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  @impl ReqLLM.Provider
   def translate_options(_operation, model, opts) do
     warnings = []
 
@@ -353,11 +379,15 @@ defmodule ReqLLM.Providers.OpenRouter do
 
   @impl ReqLLM.Provider
   def build_body(request) do
-    ReqLLM.Provider.Defaults.default_build_body(request)
-    |> encode_file_parser_pdf_files(request.options)
+    original_context = request.options[:context]
+
+    request
+    |> strip_reasoning_details_from_context()
+    |> ReqLLM.Provider.Defaults.default_build_body()
+    |> encode_openrouter_content_parts(request.options)
     |> add_embedding_options(request.options)
     |> translate_tool_choice_format()
-    |> encode_reasoning_details_in_messages()
+    |> encode_reasoning_details_in_messages(original_context)
     |> maybe_put(:models, request.options[:openrouter_models])
     |> maybe_put(:route, request.options[:openrouter_route])
     |> maybe_put(:provider, request.options[:openrouter_provider])
@@ -375,12 +405,12 @@ defmodule ReqLLM.Providers.OpenRouter do
     |> add_stream_options(request.options)
   end
 
-  defp encode_file_parser_pdf_files(body, request_options) do
+  defp encode_openrouter_content_parts(body, request_options) do
     context = request_options[:context]
     plugins = request_options[:openrouter_plugins]
 
-    if file_parser_plugin?(plugins) and match?(%ReqLLM.Context{}, context) do
-      replace_file_parser_messages(body, context)
+    if match?(%ReqLLM.Context{}, context) do
+      replace_openrouter_content_messages(body, context, file_parser_plugin?(plugins))
     else
       body
     end
@@ -396,39 +426,61 @@ defmodule ReqLLM.Providers.OpenRouter do
 
   defp file_parser_plugin?(_plugins), do: false
 
-  defp replace_file_parser_messages(%{messages: encoded_messages} = body, context)
+  defp replace_openrouter_content_messages(
+         %{messages: encoded_messages} = body,
+         context,
+         pdf_files?
+       )
        when is_list(encoded_messages) do
-    Map.put(body, :messages, encode_file_parser_messages(encoded_messages, context.messages))
+    Map.put(
+      body,
+      :messages,
+      encode_openrouter_content_messages(encoded_messages, context.messages, pdf_files?)
+    )
   end
 
-  defp replace_file_parser_messages(%{"messages" => encoded_messages} = body, context)
+  defp replace_openrouter_content_messages(
+         %{"messages" => encoded_messages} = body,
+         context,
+         pdf_files?
+       )
        when is_list(encoded_messages) do
-    Map.put(body, "messages", encode_file_parser_messages(encoded_messages, context.messages))
+    Map.put(
+      body,
+      "messages",
+      encode_openrouter_content_messages(encoded_messages, context.messages, pdf_files?)
+    )
   end
 
-  defp replace_file_parser_messages(body, _context), do: body
+  defp replace_openrouter_content_messages(body, _context, _pdf_files?), do: body
 
-  defp encode_file_parser_messages(encoded_messages, context_messages)
+  defp encode_openrouter_content_messages(encoded_messages, context_messages, pdf_files?)
        when length(encoded_messages) == length(context_messages) do
     encoded_messages
     |> Enum.zip(context_messages)
     |> Enum.map(fn {encoded_message, context_message} ->
-      encode_file_parser_message(encoded_message, context_message)
+      encode_openrouter_content_message(encoded_message, context_message, pdf_files?)
     end)
   end
 
-  defp encode_file_parser_messages(encoded_messages, _context_messages), do: encoded_messages
+  defp encode_openrouter_content_messages(encoded_messages, _context_messages, _pdf_files?),
+    do: encoded_messages
 
-  defp encode_file_parser_message(encoded_message, %ReqLLM.Message{content: content})
+  defp encode_openrouter_content_message(
+         encoded_message,
+         %ReqLLM.Message{content: content},
+         pdf_files?
+       )
        when is_list(content) do
-    if Enum.any?(content, &openrouter_pdf_file_part?/1) do
-      put_message_content(encoded_message, encode_openrouter_content(content))
+    if Enum.any?(content, &openrouter_reencoded_content_part?(&1, pdf_files?)) do
+      put_message_content(encoded_message, encode_openrouter_content(content, pdf_files?))
     else
       encoded_message
     end
   end
 
-  defp encode_file_parser_message(encoded_message, _message), do: encoded_message
+  defp encode_openrouter_content_message(encoded_message, _message, _pdf_files?),
+    do: encoded_message
 
   defp put_message_content(%{content: _} = message, content),
     do: Map.put(message, :content, content)
@@ -438,9 +490,9 @@ defmodule ReqLLM.Providers.OpenRouter do
 
   defp put_message_content(message, content), do: Map.put(message, :content, content)
 
-  defp encode_openrouter_content(content) do
+  defp encode_openrouter_content(content, pdf_files?) do
     content
-    |> Enum.map(&encode_openrouter_content_part/1)
+    |> Enum.map(&encode_openrouter_content_part(&1, pdf_files?))
     |> Enum.reject(&is_nil/1)
     |> normalize_openrouter_content()
   end
@@ -453,29 +505,38 @@ defmodule ReqLLM.Providers.OpenRouter do
 
   defp normalize_openrouter_content(content), do: content
 
-  defp encode_openrouter_content_part(%ContentPart{type: :text, text: text, metadata: metadata}) do
+  defp encode_openrouter_content_part(
+         %ContentPart{type: :text, text: text, metadata: metadata},
+         _pdf_files?
+       ) do
     %{type: "text", text: text}
     |> merge_content_metadata(metadata)
   end
 
-  defp encode_openrouter_content_part(%ContentPart{
-         type: :image,
-         data: data,
-         media_type: media_type,
-         metadata: metadata
-       })
+  defp encode_openrouter_content_part(
+         %ContentPart{
+           type: :image,
+           data: data,
+           media_type: media_type,
+           metadata: metadata
+         },
+         _pdf_files?
+       )
        when is_binary(data) do
     data
     |> image_url_content_part(media_type)
     |> merge_content_metadata(metadata)
   end
 
-  defp encode_openrouter_content_part(%ContentPart{
-         type: :image_url,
-         url: url,
-         media_type: media_type,
-         metadata: metadata
-       }) do
+  defp encode_openrouter_content_part(
+         %ContentPart{
+           type: :image_url,
+           url: url,
+           media_type: media_type,
+           metadata: metadata
+         },
+         _pdf_files?
+       ) do
     image_url_map = %{url: url}
 
     image_url_map =
@@ -489,23 +550,55 @@ defmodule ReqLLM.Providers.OpenRouter do
     |> merge_content_metadata(metadata)
   end
 
-  defp encode_openrouter_content_part(%ContentPart{type: :file, data: data} = part)
+  defp encode_openrouter_content_part(%ContentPart{type: :file, data: data} = part, pdf_files?)
        when is_binary(data) do
-    if openrouter_pdf_file_part?(part) do
-      %{
-        type: "file",
-        file: %{
-          filename: openrouter_file_filename(part),
-          file_data: "data:#{openrouter_file_media_type(part)};base64,#{Base.encode64(data)}"
+    cond do
+      openrouter_input_audio_part?(part) ->
+        data
+        |> input_audio_content_part(openrouter_input_audio_format(part))
+        |> merge_content_metadata(part.metadata)
+
+      openrouter_audio_file_part?(part) ->
+        raise ReqLLM.Error.Invalid.Message.exception(
+                reason:
+                  "OpenRouter chat audio input supports only mp3 and wav file parts; got #{inspect(part.media_type)}."
+              )
+
+      pdf_files? and openrouter_pdf_file_part?(part) ->
+        %{
+          type: "file",
+          file: %{
+            filename: openrouter_file_filename(part),
+            file_data: "data:#{openrouter_file_media_type(part)};base64,#{Base.encode64(data)}"
+          }
         }
-      }
-    else
-      image_url_content_part(data, part.media_type)
+
+      true ->
+        image_url_content_part(data, part.media_type)
     end
   end
 
-  defp encode_openrouter_content_part(%ContentPart{type: :thinking}), do: nil
-  defp encode_openrouter_content_part(_part), do: nil
+  defp encode_openrouter_content_part(%ContentPart{type: :thinking}, _pdf_files?), do: nil
+  defp encode_openrouter_content_part(_part, _pdf_files?), do: nil
+
+  defp openrouter_reencoded_content_part?(part, true) do
+    openrouter_input_audio_part?(part) or openrouter_audio_file_part?(part) or
+      openrouter_pdf_file_part?(part)
+  end
+
+  defp openrouter_reencoded_content_part?(part, _pdf_files?) do
+    openrouter_input_audio_part?(part) or openrouter_audio_file_part?(part)
+  end
+
+  defp input_audio_content_part(data, format) do
+    %{
+      type: "input_audio",
+      input_audio: %{
+        data: Base.encode64(data),
+        format: format
+      }
+    }
+  end
 
   defp image_url_content_part(data, media_type) do
     %{
@@ -522,6 +615,73 @@ defmodule ReqLLM.Providers.OpenRouter do
   end
 
   defp openrouter_pdf_file_part?(_part), do: false
+
+  defp openrouter_audio_file_part?(%ContentPart{type: :file, data: data, media_type: media_type})
+       when is_binary(data) and is_binary(media_type) do
+    media_type
+    |> normalize_openrouter_media_type()
+    |> String.starts_with?("audio/")
+  end
+
+  defp openrouter_audio_file_part?(_part), do: false
+
+  defp openrouter_input_audio_part?(%ContentPart{type: :file, data: data} = part)
+       when is_binary(data) do
+    is_binary(openrouter_input_audio_format(part))
+  end
+
+  defp openrouter_input_audio_part?(_part), do: false
+
+  defp openrouter_input_audio_format(%ContentPart{media_type: media_type, filename: filename}) do
+    case openrouter_audio_format_from_media_type(media_type) do
+      format when is_binary(format) -> format
+      nil -> openrouter_audio_format_from_non_audio_media_type(media_type, filename)
+    end
+  end
+
+  defp openrouter_audio_format_from_media_type(media_type) when is_binary(media_type) do
+    case normalize_openrouter_media_type(media_type) do
+      "audio/mpeg" -> "mp3"
+      "audio/mp3" -> "mp3"
+      "audio/wav" -> "wav"
+      "audio/wave" -> "wav"
+      "audio/x-wav" -> "wav"
+      _ -> nil
+    end
+  end
+
+  defp openrouter_audio_format_from_media_type(_media_type), do: nil
+
+  defp openrouter_audio_format_from_non_audio_media_type(media_type, filename)
+       when is_binary(media_type) do
+    if String.starts_with?(normalize_openrouter_media_type(media_type), "audio/") do
+      nil
+    else
+      openrouter_audio_format_from_filename(filename)
+    end
+  end
+
+  defp openrouter_audio_format_from_non_audio_media_type(_media_type, filename) do
+    openrouter_audio_format_from_filename(filename)
+  end
+
+  defp normalize_openrouter_media_type(media_type) do
+    media_type
+    |> String.downcase()
+    |> String.split(";", parts: 2)
+    |> List.first()
+    |> String.trim()
+  end
+
+  defp openrouter_audio_format_from_filename(filename) when is_binary(filename) do
+    case filename |> String.downcase() |> Path.extname() do
+      ".mp3" -> "mp3"
+      ".wav" -> "wav"
+      _ -> nil
+    end
+  end
+
+  defp openrouter_audio_format_from_filename(_filename), do: nil
 
   defp openrouter_pdf_filename?(filename) when is_binary(filename) do
     filename
@@ -561,6 +721,27 @@ defmodule ReqLLM.Providers.OpenRouter do
   end
 
   defp merge_content_metadata(base, _metadata), do: base
+
+  defp validate_openrouter_stream_content(%ReqLLM.Context{messages: messages}) do
+    messages
+    |> Stream.flat_map(&openrouter_message_content/1)
+    |> Enum.find_value(:ok, &unsupported_openrouter_audio_error/1)
+  end
+
+  defp openrouter_message_content(%ReqLLM.Message{content: content}) when is_list(content),
+    do: content
+
+  defp openrouter_message_content(_message), do: []
+
+  defp unsupported_openrouter_audio_error(part) do
+    if openrouter_audio_file_part?(part) and not openrouter_input_audio_part?(part) do
+      {:error,
+       ReqLLM.Error.Invalid.Message.exception(
+         reason:
+           "OpenRouter chat audio input supports only mp3 and wav file parts; got #{inspect(part.media_type)}."
+       )}
+    end
+  end
 
   defp add_embedding_options(body, request_options) do
     if request_options[:operation] == :embedding do
@@ -777,72 +958,93 @@ defmodule ReqLLM.Providers.OpenRouter do
   defp extract_reasoning_details(_), do: nil
 
   defp normalize_reasoning_detail({raw, fallback_index}) do
-    %ReqLLM.Message.ReasoningDetails{
-      text: raw["text"],
-      signature: raw["signature"],
-      encrypted?: raw["signature_encrypted"] || false,
-      provider: :openrouter,
-      format: raw["format"] || "openrouter-v1",
-      index: raw["index"] || fallback_index,
-      provider_data: %{"type" => raw["type"]}
-    }
+    ReqLLM.Message.ReasoningDetails.from_openai_compatible(
+      raw,
+      :openrouter,
+      fallback_index,
+      "openrouter-v1"
+    )
   end
 
-  defp encode_reasoning_details_in_messages(%{messages: messages} = body)
-       when is_list(messages) do
-    updated_messages = Enum.map(messages, &encode_message_reasoning_details/1)
-    Map.put(body, :messages, updated_messages)
+  defp strip_reasoning_details_from_context(%Req.Request{options: options} = request) do
+    case options[:context] do
+      %ReqLLM.Context{messages: messages} = context ->
+        stripped_messages =
+          Enum.map(messages, fn
+            %ReqLLM.Message{} = message -> %{message | reasoning_details: nil}
+            message -> message
+          end)
+
+        put_in(request.options[:context], %{context | messages: stripped_messages})
+
+      _ ->
+        request
+    end
   end
 
-  defp encode_reasoning_details_in_messages(%{"messages" => messages} = body)
-       when is_list(messages) do
-    updated_messages = Enum.map(messages, &encode_message_reasoning_details/1)
-    Map.put(body, "messages", updated_messages)
+  defp encode_reasoning_details_in_messages(body, %ReqLLM.Context{messages: context_messages}) do
+    cond do
+      is_list(Map.get(body, :messages)) ->
+        updated_messages = encode_messages_reasoning_details(body.messages, context_messages)
+        Map.put(body, :messages, updated_messages)
+
+      is_list(Map.get(body, "messages")) ->
+        updated_messages = encode_messages_reasoning_details(body["messages"], context_messages)
+        Map.put(body, "messages", updated_messages)
+
+      true ->
+        body
+    end
   end
 
-  defp encode_reasoning_details_in_messages(body), do: body
+  defp encode_reasoning_details_in_messages(body, _context), do: body
 
-  defp encode_message_reasoning_details(%{reasoning_details: details} = message)
+  defp encode_messages_reasoning_details(encoded_messages, context_messages)
+       when length(encoded_messages) == length(context_messages) do
+    encoded_messages
+    |> Enum.zip(context_messages)
+    |> Enum.map(fn {encoded_message, context_message} ->
+      encode_message_reasoning_details(encoded_message, context_message)
+    end)
+  end
+
+  defp encode_messages_reasoning_details(encoded_messages, _context_messages),
+    do: encoded_messages
+
+  defp encode_message_reasoning_details(encoded_message, %ReqLLM.Message{
+         reasoning_details: details
+       })
        when is_list(details) and details != [] do
     encoded_details =
       details
       |> Enum.map(&encode_single_reasoning_detail/1)
       |> Enum.reject(&is_nil/1)
 
-    if encoded_details == [] do
-      Map.delete(message, :reasoning_details)
-    else
-      Map.put(message, :reasoning_details, encoded_details)
-    end
+    put_encoded_reasoning_details(encoded_message, encoded_details)
   end
 
-  defp encode_message_reasoning_details(%{"reasoning_details" => details} = message)
-       when is_list(details) and details != [] do
-    encoded_details =
-      details
-      |> Enum.map(&encode_single_reasoning_detail/1)
-      |> Enum.reject(&is_nil/1)
+  defp encode_message_reasoning_details(encoded_message, _context_message), do: encoded_message
 
-    if encoded_details == [] do
-      Map.delete(message, "reasoning_details")
-    else
-      Map.put(message, "reasoning_details", encoded_details)
-    end
+  defp put_encoded_reasoning_details(message, []) when is_map(message) do
+    message
+    |> Map.delete(:reasoning_details)
+    |> Map.delete("reasoning_details")
   end
 
-  defp encode_message_reasoning_details(message), do: message
+  defp put_encoded_reasoning_details(%{} = message, details) do
+    cond do
+      Map.has_key?(message, :role) -> Map.put(message, :reasoning_details, details)
+      Map.has_key?(message, "role") -> Map.put(message, "reasoning_details", details)
+      true -> Map.put(message, :reasoning_details, details)
+    end
+  end
 
   defp encode_single_reasoning_detail(
          %ReqLLM.Message.ReasoningDetails{provider: :openrouter} = detail
        ) do
-    base = %{
-      "type" => detail.provider_data["type"] || "reasoning.text",
-      "format" => detail.format,
-      "index" => detail.index,
-      "text" => detail.text
-    }
-
-    if detail.signature, do: Map.put(base, "signature", detail.signature), else: base
+    detail
+    |> ReqLLM.Message.ReasoningDetails.to_openai_compatible()
+    |> Map.put_new("type", "reasoning.text")
   end
 
   defp encode_single_reasoning_detail(%ReqLLM.Message.ReasoningDetails{provider: provider}) do
@@ -851,16 +1053,9 @@ defmodule ReqLLM.Providers.OpenRouter do
   end
 
   defp encode_single_reasoning_detail(%{"provider" => "openrouter"} = decoded_struct) do
-    base = %{
-      "type" => get_in(decoded_struct, ["provider_data", "type"]) || "reasoning.text",
-      "format" => decoded_struct["format"],
-      "index" => decoded_struct["index"],
-      "text" => decoded_struct["text"]
-    }
-
-    if decoded_struct["signature"],
-      do: Map.put(base, "signature", decoded_struct["signature"]),
-      else: base
+    decoded_struct
+    |> openrouter_reasoning_detail_to_wire()
+    |> Map.put_new("type", "reasoning.text")
   end
 
   defp encode_single_reasoning_detail(%{"provider" => provider}) when is_binary(provider) do
@@ -873,6 +1068,28 @@ defmodule ReqLLM.Providers.OpenRouter do
   end
 
   defp encode_single_reasoning_detail(_), do: nil
+
+  defp openrouter_reasoning_detail_to_wire(detail) do
+    detail
+    |> Map.get("provider_data", %{})
+    |> ensure_map()
+    |> put_wire_field("text", detail["text"])
+    |> put_wire_field("signature", detail["signature"])
+    |> put_wire_field("signature_encrypted", encrypted_signature?(detail))
+    |> put_wire_field("format", detail["format"])
+    |> put_wire_field("index", detail["index"])
+  end
+
+  defp encrypted_signature?(%{"encrypted?" => true}), do: true
+  defp encrypted_signature?(%{"encrypted" => true}), do: true
+  defp encrypted_signature?(_detail), do: nil
+
+  defp put_wire_field(map, _key, nil), do: map
+  defp put_wire_field(map, _key, ""), do: map
+  defp put_wire_field(map, key, value), do: Map.put(map, key, value)
+
+  defp ensure_map(map) when is_map(map), do: map
+  defp ensure_map(_), do: %{}
 
   defp attach_reasoning_details_to_response(resp, nil), do: resp
 

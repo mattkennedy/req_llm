@@ -822,25 +822,33 @@ defmodule ReqLLM.Provider.Defaults do
   Provider.Defaults for the protocol removal refactoring.
   """
   @spec encode_context_to_openai_format(ReqLLM.Context.t(), String.t()) :: map()
-  def encode_context_to_openai_format(%ReqLLM.Context{messages: messages}, _model_name) do
+  def encode_context_to_openai_format(context, model_name) do
+    encode_context_to_openai_format(context, model_name, [])
+  end
+
+  @spec encode_context_to_openai_format(ReqLLM.Context.t(), String.t(), keyword()) :: map()
+  def encode_context_to_openai_format(%ReqLLM.Context{messages: messages}, _model_name, opts) do
     %{
-      messages: encode_openai_messages(messages)
+      messages: encode_openai_messages(messages, opts)
     }
   end
 
-  defp encode_openai_messages(messages) do
-    Enum.map(messages, &encode_openai_message/1)
+  defp encode_openai_messages(messages, opts) do
+    Enum.map(messages, &encode_openai_message(&1, opts))
   end
 
-  defp encode_openai_message(%ReqLLM.Message{
-         role: r,
-         content: c,
-         tool_calls: tc,
-         tool_call_id: tcid,
-         name: name,
-         reasoning_details: rd,
-         metadata: metadata
-       }) do
+  defp encode_openai_message(
+         %ReqLLM.Message{
+           role: r,
+           content: c,
+           tool_calls: tc,
+           tool_call_id: tcid,
+           name: name,
+           reasoning_details: rd,
+           metadata: metadata
+         },
+         opts
+       ) do
     {reasoning_content, content_without_thinking} = extract_reasoning_content(c)
 
     base_message = %{
@@ -849,11 +857,11 @@ defmodule ReqLLM.Provider.Defaults do
     }
 
     base_message
-    |> maybe_add_field(:tool_calls, tc)
+    |> maybe_add_field(:tool_calls, encode_openai_tool_calls(tc))
     |> maybe_add_field(:tool_call_id, tcid)
     |> maybe_add_field(:name, name)
     |> maybe_add_assistant_reasoning(r, reasoning_content)
-    |> maybe_add_field(:reasoning_details, rd)
+    |> maybe_add_reasoning_details(rd, Keyword.get(opts, :encode_reasoning_details?, false))
     |> maybe_add_field(:metadata, metadata)
   end
 
@@ -884,11 +892,54 @@ defmodule ReqLLM.Provider.Defaults do
   defp maybe_add_field(message, _key, %{} = value) when map_size(value) == 0, do: message
   defp maybe_add_field(message, key, value), do: Map.put(message, key, value)
 
+  defp maybe_add_reasoning_details(message, nil, _encode?), do: message
+  defp maybe_add_reasoning_details(message, [], _encode?), do: message
+
+  defp maybe_add_reasoning_details(message, details, true) when is_list(details) do
+    encoded_details =
+      details
+      |> Enum.map(&encode_reasoning_detail_for_openai/1)
+      |> Enum.reject(&is_nil/1)
+
+    maybe_add_field(message, :reasoning_details, encoded_details)
+  end
+
+  defp maybe_add_reasoning_details(message, details, false) when is_list(details) do
+    maybe_add_field(message, :reasoning_details, details)
+  end
+
+  defp maybe_add_reasoning_details(message, _details, _encode?), do: message
+
+  defp encode_reasoning_detail_for_openai(%ReqLLM.Message.ReasoningDetails{} = detail) do
+    ReqLLM.Message.ReasoningDetails.to_openai_compatible(detail)
+  end
+
+  defp encode_reasoning_detail_for_openai(_detail), do: nil
+
   defp maybe_add_assistant_reasoning(message, :assistant, reasoning_content) do
     maybe_add_field(message, :reasoning_content, reasoning_content)
   end
 
   defp maybe_add_assistant_reasoning(message, _, _), do: message
+
+  defp encode_openai_tool_calls(nil), do: nil
+  defp encode_openai_tool_calls([]), do: []
+
+  defp encode_openai_tool_calls(tool_calls) when is_list(tool_calls),
+    do: Enum.map(tool_calls, &encode_openai_tool_call/1)
+
+  defp encode_openai_tool_call(%ReqLLM.ToolCall{id: id, type: type, function: function}) do
+    %{
+      id: id,
+      type: type,
+      function: %{
+        name: function.name,
+        arguments: function.arguments
+      }
+    }
+  end
+
+  defp encode_openai_tool_call(tool_call), do: tool_call
 
   defp encode_openai_content(content) when is_binary(content), do: content
 
@@ -956,6 +1007,8 @@ defmodule ReqLLM.Provider.Defaults do
         image_url_map
       end
 
+    image_url_map = maybe_put_image_detail(image_url_map, metadata)
+
     %{
       type: "image_url",
       image_url: image_url_map
@@ -967,6 +1020,17 @@ defmodule ReqLLM.Provider.Defaults do
     raise ReqLLM.Error.Invalid.Message.exception(
             reason: "Video URLs are not supported for this provider."
           )
+  end
+
+  defp encode_openai_content_part(%ReqLLM.Message.ContentPart{
+         type: :file,
+         file_id: file_id
+       })
+       when is_binary(file_id) and file_id != "" do
+    %{
+      type: "file",
+      file: %{file_id: file_id}
+    }
   end
 
   defp encode_openai_content_part(%ReqLLM.Message.ContentPart{
@@ -991,6 +1055,14 @@ defmodule ReqLLM.Provider.Defaults do
   defp encode_openai_content_part(%ReqLLM.Message.ContentPart{type: :thinking}), do: nil
 
   defp encode_openai_content_part(_), do: nil
+
+  defp maybe_put_image_detail(image_url, %{detail: detail}) when not is_nil(detail),
+    do: Map.put(image_url, :detail, detail)
+
+  defp maybe_put_image_detail(image_url, %{"detail" => detail}) when not is_nil(detail),
+    do: Map.put(image_url, :detail, detail)
+
+  defp maybe_put_image_detail(image_url, _metadata), do: image_url
 
   @passthrough_metadata_keys [:cache_control, "cache_control"]
 
@@ -1061,14 +1133,17 @@ defmodule ReqLLM.Provider.Defaults do
 
     finish_reason = parse_openai_finish_reason(Map.get(first_choice, "finish_reason"))
 
-    content_chunks =
+    {content_chunks, raw_message} =
       case first_choice do
-        %{"message" => message} -> decode_openai_message(message)
-        %{"delta" => delta} -> decode_openai_delta(delta)
-        _ -> []
+        %{"message" => message} -> {decode_openai_message(message), message}
+        %{"delta" => delta} -> {decode_openai_delta(delta), delta}
+        _ -> {[], %{}}
       end
 
-    message = build_openai_message_from_chunks(content_chunks)
+    message =
+      content_chunks
+      |> build_openai_message_from_chunks()
+      |> put_openai_reasoning_details(raw_message, model.provider)
 
     context = %ReqLLM.Context{
       messages: [message]
@@ -1129,7 +1204,8 @@ defmodule ReqLLM.Provider.Defaults do
             reasoning_details_chunks =
               case delta do
                 %{"reasoning_details" => details} when is_list(details) and details != [] ->
-                  [ReqLLM.StreamChunk.meta(%{reasoning_details: details})]
+                  reasoning_details = decode_openai_reasoning_details(details, model.provider)
+                  [ReqLLM.StreamChunk.meta(%{reasoning_details: reasoning_details})]
 
                 _ ->
                   []
@@ -1235,6 +1311,39 @@ defmodule ReqLLM.Provider.Defaults do
   end
 
   defp decode_openai_tool_calls(_), do: []
+
+  defp put_openai_reasoning_details(message, %{"reasoning_details" => details}, provider)
+       when is_list(details) and details != [] do
+    normalized_details = decode_openai_reasoning_details(details, provider)
+
+    if normalized_details == [] do
+      message
+    else
+      %{message | reasoning_details: normalized_details}
+    end
+  end
+
+  defp put_openai_reasoning_details(message, _raw_message, _provider), do: message
+
+  defp decode_openai_reasoning_details(details, provider) when is_list(details) do
+    details
+    |> Enum.with_index()
+    |> Enum.map(&decode_openai_reasoning_detail(&1, provider))
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp decode_openai_reasoning_detail(
+         {%ReqLLM.Message.ReasoningDetails{} = detail, _fallback_index},
+         _provider
+       ) do
+    detail
+  end
+
+  defp decode_openai_reasoning_detail({raw, fallback_index}, provider) when is_map(raw) do
+    ReqLLM.Message.ReasoningDetails.from_openai_compatible(raw, provider, fallback_index)
+  end
+
+  defp decode_openai_reasoning_detail(_detail, _provider), do: nil
 
   defp decode_openai_content_part(%{"type" => "text", "text" => text}) do
     [ReqLLM.StreamChunk.text(text)]
@@ -1580,7 +1689,7 @@ defmodule ReqLLM.Provider.Defaults do
       case request.options[:context] do
         %ReqLLM.Context{} = ctx ->
           model_name = request.options[:model]
-          encode_context_to_openai_format(ctx, model_name)
+          encode_context_to_openai_format(ctx, model_name, encode_reasoning_details?: true)
 
         _ ->
           %{messages: request.options[:messages] || []}
@@ -1618,8 +1727,11 @@ defmodule ReqLLM.Provider.Defaults do
     response_format = request.options[:response_format] || provider_opts[:response_format]
 
     case response_format do
-      format when is_map(format) -> Map.put(body, :response_format, format)
-      _ -> body
+      format when is_map(format) ->
+        ReqLLM.Providers.OpenAI.AdapterHelpers.add_response_format(body, response_format: format)
+
+      _other ->
+        body
     end
   end
 
