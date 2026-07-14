@@ -1627,10 +1627,12 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert [] = ResponsesAPI.decode_stream_event(event, model)
     end
 
-    test "ignores reasoning summary text done event", %{model: model} do
+    test "emits a paragraph break when a reasoning summary part completes", %{model: model} do
       event = %{data: %{"event" => "response.reasoning_summary_text.done"}}
 
-      assert [] = ResponsesAPI.decode_stream_event(event, model)
+      assert [chunk] = ResponsesAPI.decode_stream_event(event, model)
+      assert chunk.type == :thinking
+      assert chunk.text == "\n\n"
     end
 
     test "ignores reasoning summary part done event", %{model: model} do

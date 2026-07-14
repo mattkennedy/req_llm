@@ -156,7 +156,14 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
         if text == "", do: [], else: [ReqLLM.StreamChunk.thinking(text, thinking_metadata(data))]
 
       "response.reasoning_summary_text.done" ->
-        []
+        # Each reasoning summary is emitted as one or more distinct parts (each a
+        # section like "**Heading**\n\nbody"). The backend streams the parts'
+        # deltas back-to-back with no delimiter between them, so without a break
+        # here consecutive parts smash together ("...analysis**" + "**Searching...")
+        # and render as malformed markdown ("****", run-on words). Close each part
+        # with a paragraph break so parts stay separate blocks. Accumulates into
+        # the streamed response's reasoning the same as any thinking chunk.
+        [ReqLLM.StreamChunk.thinking("\n\n")]
 
       "response.reasoning_summary_part.done" ->
         []
