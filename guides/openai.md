@@ -93,15 +93,81 @@ ReqLLM.generate_text(
 
 If you need to customize the refresh HTTP client, pass `oauth_http_options` under `provider_options`.
 
-For `openai_codex`, you can also override the backend headers with:
+For `openai_codex`, you can also override backend request headers with:
 
 - `provider_options: [chatgpt_account_id: "..."]`
 - `provider_options: [codex_originator: "pi"]`
 
+ReqLLM applies the complete Responses Lite wire profile when the Codex model catalog marks a model with `use_responses_lite: true`. The bundled catalog currently enables that profile for GPT-5.6 Sol, Terra, and Luna. Explicit model specs can provide updated provider metadata under `extra.openai_codex.use_responses_lite`.
+
+Responses Lite is an internal Codex backend contract, not a mode of the public OpenAI Responses API. It sends instructions and client-executed tools as input items, uses persistent reasoning context, disables parallel tool calls, and marks the request with the Codex Responses Lite header. The canonical behavior is defined by the [Codex model metadata](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/openai_models.rs) and [Responses Lite contract tests](https://github.com/openai/codex/blob/main/codex-rs/core/tests/suite/responses_lite.rs).
+
 ## Attachments
 
 OpenAI Chat Completions API only supports image attachments (JPEG, PNG, GIF, WebP).
-For document support (PDFs, etc.), use Anthropic or Google providers.
+OpenAI Responses models also support image and PDF file inputs. Inline and URL
+attachments continue to work as before.
+
+### Reusable OpenAI files
+
+`ReqLLM.Providers.OpenAI.Files` exposes the OpenAI Files lifecycle without
+adding uploads to the common provider behaviour. Uploading once can avoid
+repeating a large inline payload across Responses calls:
+
+```elixir
+alias ReqLLM.Message.ContentPart
+alias ReqLLM.Providers.OpenAI.Files
+
+{:ok, file} =
+  Files.upload(
+    ContentPart.file(pdf_bytes, "report.pdf", "application/pdf"),
+    purpose: :user_data,
+    expires_after: 86_400
+  )
+
+context =
+  ReqLLM.Context.new([
+    ReqLLM.Context.user([
+      ContentPart.text("Summarize this report."),
+      file
+    ])
+  ])
+
+{:ok, response} = ReqLLM.generate_text("openai:gpt-5", context)
+```
+
+`Files.upload/2` accepts an inline file `ContentPart`, a local path, or an
+explicit `{:binary, data, filename, media_type}` tuple. It returns the same
+owned `ContentPart` shape documented in [Data Structures](data-structures.md),
+including OpenAI ownership, purpose, filename, media type, size, status, and
+expiry when available. Inline inputs also include a locally calculated SHA-256.
+Local paths are streamed into the multipart request instead of being loaded
+into one large binary.
+
+Lifecycle operations remain provider-scoped:
+
+```elixir
+{:ok, current} = Files.retrieve(file)
+{:ok, %Files.Page{files: files, has_more: has_more}} =
+  Files.list(purpose: :user_data, limit: 100)
+
+{:ok, true} = Files.delete(current)
+```
+
+OpenAI retains most uploaded files until they are deleted. Use
+`:expires_after` when supported by the selected purpose, or delete references
+when they are no longer needed. Deletion accepts a known-expired reference so
+cleanup remains possible. The caller remains responsible for retention,
+pagination, and cleanup; ReqLLM does not run background workers or upload
+inputs automatically.
+
+Treat returned references as sensitive. Regular inspection and ReqLLM
+telemetry redact provider IDs, URLs, credentials, and file contents. Use
+`ContentPart.provider_file_reference/1` only when the complete provider record
+is required.
+
+See the [OpenAI Files API reference](https://platform.openai.com/docs/api-reference/files)
+for current purposes, retention rules, and service limits.
 
 ## Dual API Architecture
 
@@ -109,6 +175,26 @@ OpenAI provider automatically routes between two APIs based on model metadata:
 
 - **Chat Completions API**: Standard GPT models (gpt-4o, gpt-4-turbo, gpt-3.5-turbo)
 - **Responses API**: Reasoning models (o1, o3, o4-mini, gpt-5) with extended thinking
+
+### Chat Completions responsibilities
+
+The V1 provider callbacks and transports remain unchanged. Internally, Chat
+Completions responsibilities are intentionally narrow:
+
+| Responsibility | Before | Current owner |
+| --- | --- | --- |
+| Select Chat Completions or Responses and attach the Req pipeline | `ReqLLM.Providers.OpenAI` | `ReqLLM.Providers.OpenAI` |
+| Implement the Chat Completions driver callbacks and assemble its Finch request | `ReqLLM.Providers.OpenAI.ChatAPI` | `ReqLLM.Providers.OpenAI.ChatAPI` |
+| Build the exact request envelope used by both Req and Finch | private functions mixed into `ChatAPI` | <code>ReqLLM.Providers.OpenAI.ChatAPI.Request</code> |
+| Encode OpenAI-compatible messages and decode buffered/SSE wire data | `ReqLLM.Provider.Defaults` | `ReqLLM.Provider.Defaults` |
+| Accumulate chunks and materialize canonical responses | `ReqLLM.Provider.ChunkAccumulator` and response builders | unchanged shared modules |
+
+The request-envelope seam removes duplicate strict-tool and parallel-tool
+normalization by reusing `ReqLLM.Providers.OpenAI.AdapterHelpers`. SSE decoding,
+transport construction, and response handoff already have single owners, so they
+remain in place. This is an internal refactor: Req remains the buffered
+transport, Finch remains the streaming transport, and the existing
+`ReqLLM.Provider` callbacks and request/response shapes are preserved.
 
 ## Provider Options
 
@@ -271,7 +357,40 @@ ReqLLM also exposes an experimental low-level Realtime WebSocket client for sess
 :ok = ReqLLM.OpenAI.Realtime.close(session)
 ```
 
-This API is intentionally low-level. You send JSON events, receive JSON events, and manage the session lifecycle explicitly.
+This API is intentionally low-level. You send JSON events, receive JSON events, and manage the session lifecycle explicitly. Existing `next_event/2` calls continue to return the decoded OpenAI event unchanged.
+
+For consumers that already understand `ReqLLM.StreamEvent`, use the additive projected view:
+
+```elixir
+{:ok, projected} = ReqLLM.OpenAI.Realtime.next_projected_event(session)
+
+projected.type
+#=> "response.output_text.delta"
+
+projected.native
+#=> the native event with sensitive payloads redacted
+
+projected.stream_events
+#=> [%ReqLLM.StreamEvent{type: :text_delta, data: "[REDACTED]", ...}]
+```
+
+Pass `payloads: :raw` only when that consumer is authorized to retain text, audio transcripts, tool arguments/results, and provider error messages. Raw audio deltas, input transcription, session/control events, rate limits, MCP and other provider-native tools, and recoverable session errors remain native-only because ReqLLM has no exact portable event for them.
+
+The experimental projection is intentionally narrow:
+
+| OpenAI Realtime event | Portable projection |
+| --- | --- |
+| `response.created` | `:start` when the resolved session model is available |
+| `response.output_text.delta` | `:text_delta` |
+| `response.output_audio_transcript.delta` | `:text_delta` with `modality: :audio_transcript` |
+| application `response.output_item.added` | `:tool_call_start` |
+| `response.function_call_arguments.delta` / `.done` | `:tool_call_delta` / `:tool_call` |
+| application `conversation.item.done` function output | `:tool_result` |
+| `response.done` | optional `:usage`, then one `:finish`, `:cancelled`, or terminal `:error` |
+
+All other events have an empty `stream_events` list and remain available through `native`. This includes top-level `error` events because OpenAI defines many of them as recoverable session errors, while canonical `StreamEvent` errors are terminal. See the [OpenAI Realtime server-event reference](https://platform.openai.com/docs/api-reference/realtime-server-events) for the provider event catalog.
+
+`response.created` starts a canonical response lifecycle, and `response.done` contributes usage followed by exactly one completion, cancellation, or terminal error event. OpenAI event, response, item, call, conversation, session, index, and sequence identifiers are retained for correlation. Reconnecting creates a new provider session; ReqLLM does not hide reconnection or replay events. Applications or Jido continue to own session hosting, reconnection, tool execution, and follow-up calls.
 
 ## Usage Metrics
 

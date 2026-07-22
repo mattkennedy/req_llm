@@ -11,6 +11,8 @@ config :req_llm,
   receive_timeout: 120_000,          # Default response timeout
   stream_receive_timeout: 120_000,   # Streaming chunk timeout
   stream_pool_timeout: 120_000,      # Streaming connection checkout timeout
+  # total_timeout: 180_000,          # Optional whole-call deadline
+  # stream_idle_timeout: 60_000,     # Optional semantic-progress deadline
   stream_pool_protocols: [:http1],   # Default stream pool protocols
   stream_pool_size: 1,               # HTTP/1 connections per stream pool worker
   stream_pool_count: 8,              # Stream pool workers per origin
@@ -35,13 +37,118 @@ config :req_llm,
   debug: false                       # Enable verbose logging
 ```
 
+## Canonical Reasoning Options
+
+ReqLLM accepts provider-neutral reasoning controls on text requests:
+
+```elixir
+ReqLLM.generate_text(
+  "anthropic:claude-sonnet-4-5",
+  "Solve this carefully",
+  reasoning_effort: :high,
+  reasoning_token_budget: 8_192
+)
+```
+
+`reasoning_effort` accepts `:none`, `:minimal`, `:low`, `:medium`, `:high`,
+`:xhigh`, and `:default`. `reasoning_token_budget` refines the request on
+provider surfaces with an explicit thinking budget. Older `reasoning: true` and
+string-valued `reasoning` aliases remain supported, but new code should use the
+canonical options.
+
+Provider-native controls such as Anthropic `thinking` and Google
+`google_thinking_budget` remain available under `provider_options`. Avoid mixing
+canonical and provider-native controls unless you rely on the provider's
+existing precedence rules.
+
+Lossy or ignored reasoning translations are non-fatal by default and emit a
+deterministic warning. `ReqLLM.plan/3` reports the same sanitized warnings
+without making a request. These reasoning advisories do not introduce new
+failures for `on_unsupported: :error`; existing enforceable provider warnings
+retain their current behavior.
+
+## Provider Option Namespaces
+
+ReqLLM 1.x accepts both the existing flat `provider_options` shape and an
+additive provider-keyed shape. Existing calls remain valid and do not warn when
+their flat options are unambiguous:
+
+```elixir
+ReqLLM.generate_text(
+  "openai:gpt-5",
+  "Solve this carefully",
+  provider_options: [reasoning_summary: "auto"]
+)
+```
+
+New code can scope the same options to the selected provider:
+
+```elixir
+ReqLLM.generate_text(
+  "openai:gpt-5",
+  "Solve this carefully",
+  provider_options: [
+    openai: [reasoning_summary: "auto"]
+  ]
+)
+```
+
+Keyword lists and atom-keyed maps are supported:
+
+```elixir
+provider_options: %{
+  openai: %{reasoning_summary: "auto"}
+}
+```
+
+The namespace is always the actual ReqLLM provider identity. Use `azure:` for
+Azure-hosted models, `google_vertex:` for Vertex-hosted models, and
+`openrouter:` for OpenRouter models. Do not use `openai:` or `google:` merely
+because the hosted service uses an OpenAI- or Gemini-compatible wire format.
+Foreign namespaces fail before network I/O.
+
+When forms are combined, precedence is deterministic:
+
+1. Explicit top-level canonical options win over the same namespaced option.
+2. Options under the selected provider namespace win over colliding legacy flat
+   provider options.
+3. Non-colliding flat and namespaced provider options are merged.
+
+Mixed forms emit an actionable warning by default. Set `on_unsupported: :error`
+to reject an ambiguous mix, or `on_unsupported: :ignore` to apply the same
+precedence without logging. Invalid namespace containers, unknown namespaced
+options, duplicate namespaced keys, and foreign provider namespaces are rejected
+before I/O. ReqLLM 1.x does not reject an otherwise valid call merely because it
+uses the legacy flat shape.
+
 ## Timeout Configuration
 
-ReqLLM uses multiple timeout settings to handle different scenarios:
+ReqLLM separates whole-call, transport, semantic-progress, pool-checkout, and
+metadata-wait budgets. The earliest applicable timeout wins.
+
+### `total_timeout` (default: `:infinity`)
+
+An opt-in deadline for one ReqLLM model call. It includes provider requests,
+retry attempts and retry delays, sequential rerank batches, and streamed
+responses. A finite total timeout prevents internal work from extending a call
+past the caller's budget.
+
+```elixir
+config :req_llm, total_timeout: 180_000
+
+ReqLLM.generate_text(model, messages, total_timeout: 60_000)
+ReqLLM.stream_text(model, messages, total_timeout: 120_000)
+```
+
+Set `total_timeout: :infinity` to disable the total deadline. Omitting the
+option preserves ReqLLM 1.x's unlimited total-call behavior.
 
 ### `receive_timeout` (default: 30,000ms)
 
-The standard HTTP response timeout for non-streaming requests. Increase this for slow models or large responses.
+The existing provider-transport inactivity timeout. For buffered requests it
+limits how long the HTTP client waits to receive the response. For Finch
+streaming it applies between raw transport chunks. Transport keepalive traffic
+therefore counts as activity for this timeout.
 
 ```elixir
 config :req_llm, receive_timeout: 60_000
@@ -53,13 +160,36 @@ Per-request override:
 ReqLLM.generate_text("openai:gpt-4o", "Hello", receive_timeout: 60_000)
 ```
 
+`receive_timeout` is not a total-call deadline and is unchanged by the additive
+timeout options.
+
 ### `stream_receive_timeout` (default: inherits from `receive_timeout`)
 
-Timeout between streaming chunks. If no data arrives within this window, the stream fails.
+The global default for streaming `receive_timeout`. If no raw transport chunk
+arrives within this window, the transport fails.
 
 ```elixir
 config :req_llm, stream_receive_timeout: 120_000
 ```
+
+### `stream_idle_timeout` (default: not configured)
+
+An opt-in timeout between semantic stream updates. Text, reasoning, tool calls,
+usage, and meaningful provider metadata reset it; transport keepalives do not.
+Expiry terminates the transport, wakes waiting consumers, emits request
+exception telemetry, and materializes final metadata with
+`finish_reason: :error` and a `%ReqLLM.Error.API.Timeout{kind: :stream_idle}`.
+
+```elixir
+config :req_llm, stream_idle_timeout: 60_000
+
+ReqLLM.stream_text(model, messages, stream_idle_timeout: 30_000)
+```
+
+Omitting this option retains the existing ReqLLM 1.x stream-consumer timeout
+behavior based on `receive_timeout`. Explicit `stream_idle_timeout: :infinity`
+disables the semantic-progress timer while leaving the transport timeout in
+place.
 
 ### `stream_pool_timeout` (when unset: inherits from `stream_receive_timeout`)
 
@@ -136,7 +266,12 @@ config :req_llm, thinking_timeout: 600_000  # 10 minutes
 
 ### `metadata_timeout` (default: 300,000ms)
 
-Timeout for collecting streaming metadata (usage, finish_reason) after the stream completes. Long-running streams or slow providers may need more time.
+Maximum time the concurrent metadata collector waits without semantic stream
+progress. Content, reasoning, tool, and usage events restart a finite wait, so
+active long-running streams are not abandoned based on total elapsed time. This
+controls the metadata accessor; it does not terminate the provider stream. Use
+`stream_idle_timeout` when inactivity should fail and clean up the model call.
+Set it to `:infinity` to disable the metadata wait timeout.
 
 ```elixir
 config :req_llm, metadata_timeout: 120_000
@@ -146,7 +281,24 @@ Per-request override:
 
 ```elixir
 ReqLLM.stream_text("anthropic:claude-haiku-4-5", "Hello", metadata_timeout: 60_000)
+
+ReqLLM.stream_text("anthropic:claude-haiku-4-5", "Hello", metadata_timeout: :infinity)
 ```
+
+### Timeout, cancellation, and retry results
+
+Finite `total_timeout` and `stream_idle_timeout` values produce a structured
+`ReqLLM.Error.API.Timeout` whose `kind` identifies the expired budget. Buffered
+calls return it in `{:error, error}`. Direct stream enumeration preserves the
+existing `ReqLLM.Error.API.Stream` wrapper and places the timeout in `cause`;
+`ReqLLM.StreamResponse.events/1` emits a terminal error event, and materialized
+metadata retains the timeout under `:error` with `finish_reason: :error`.
+
+Caller cancellation remains distinct: it ends successfully with
+`finish_reason: :cancelled`, not a timeout exception. Completed retry attempt
+durations and scheduled delays are available through
+`[:req_llm, :request, :retry]` telemetry. Pool checkout is still governed by
+`pool_timeout`; the total budget can end the call sooner when both are finite.
 
 ### `image_receive_timeout` (default: 120,000ms)
 

@@ -1,6 +1,8 @@
 defmodule ReqLLM.ToolTest do
   use ExUnit.Case, async: true
 
+  @moduletag contract: :public_api
+
   alias ReqLLM.Tool
 
   # Test fixtures
@@ -478,6 +480,52 @@ defmodule ReqLLM.ToolTest do
                })
 
       assert validated[:pair] == {%{enabled: true}, "ok"}
+    end
+  end
+
+  describe "validate_input/2" do
+    test "returns normalized input without invoking the callback" do
+      parent = self()
+
+      tool =
+        Tool.new!(
+          name: "inspectable",
+          description: "Inspectable tool",
+          parameter_schema: [
+            query: [type: :string, required: true],
+            limit: [type: :integer, default: 10]
+          ],
+          callback: fn args ->
+            send(parent, {:tool_executed, args})
+            {:ok, args}
+          end
+        )
+
+      assert {:ok, %{query: "docs", limit: 10}} =
+               Tool.validate_input(tool, %{"query" => "docs"})
+
+      refute_received {:tool_executed, _args}
+    end
+
+    test "returns the same validation errors as execute/2" do
+      tool =
+        Tool.new!(
+          name: "validated",
+          description: "Validated tool",
+          parameter_schema: [query: [type: :string, required: true]],
+          callback: fn args -> {:ok, args} end
+        )
+
+      assert {:error, %ReqLLM.Error.Validation.Error{} = validation_error} =
+               Tool.validate_input(tool, %{})
+
+      assert {:error, %ReqLLM.Error.Validation.Error{} = execution_error} =
+               Tool.execute(tool, %{})
+
+      assert Exception.message(validation_error) == Exception.message(execution_error)
+
+      assert {:error, %ReqLLM.Error.Invalid.Parameter{}} =
+               Tool.validate_input(tool, "not a map")
     end
   end
 

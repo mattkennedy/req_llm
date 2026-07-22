@@ -25,7 +25,7 @@ LLM APIs are inconsistent. ReqLLM provides a unified, idiomatic Elixir interface
 
 ReqLLM currently exposes **1,205 models across 21 implemented provider integrations** from [LLMDB](https://llmdb.xyz), the model catalog maintained through `llm_db`. Counting the cataloged-but-not-separate `google_vertex_anthropic` namespace, the registry contains **1,218 models across 22 provider namespaces**.
 
-That breadth extends well beyond chat: ReqLLM tracks **92 non-text operation models** across embedding, image generation, text-to-speech, transcription, rerank, and OCR APIs. The fixture suite currently contains **619 unique recorded model specs**, giving ReqLLM a compatibility ledger for text and multi-modal provider behavior.
+That breadth extends well beyond chat: ReqLLM tracks **92 non-text operation models** across embedding, image generation, text-to-speech, transcription, rerank, and OCR APIs. The fixture suite currently contains **622 unique recorded model specs**, giving ReqLLM a compatibility ledger for text and multi-modal provider behavior.
 
 | Provider | ID | Catalog models | Operation surface | Recorded specs | Guide |
 |---|---|---:|---|---:|---|
@@ -41,7 +41,9 @@ That breadth extends well beyond chat: ReqLLM tracks **92 non-text operation mod
 | [Google Gemini](https://llmdb.xyz/?providers=google) | `google` | 50 | text, embedding 2, image 8 | 24 | [Guide](guides/google.md) |
 | [Google Vertex AI](https://llmdb.xyz/?providers=google_vertex) | `google_vertex` | 40 | text | 11 | [Guide](guides/google_vertex.md) |
 | [Groq](https://llmdb.xyz/?providers=groq) | `groq` | 18 | text, speech 2, transcription 2 | 11 | [Guide](guides/groq.md) |
+| [Meta Model API](https://llmdb.xyz/?providers=meta) | `meta` | 1 | text | 1 | [Guide](guides/meta.md) |
 | [MiniMax](https://llmdb.xyz/?providers=minimax) | `minimax` | 6 | text | 6 | — |
+| [Moonshot AI](https://llmdb.xyz/?providers=moonshotai) | `moonshotai` | 1 | text | 1 | [Guide](guides/moonshot_ai.md) |
 | [OpenAI](https://llmdb.xyz/?providers=openai) | `openai` | 86 | text, embedding 3, image 5, speech 6, transcription 7 | 64 | [Guide](guides/openai.md) |
 | [OpenRouter](https://llmdb.xyz/?providers=openrouter) | `openrouter` | 364 | text, embedding 25, image 5 | 234 | [Guide](guides/openrouter.md) |
 | [Venice](https://llmdb.xyz/?providers=venice) | `venice` | 67 | text | 67 | — |
@@ -110,6 +112,23 @@ schema = [name: [type: :string, required: true], age: [type: :pos_integer]]
 person = ReqLLM.generate_object!(model, "Generate a person", schema)
 #=> %{name: "John Doe", age: 30}
 
+output = ReqLLM.Output.array([name: [type: :string, required: true]])
+{:ok, response} = ReqLLM.generate_text(model, "Generate three people", output: output)
+ReqLLM.Response.output(response, output)
+#=> [%{"name" => "Ada"}, %{"name" => "Grace"}, %{"name" => "Linus"}]
+
+result = ReqLLM.Response.output_result(response, output)
+result.valid?       #=> true
+result.raw          # retained text or tool-call arguments
+result.repairs      # visible legacy or callback repair attempts
+
+{:ok, strict_response} = ReqLLM.generate_text(
+  model,
+  "Generate three people",
+  output: output,
+  output_validation: :strict
+)
+
 {:ok, image_response} = ReqLLM.generate_image("openai:gpt-image-1.5", "A simple red square")
 image_bytes = ReqLLM.Response.image_data(image_response)
 File.write!("red_square.png", image_bytes)
@@ -171,8 +190,9 @@ usage = ReqLLM.StreamResponse.usage(response)
   - Req-backed request/response calls and Finch-backed streaming behind the same provider abstraction
   - Advanced Req request customization available for non-streaming use cases
 
-- **Structured object generation**
-  - `generate_object/4` renders JSON-compatible Elixir maps validated by a NimbleOptions-compiled schema
+- **Structured output generation**
+  - `ReqLLM.Output` descriptors add text, object, array, choice, and arbitrary JSON contracts to `generate_text/3` and `stream_text/3`
+  - `generate_object/4` and `stream_object/4` remain compatible object-generation conveniences
   - Zero-copy mapping to provider JSON-schema / function-calling endpoints
   - OpenAI native structured outputs with three modes (`:auto` (default), `:json_schema`, `:tool_strict`)
 
@@ -491,26 +511,33 @@ This approach gives you full control over the Req pipeline, allowing you to add 
 
 ## Documentation
 
+- [Compatibility Policy](COMPATIBILITY.md) – stable, experimental, deprecated, platform, and ReqLLM/Jido contracts
+- [Model Support Evidence](guides/model-support.md) – generated, surface-specific compatibility tiers
 - [Getting Started](guides/getting-started.md) – first call and basic concepts
 - [Configuration](guides/configuration.md) – timeouts, connection pools, and global settings
 - [Telemetry](guides/telemetry.md) – request lifecycle, reasoning lifecycle, payload capture
 - [Core Concepts](guides/core-concepts.md) – architecture & data model
 - [Data Structures](guides/data-structures.md) – detailed type information
+- [Host Integration](guides/host-integration.md) – stable one-call boundary for Jido and other hosts
+- [Provider-native Integrations](guides/provider-native-integrations.md) – MCP, native tool, resource, and future operation boundaries
 - [Pricing Policy](guides/pricing-policy.md) – cost-calculation scope, guarantees, and known gaps
 - [Usage & Billing](guides/usage-and-billing.md) – token costs, tool usage, image costs
 - [Image Generation](guides/image-generation.md) – generating images with OpenAI and Google
 - [Mix Tasks](guides/mix-tasks.md) – model sync, compatibility testing, code generation
 - [Fixture Testing](guides/fixture-testing.md) – model validation and supported models
 - [Adding a Provider](guides/adding_a_provider.md) – extend with new providers
-- Provider Guides: [Anthropic](guides/anthropic.md), [OpenAI](guides/openai.md), [Google](guides/google.md), [Google Vertex](guides/google_vertex.md), [xAI](guides/xai.md), [Groq](guides/groq.md), [OpenRouter](guides/openrouter.md), [Amazon Bedrock](guides/amazon_bedrock.md), [Azure](guides/azure.md), [Cerebras](guides/cerebras.md), [Fireworks AI](guides/fireworks_ai.md), [Z.AI](guides/zai.md), [Z.AI Coder](guides/zai_coder.md), [Zenmux](guides/zenmux.md)
+- Provider Guides: [Anthropic](guides/anthropic.md), [OpenAI](guides/openai.md), [Google](guides/google.md), [Google Vertex](guides/google_vertex.md), [xAI](guides/xai.md), [Groq](guides/groq.md), [OpenRouter](guides/openrouter.md), [Amazon Bedrock](guides/amazon_bedrock.md), [Azure](guides/azure.md), [Cerebras](guides/cerebras.md), [Fireworks AI](guides/fireworks_ai.md), [Meta](guides/meta.md), [Moonshot AI](guides/moonshot_ai.md), [Z.AI](guides/zai.md), [Z.AI Coder](guides/zai_coder.md), [Zenmux](guides/zenmux.md)
 
 ## Roadmap & Status
 
-ReqLLM has now reached v1.0.0. The core API is stable and ready for production use. We're continuing to refine the library and would love community feedback as we plan the next set of improvements. If you run into anything or have suggestions, please open an issue or PR.
+ReqLLM has reached v1.0.0. Its [compatibility policy](COMPATIBILITY.md)
+protects the stable core API while the [roadmap](ROADMAP.md) evolves the library
+through conservative V1 improvements and separately justified V2 candidates.
+If you run into anything or have suggestions, please open an issue or PR.
 
 ### Test Coverage & Quality Commitment
 
-ReqLLM uses fixture-backed compatibility tests as a practical map of provider behavior. The current suite includes **159 passing model-compat entries** across 12 providers and **619 unique recorded fixture model specs** across text, streaming, tool calling, structured output, embeddings, image generation, speech, transcription, rerank, and OCR.
+ReqLLM uses fixture-backed compatibility tests as a practical map of provider behavior. The current suite includes **160 passing model-compat entries** across 13 providers and **622 unique recorded fixture model specs** across text, streaming, tool calling, structured output, embeddings, image generation, speech, transcription, rerank, and OCR.
 
 Catalog support and fixture-verified coverage are tracked separately on purpose: provider catalogs move quickly, account access varies, and some modalities need specialized tests. ReqLLM makes that state visible through `mix mc "*:*"` and lets you narrow checks by provider or operation type when you need to validate the exact models your application uses.
 

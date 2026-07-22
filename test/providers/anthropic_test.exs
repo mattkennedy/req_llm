@@ -497,6 +497,41 @@ defmodule ReqLLM.Providers.AnthropicTest do
       assert result2["tool_use_id"] == "tool_2"
     end
 
+    test "encode_body round trips matched tool exchanges in assistant call order" do
+      {:ok, model} = ReqLLM.model("anthropic:claude-sonnet-4-5-20250929")
+      base_context = ReqLLM.Context.new([ReqLLM.Context.user("Get weather and time")])
+
+      assistant =
+        ReqLLM.Context.assistant("",
+          tool_calls: [
+            {"get_weather", %{city: "Paris"}, id: "tool_1"},
+            {"get_time", %{timezone: "Europe/Paris"}, id: "tool_2"}
+          ],
+          metadata: %{provider_native: %{request_id: "req_123"}}
+        )
+
+      results = [
+        ReqLLM.Context.tool_result("tool_2", "get_time", "10:00 CEST"),
+        ReqLLM.Context.tool_result("tool_1", "72°F and sunny")
+      ]
+
+      assert {:ok, context} =
+               ReqLLM.Context.append_tool_exchange(base_context, assistant, results)
+
+      mock_request = %Req.Request{
+        options: [context: context, model: model.model, stream: false]
+      }
+
+      decoded = mock_request |> Anthropic.encode_body() |> ReqLLM.Test.Helpers.json_body()
+
+      tool_result_blocks =
+        decoded["messages"]
+        |> List.last()
+        |> Map.fetch!("content")
+
+      assert Enum.map(tool_result_blocks, & &1["tool_use_id"]) == ["tool_1", "tool_2"]
+    end
+
     test "encode_body preserves multimodal tool_result content blocks" do
       {:ok, model} = ReqLLM.model("anthropic:claude-sonnet-4-5-20250929")
 
@@ -594,6 +629,35 @@ defmodule ReqLLM.Providers.AnthropicTest do
                  "file_id" => "file_011CPMxVD3fHLUhvTqtsQA5w"
                }
              }
+    end
+
+    test "encode_body consumes explicitly owned Anthropic file references" do
+      {:ok, model} = ReqLLM.model("anthropic:claude-sonnet-4-5-20250929")
+
+      file_part =
+        ContentPart.owned_file_id("file_owned", :anthropic,
+          metadata: %{title: "Quarterly report"},
+          purpose: :analysis,
+          status: :active
+        )
+
+      context = ReqLLM.Context.new([ReqLLM.Context.user([file_part])])
+
+      request = %Req.Request{
+        options: [context: context, model: model.model, stream: false]
+      }
+
+      decoded = request |> Anthropic.encode_body() |> ReqLLM.Test.Helpers.json_body()
+
+      assert [%{"content" => [block]}] = decoded["messages"]
+
+      assert block == %{
+               "type" => "document",
+               "source" => %{"type" => "file", "file_id" => "file_owned"},
+               "title" => "Quarterly report"
+             }
+
+      refute Jason.encode!(decoded) =~ "req_llm"
     end
 
     test "encode_body without tools" do
@@ -1473,21 +1537,27 @@ defmodule ReqLLM.Providers.AnthropicTest do
       assert Keyword.get(translated_opts, :response_format) == nil
     end
 
-    test "translate_options adapts Claude Opus 4.8 metadata constraints" do
+    test "translate_options preserves supported Claude Opus 4.8 effort levels" do
       {:ok, model} = ReqLLM.model("anthropic:claude-opus-4-8")
 
-      {translated_opts, []} =
-        Anthropic.translate_options(:chat, model,
-          reasoning_effort: :xhigh,
-          temperature: 0.0,
-          top_p: 0.5,
-          max_tokens: 100
-        )
+      for effort <- [:xhigh, :max] do
+        {translated_opts, []} =
+          Anthropic.translate_options(:chat, model,
+            reasoning_effort: effort,
+            temperature: 0.0,
+            top_p: 0.5,
+            max_tokens: 100
+          )
 
-      assert Keyword.get(translated_opts, :thinking) == %{type: "adaptive", display: "summarized"}
-      assert Keyword.get(translated_opts, :output_config) == %{effort: "max"}
-      refute Keyword.has_key?(translated_opts, :top_p)
-      refute Keyword.has_key?(translated_opts, :temperature)
+        assert Keyword.get(translated_opts, :thinking) == %{
+                 type: "adaptive",
+                 display: "summarized"
+               }
+
+        assert Keyword.get(translated_opts, :output_config) == %{effort: Atom.to_string(effort)}
+        refute Keyword.has_key?(translated_opts, :top_p)
+        refute Keyword.has_key?(translated_opts, :temperature)
+      end
     end
 
     test "translate_options defaults direct adaptive thinking display to summarized" do
@@ -2073,7 +2143,8 @@ defmodule ReqLLM.Providers.AnthropicTest do
         {:low, 1_024},
         {:medium, 2_048},
         {:high, 4_096},
-        {:xhigh, 8_192}
+        {:xhigh, 8_192},
+        {:max, 8_192}
       ]
 
       for {effort, expected_budget} <- test_cases do
@@ -2326,17 +2397,24 @@ defmodule ReqLLM.Providers.AnthropicTest do
 
       assistant_message = %ReqLLM.Message{
         role: :assistant,
-        content: [%ReqLLM.Message.ContentPart{type: :text, text: "I'll check the weather."}],
+        content: [
+          %ReqLLM.Message.ContentPart{
+            type: :thinking,
+            text: "Let me think about which tool to use..."
+          },
+          %ReqLLM.Message.ContentPart{type: :text, text: "I'll check the weather."}
+        ],
         tool_calls: [tool_call],
         reasoning_details: [reasoning_detail],
         metadata: %{}
       }
 
-      context =
-        ReqLLM.Context.new([
+      context = %ReqLLM.Context{
+        messages: [
           ReqLLM.Context.user("What's the weather in NYC?"),
           assistant_message
-        ])
+        ]
+      }
 
       encoded = ReqLLM.Providers.Anthropic.Context.encode_request(context, model)
       messages = encoded[:messages]
@@ -2346,6 +2424,122 @@ defmodule ReqLLM.Providers.AnthropicTest do
 
       type_order = Enum.map(content_blocks, fn b -> b[:type] end)
       assert type_order == ["thinking", "text", "tool_use"]
+
+      [thinking_block] = Enum.filter(content_blocks, &(&1[:type] == "thinking"))
+      assert thinking_block[:signature] == "sig123"
+    end
+
+    test "preserves signed thinking content with tool calls without reasoning_details" do
+      {:ok, model} = ReqLLM.model("anthropic:claude-sonnet-4-5-20250929")
+
+      tool_call = %ReqLLM.ToolCall{
+        id: "call_456",
+        type: "function",
+        function: %{name: "get_weather", arguments: ~s({"location":"NYC"})}
+      }
+
+      assistant_message = %ReqLLM.Message{
+        role: :assistant,
+        content: [
+          %ReqLLM.Message.ContentPart{
+            type: :thinking,
+            text: "I should check the weather.",
+            metadata: %{signature: "sig456"}
+          },
+          %ReqLLM.Message.ContentPart{type: :text, text: "I'll check the weather."}
+        ],
+        tool_calls: [tool_call],
+        reasoning_details: nil,
+        metadata: %{}
+      }
+
+      context = %ReqLLM.Context{messages: [assistant_message]}
+      encoded = ReqLLM.Providers.Anthropic.Context.encode_request(context, model)
+      [assistant_msg] = encoded[:messages]
+
+      assert Enum.map(assistant_msg[:content], & &1[:type]) == ["thinking", "text", "tool_use"]
+      assert [thinking_block] = Enum.filter(assistant_msg[:content], &(&1[:type] == "thinking"))
+      assert thinking_block[:signature] == "sig456"
+      assert thinking_block[:thinking] == "I should check the weather."
+    end
+
+    test "preserves signed thinking when reasoning_details encode no Anthropic blocks" do
+      {:ok, model} = ReqLLM.model("anthropic:claude-sonnet-4-5-20250929")
+
+      tool_call = %ReqLLM.ToolCall{
+        id: "call_789",
+        type: "function",
+        function: %{name: "get_weather", arguments: ~s({"location":"NYC"})}
+      }
+
+      assistant_message = %ReqLLM.Message{
+        role: :assistant,
+        content: [
+          %ReqLLM.Message.ContentPart{
+            type: :thinking,
+            text: "I should check the weather.",
+            metadata: %{signature: "sig789"}
+          },
+          %ReqLLM.Message.ContentPart{type: :text, text: "I'll check the weather."}
+        ],
+        tool_calls: [tool_call],
+        reasoning_details: [
+          %ReqLLM.Message.ReasoningDetails{
+            provider: :openai,
+            index: 0,
+            text: "openai reasoning"
+          }
+        ],
+        metadata: %{}
+      }
+
+      context = %ReqLLM.Context{messages: [assistant_message]}
+      encoded = ReqLLM.Providers.Anthropic.Context.encode_request(context, model)
+      [assistant_msg] = encoded[:messages]
+
+      assert Enum.map(assistant_msg[:content], & &1[:type]) == ["thinking", "text", "tool_use"]
+      assert [thinking_block] = Enum.filter(assistant_msg[:content], &(&1[:type] == "thinking"))
+      assert thinking_block[:signature] == "sig789"
+    end
+
+    test "preserves redacted thinking content with tool calls without reasoning_details" do
+      {:ok, model} = ReqLLM.model("anthropic:claude-sonnet-4-5-20250929")
+
+      tool_call = %ReqLLM.ToolCall{
+        id: "call_789",
+        type: "function",
+        function: %{name: "get_weather", arguments: ~s({"location":"NYC"})}
+      }
+
+      assistant_message = %ReqLLM.Message{
+        role: :assistant,
+        content: [
+          %ReqLLM.Message.ContentPart{
+            type: :thinking,
+            text: "",
+            metadata: %{"redacted" => true, "data" => "redacted-bytes"}
+          },
+          %ReqLLM.Message.ContentPart{type: :text, text: "I'll check the weather."}
+        ],
+        tool_calls: [tool_call],
+        reasoning_details: [],
+        metadata: %{}
+      }
+
+      context = %ReqLLM.Context{messages: [assistant_message]}
+      encoded = ReqLLM.Providers.Anthropic.Context.encode_request(context, model)
+      [assistant_msg] = encoded[:messages]
+
+      assert Enum.map(assistant_msg[:content], & &1[:type]) == [
+               "redacted_thinking",
+               "text",
+               "tool_use"
+             ]
+
+      assert hd(assistant_msg[:content]) == %{
+               type: "redacted_thinking",
+               data: "redacted-bytes"
+             }
     end
   end
 

@@ -117,6 +117,7 @@ defmodule ReqLLM.StreamServer.TelemetryTest do
 
   @events [
     [:req_llm, :request, :start],
+    [:req_llm, :request, :retry],
     [:req_llm, :request, :stop],
     [:req_llm, :request, :exception],
     [:req_llm, :reasoning, :start],
@@ -150,6 +151,77 @@ defmodule ReqLLM.StreamServer.TelemetryTest do
     :ok
   end
 
+  test "buffers retry timing until telemetry context is installed" do
+    model = reasoning_model()
+    server = start_server(provider_mod: ReqLLM.StreamServer.TelemetryProvider, model: model)
+
+    StreamServer.retry_event(server, %{
+      attempt: 1,
+      next_attempt: 2,
+      max_retries: 3,
+      delay: 25,
+      duration: 100,
+      http_status: 429
+    })
+
+    refute_receive {:telemetry_event, [:req_llm, :request, :retry], _, _}, 25
+
+    telemetry_context =
+      model
+      |> ReqLLM.Telemetry.new_context(
+        [context: ReqLLM.Context.new([user("hello")])],
+        mode: :stream,
+        transport: :finch,
+        operation: :chat
+      )
+      |> ReqLLM.Telemetry.start_request(%{})
+
+    assert :ok = StreamServer.set_telemetry_context(server, telemetry_context)
+
+    assert_receive {:telemetry_event, [:req_llm, :request, :retry], measurements, metadata}
+    assert measurements.duration == 100
+    assert metadata.request_id == telemetry_context.request_id
+    assert metadata.retry.attempt == 1
+    assert metadata.retry.next_attempt == 2
+    assert metadata.retry.delay == 25
+    assert metadata.retry.http_status == 429
+
+    StreamServer.cancel(server)
+  end
+
+  test "emits a structured streaming timeout exception" do
+    model = reasoning_model()
+
+    server =
+      start_server(
+        provider_mod: ReqLLM.StreamServer.TelemetryProvider,
+        model: model,
+        total_timeout: 50
+      )
+
+    _task = mock_http_task(server)
+
+    telemetry_context =
+      model
+      |> ReqLLM.Telemetry.new_context(
+        [context: ReqLLM.Context.new([user("hello")]), total_timeout: 50],
+        mode: :stream,
+        transport: :finch,
+        operation: :chat
+      )
+      |> ReqLLM.Telemetry.start_request(%{})
+
+    assert :ok = StreamServer.set_telemetry_context(server, telemetry_context)
+    assert {:ok, metadata} = StreamServer.await_metadata(server, 500)
+    assert %ReqLLM.Error.API.Timeout{kind: :total, timeout: 50} = metadata.error
+
+    assert_receive {:telemetry_event, [:req_llm, :request, :exception], _, exception_metadata}
+    assert exception_metadata.request_id == telemetry_context.request_id
+    assert exception_metadata.finish_reason == :error
+    assert exception_metadata.error == metadata.error
+    refute_receive {:telemetry_event, [:req_llm, :request, :stop], _, _}
+  end
+
   test "buffers fast HTTP events until streaming telemetry context is installed" do
     model = reasoning_model()
     server = start_server(provider_mod: ReqLLM.StreamServer.TelemetryProvider, model: model)
@@ -161,18 +233,22 @@ defmodule ReqLLM.StreamServer.TelemetryTest do
 
     StreamServer.http_event(server, {:status, 200})
 
-    StreamServer.http_event(
-      server,
-      {:data, "data: #{Jason.encode!(%{"type" => "content", "text" => "answer"})}\n\n"}
-    )
+    producer =
+      Task.async(fn ->
+        StreamServer.http_event(
+          server,
+          {:data, "data: #{Jason.encode!(%{"type" => "content", "text" => "answer"})}\n\n"}
+        )
 
-    StreamServer.http_event(
-      server,
-      {:data, "data: #{Jason.encode!(%{"type" => "finish", "finish_reason" => "stop"})}\n\n"}
-    )
+        StreamServer.http_event(
+          server,
+          {:data, "data: #{Jason.encode!(%{"type" => "finish", "finish_reason" => "stop"})}\n\n"}
+        )
 
-    StreamServer.http_event(server, :done)
-    send(server, {:EXIT, task.pid, :normal})
+        StreamServer.http_event(server, :done)
+      end)
+
+    assert nil == Task.yield(producer, 25)
 
     refute_receive {:telemetry_event, [:req_llm, :request, :start], _, _}, 50
     refute_receive {:telemetry_event, [:req_llm, :request, :stop], _, _}, 50
@@ -188,6 +264,8 @@ defmodule ReqLLM.StreamServer.TelemetryTest do
       |> ReqLLM.Telemetry.start_request(%{})
 
     assert :ok = StreamServer.set_telemetry_context(server, telemetry_context)
+    assert :ok = Task.await(producer)
+    send(server, {:EXIT, task.pid, :normal})
     assert {:ok, metadata} = StreamServer.await_metadata(server, 500)
     assert metadata.finish_reason == :stop
 
@@ -508,15 +586,32 @@ defmodule ReqLLM.StreamServer.TelemetryTest do
 
     assert :ok = StreamServer.set_telemetry_context(server, telemetry_context)
 
+    usage = %{"prompt_tokens" => 7, "completion_tokens" => 3, "total_tokens" => 10}
+
+    StreamServer.http_event(
+      server,
+      {:data,
+       "data: #{Jason.encode!(%{"type" => "meta", "usage" => usage, "reasoning_details" => []})}\n\n"}
+    )
+
     StreamServer.http_event(server, {:error, :boom})
 
-    assert {:error, :boom} = StreamServer.await_metadata(server, 200)
+    assert {:ok, metadata} = StreamServer.await_metadata(server, 200)
+    assert metadata.error == :boom
+    assert metadata.usage.input_tokens == 7
+    assert metadata.usage.output_tokens == 3
+
     assert_receive {:telemetry_event, [:req_llm, :request, :start], _, _}
     assert_receive {:telemetry_event, [:req_llm, :reasoning, :start], _, _}
     assert_receive {:telemetry_event, [:req_llm, :request, :exception], _, exception_meta}
     assert_receive {:telemetry_event, [:req_llm, :reasoning, :stop], _, reasoning_stop_meta}
+    assert_receive {:telemetry_event, [:req_llm, :token_usage], token_measurements, _}
     refute_receive {:telemetry_event, [:req_llm, :request, :stop], _, _}
     assert exception_meta.finish_reason == :error
+    assert exception_meta.usage.input_tokens == 7
+    assert exception_meta.usage.output_tokens == 3
+    assert token_measurements.tokens.input_tokens == 7
+    assert token_measurements.tokens.output_tokens == 3
     assert reasoning_stop_meta.milestone == :error
 
     StreamServer.cancel(server)

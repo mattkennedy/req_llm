@@ -35,23 +35,34 @@ defmodule ReqLLM.MixProject do
         main: "overview",
         extras: [
           {"README.md", title: "Overview", filename: "overview"},
+          "COMPATIBILITY.md",
+          "ROADMAP.md",
+          "ROADMAP_V1.md",
+          "ROADMAP_V2.md",
+          "V1_EXECUTION_GOAL.md",
           "CHANGELOG.md",
           "CONTRIBUTING.md",
           "guides/getting-started.md",
           "guides/configuration.md",
           "guides/telemetry.md",
+          "guides/telemetry-contract.md",
           "guides/core-concepts.md",
           "guides/data-structures.md",
+          "guides/host-integration.md",
+          "guides/provider-native-integrations.md",
           "guides/pricing-policy.md",
           "guides/model-specs.md",
           "guides/usage-and-billing.md",
           "guides/image-generation.md",
           "guides/model-metadata.md",
+          "guides/model-support.md",
+          "guides/v2-migration-audit.md",
           "guides/getting-started.livemd",
           "guides/image-generation.livemd",
           "guides/mix-tasks.md",
           "guides/fixture-testing.md",
           "guides/adding_a_provider.md",
+          "guides/provider-extension-decision.md",
           "guides/anthropic.md",
           "guides/openai.md",
           "guides/google.md",
@@ -67,6 +78,7 @@ defmodule ReqLLM.MixProject do
           "guides/fireworks_ai.md",
           "guides/meta.md",
           "guides/github_copilot.md",
+          "guides/moonshot_ai.md",
           "guides/nearai.md",
           "guides/zenmux.md",
           "guides/zai.md",
@@ -74,19 +86,31 @@ defmodule ReqLLM.MixProject do
         ],
         groups_for_extras: [
           Overview: [
-            "README.md"
+            "README.md",
+            "COMPATIBILITY.md"
+          ],
+          Roadmaps: [
+            "ROADMAP.md",
+            "ROADMAP_V1.md",
+            "ROADMAP_V2.md",
+            "V1_EXECUTION_GOAL.md"
           ],
           Guides: [
             "guides/getting-started.md",
             "guides/configuration.md",
             "guides/telemetry.md",
+            "guides/telemetry-contract.md",
             "guides/core-concepts.md",
             "guides/data-structures.md",
+            "guides/host-integration.md",
+            "guides/provider-native-integrations.md",
             "guides/pricing-policy.md",
             "guides/model-specs.md",
             "guides/usage-and-billing.md",
             "guides/image-generation.md",
-            "guides/model-metadata.md"
+            "guides/model-metadata.md",
+            "guides/model-support.md",
+            "guides/v2-migration-audit.md"
           ],
           Livebooks: [
             "guides/getting-started.livemd",
@@ -95,7 +119,8 @@ defmodule ReqLLM.MixProject do
           "Development & Testing": [
             "guides/mix-tasks.md",
             "guides/fixture-testing.md",
-            "guides/adding_a_provider.md"
+            "guides/adding_a_provider.md",
+            "guides/provider-extension-decision.md"
           ],
           Providers: [
             "guides/anthropic.md",
@@ -113,6 +138,7 @@ defmodule ReqLLM.MixProject do
             "guides/fireworks_ai.md",
             "guides/meta.md",
             "guides/github_copilot.md",
+            "guides/moonshot_ai.md",
             "guides/nearai.md",
             "guides/zenmux.md",
             "guides/zai.md",
@@ -142,7 +168,8 @@ defmodule ReqLLM.MixProject do
             ReqLLM.Usage,
             ReqLLM.Error,
             ReqLLM.Debug,
-            ReqLLM.ParamTransform
+            ReqLLM.ParamTransform,
+            ReqLLM.Migration
           ],
           "Data Structures": [
             ReqLLM.Message,
@@ -165,7 +192,6 @@ defmodule ReqLLM.MixProject do
           Speech: ~r/ReqLLM\.Speech.*/,
           "Provider Extension API": [
             ReqLLM.Provider,
-            ReqLLM.Provider.DSL,
             ReqLLM.Provider.Registry,
             ReqLLM.Provider.Options,
             ReqLLM.Provider.Utils,
@@ -218,7 +244,7 @@ defmodule ReqLLM.MixProject do
       {:websockex, "~> 0.5.1"},
       {:zoi, "~> 0.14"},
       {:jsv, "~> 0.11"},
-      {:llm_db, "~> 2026.7.0"},
+      {:llm_db, "~> 2026.7.2"},
 
       # Dev/test dependencies
       {:bandit, "~> 1.8", only: [:dev, :test], runtime: false},
@@ -250,7 +276,7 @@ defmodule ReqLLM.MixProject do
         "Website" => "https://agentjido.xyz"
       },
       files:
-        ~w(lib priv mix.exs LICENSE README.md CHANGELOG.md CONTRIBUTING.md AGENTS.md usage-rules.md guides .formatter.exs)
+        ~w(lib priv mix.exs LICENSE README.md COMPATIBILITY.md ROADMAP.md ROADMAP_V1.md ROADMAP_V2.md V1_EXECUTION_GOAL.md CHANGELOG.md CONTRIBUTING.md AGENTS.md usage-rules.md guides .formatter.exs)
     ]
   end
 

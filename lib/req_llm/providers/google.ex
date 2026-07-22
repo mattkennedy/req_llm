@@ -811,48 +811,32 @@ defmodule ReqLLM.Providers.Google do
 
   defp normalize_response_modality(modality), do: modality
 
-  defp translate_reasoning_effort_to_budget(:none, _model), do: 0
-  defp translate_reasoning_effort_to_budget(:minimal, _model), do: 2_048
-  defp translate_reasoning_effort_to_budget(:low, _model), do: 4_096
-  defp translate_reasoning_effort_to_budget(:medium, _model), do: 8_192
-  defp translate_reasoning_effort_to_budget(:high, _model), do: 16_384
-  defp translate_reasoning_effort_to_budget(:xhigh, _model), do: 32_768
+  defp translate_reasoning_effort_to_budget(effort, _model) do
+    case ReqLLM.Provider.Reasoning.normalize_effort(effort) do
+      :none -> 0
+      :minimal -> 2_048
+      :low -> 4_096
+      :medium -> 8_192
+      :high -> 16_384
+      :xhigh -> 32_768
+      :max -> 32_768
+      budget when is_integer(budget) -> budget
+      _ -> 8_192
+    end
+  end
 
-  defp translate_reasoning_effort_to_budget("none", model),
-    do: translate_reasoning_effort_to_budget(:none, model)
-
-  defp translate_reasoning_effort_to_budget("minimal", model),
-    do: translate_reasoning_effort_to_budget(:minimal, model)
-
-  defp translate_reasoning_effort_to_budget("low", model),
-    do: translate_reasoning_effort_to_budget(:low, model)
-
-  defp translate_reasoning_effort_to_budget("medium", model),
-    do: translate_reasoning_effort_to_budget(:medium, model)
-
-  defp translate_reasoning_effort_to_budget("high", model),
-    do: translate_reasoning_effort_to_budget(:high, model)
-
-  defp translate_reasoning_effort_to_budget("xhigh", model),
-    do: translate_reasoning_effort_to_budget(:xhigh, model)
-
-  defp translate_reasoning_effort_to_budget(budget, _model) when is_integer(budget), do: budget
-  defp translate_reasoning_effort_to_budget(_unknown, _model), do: 8_192
-
-  defp translate_reasoning_effort_to_level(:none), do: :minimal
-  defp translate_reasoning_effort_to_level(:minimal), do: :minimal
-  defp translate_reasoning_effort_to_level(:low), do: :low
-  defp translate_reasoning_effort_to_level(:medium), do: :medium
-  defp translate_reasoning_effort_to_level(:high), do: :high
-  defp translate_reasoning_effort_to_level(:xhigh), do: :high
-
-  defp translate_reasoning_effort_to_level("none"), do: :minimal
-  defp translate_reasoning_effort_to_level("minimal"), do: :minimal
-  defp translate_reasoning_effort_to_level("low"), do: :low
-  defp translate_reasoning_effort_to_level("medium"), do: :medium
-  defp translate_reasoning_effort_to_level("high"), do: :high
-  defp translate_reasoning_effort_to_level("xhigh"), do: :high
-  defp translate_reasoning_effort_to_level(_unknown), do: :medium
+  defp translate_reasoning_effort_to_level(effort) do
+    case ReqLLM.Provider.Reasoning.normalize_effort(effort) do
+      :none -> :minimal
+      :minimal -> :minimal
+      :low -> :low
+      :medium -> :medium
+      :high -> :high
+      :xhigh -> :high
+      :max -> :high
+      _ -> :medium
+    end
+  end
 
   @impl ReqLLM.Provider
   def translate_options(:image, _model, opts) do
@@ -2124,7 +2108,46 @@ defmodule ReqLLM.Providers.Google do
     encoded
     |> Map.get(:messages, [])
     |> preserve_tool_call_metadata_in_messages(normalized_context)
+    |> preserve_provider_file_metadata_in_messages(normalized_context)
   end
+
+  defp preserve_provider_file_metadata_in_messages(messages, %ReqLLM.Context{
+         messages: context_messages
+       }) do
+    owned_files =
+      context_messages
+      |> Enum.flat_map(fn message -> List.wrap(message.content) end)
+      |> Enum.reduce(%{}, fn part, acc ->
+        case ReqLLM.ProviderFileReference.reference_id(part, :google) do
+          {:ok, reference_id} ->
+            Map.put(acc, reference_id, %{media_type: part.media_type})
+
+          :error ->
+            acc
+        end
+      end)
+
+    Enum.map(messages, &preserve_message_provider_files(&1, owned_files))
+  end
+
+  defp preserve_message_provider_files(message, owned_files) when map_size(owned_files) == 0,
+    do: message
+
+  defp preserve_message_provider_files(%{content: content} = message, owned_files)
+       when is_list(content) do
+    %{message | content: Enum.map(content, &preserve_provider_file(&1, owned_files))}
+  end
+
+  defp preserve_message_provider_files(message, _owned_files), do: message
+
+  defp preserve_provider_file(%{type: "file", file: %{file_id: file_id}} = part, owned_files) do
+    case Map.get(owned_files, file_id) do
+      nil -> part
+      metadata -> Map.put(part, :req_llm_provider_file, metadata)
+    end
+  end
+
+  defp preserve_provider_file(part, _owned_files), do: part
 
   defp preserve_tool_call_metadata_in_messages(messages, %ReqLLM.Context{
          messages: context_messages
@@ -2493,6 +2516,9 @@ defmodule ReqLLM.Providers.Google do
     output = ReqLLM.ToolResult.output_from_message(message)
 
     cond do
+      ReqLLM.ToolResult.explicit_content?(message) ->
+        %{content: extract_content_text(raw_content)}
+
       is_map(output) or is_list(output) ->
         output
 
@@ -2590,17 +2616,20 @@ defmodule ReqLLM.Providers.Google do
     end
   end
 
-  # Most specific patterns first (file, image, etc.) - for ContentPart structs
-  defp convert_content_part(%{type: :file, data: data, media_type: media_type})
-       when is_binary(data) do
-    encoded_data = Base.encode64(data)
+  defp convert_content_part(%{
+         type: "file",
+         file: %{file_id: reference_id},
+         req_llm_provider_file: metadata
+       }) do
+    build_file_data(metadata, reference_id)
+  end
 
-    %{
-      inline_data: %{
-        mime_type: media_type,
-        data: encoded_data
-      }
-    }
+  # Most specific patterns first (file, image, etc.) - for ContentPart structs
+  defp convert_content_part(%{type: :file} = part) do
+    case ReqLLM.ProviderFileReference.reference_id(part, :google) do
+      {:ok, reference_id} -> build_file_data(part, reference_id)
+      :error -> convert_legacy_file_content_part(part)
+    end
   end
 
   # Specific text patterns
@@ -2613,6 +2642,20 @@ defmodule ReqLLM.Providers.Google do
   defp convert_content_part(text) when is_binary(text), do: %{text: text}
 
   defp convert_content_part(part), do: %{text: to_string(part)}
+
+  defp convert_legacy_file_content_part(%{data: data, media_type: media_type})
+       when is_binary(data) do
+    encoded_data = Base.encode64(data)
+
+    %{
+      inline_data: %{
+        mime_type: media_type,
+        data: encoded_data
+      }
+    }
+  end
+
+  defp convert_legacy_file_content_part(part), do: %{text: to_string(part)}
 
   defp convert_url_content_part(part, url) do
     cond do

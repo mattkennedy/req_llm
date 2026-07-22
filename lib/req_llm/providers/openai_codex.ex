@@ -12,6 +12,7 @@ defmodule ReqLLM.Providers.OpenAICodex do
 
   alias ReqLLM.Providers.OpenAI
   alias ReqLLM.Providers.OpenAI.ResponsesAPI
+  alias ReqLLM.Providers.OpenAICodex.ResponsesLite
 
   @provider_schema [
     access_token: [
@@ -126,6 +127,7 @@ defmodule ReqLLM.Providers.OpenAICodex do
   ]
 
   @codex_response_statuses ~w(completed incomplete failed cancelled queued in_progress)
+  @codex_model_option :openai_codex_model
 
   @impl ReqLLM.Provider
   def oauth_provider_id, do: "openai-codex"
@@ -226,12 +228,14 @@ defmodule ReqLLM.Providers.OpenAICodex do
     |> Req.Request.put_header("authorization", "Bearer #{credential.token}")
     |> Req.Request.put_header("chatgpt-account-id", account_id)
     |> Req.Request.put_header("originator", originator)
-    |> Req.Request.register_options(extra_option_keys)
+    |> ResponsesLite.put_req_header(model)
+    |> Req.Request.register_options([@codex_model_option | extra_option_keys])
     |> Req.Request.merge_options(
       ReqLLM.Provider.Defaults.finch_option(request) ++
         [
-          model: model.provider_model_id || model.id,
-          auth: {:bearer, credential.token}
+          {@codex_model_option, model},
+          {:model, model.provider_model_id || model.id},
+          {:auth, {:bearer, credential.token}}
         ] ++ user_opts
     )
     |> attach_retry(user_opts)
@@ -245,8 +249,8 @@ defmodule ReqLLM.Providers.OpenAICodex do
   @impl ReqLLM.Provider
   def encode_body(request) do
     context = request.options[:context] || %ReqLLM.Context{messages: []}
-    model_name = request.options[:model] || request.options[:id]
-    body = build_codex_body(context, model_name, request.options, request)
+    model = request.options[@codex_model_option]
+    body = build_codex_body(context, model, request.options, request)
     encoded = body |> ReqLLM.Schema.apply_property_ordering() |> Jason.encode!()
     Map.put(request, :body, encoded)
   end
@@ -320,17 +324,19 @@ defmodule ReqLLM.Providers.OpenAICodex do
       |> Keyword.put(:context, context)
       |> Keyword.put(:base_url, base_url)
 
-    body = build_codex_body(context, model.id, cleaned_opts, nil)
+    body = build_codex_body(context, model, cleaned_opts, nil)
     url = codex_url(base_url)
 
-    headers = [
-      {"authorization", "Bearer " <> credential.token},
-      {"chatgpt-account-id", account_id},
-      {"originator", codex_originator(opts)},
-      {"content-type", "application/json"},
-      {"accept", "text/event-stream"},
-      {"openai-beta", "responses=experimental"}
-    ]
+    headers =
+      [
+        {"authorization", "Bearer " <> credential.token},
+        {"chatgpt-account-id", account_id},
+        {"originator", codex_originator(opts)},
+        {"content-type", "application/json"},
+        {"accept", "text/event-stream"},
+        {"openai-beta", "responses=experimental"}
+      ]
+      |> ResponsesLite.put_header(model)
 
     encoded = body |> ReqLLM.Schema.apply_property_ordering() |> Jason.encode!()
     {:ok, Finch.build(:post, url, headers, encoded)}
@@ -364,7 +370,7 @@ defmodule ReqLLM.Providers.OpenAICodex do
     credential = ReqLLM.Auth.resolve!(model, opts)
     account_id = resolve_account_id!(credential, opts)
     base_url = ReqLLM.Provider.Options.effective_base_url(__MODULE__, model, opts)
-    headers = websocket_headers(credential.token, account_id, opts)
+    headers = websocket_headers(model, credential.token, account_id, opts)
     url = codex_websocket_url(base_url)
 
     cleaned_opts =
@@ -378,7 +384,7 @@ defmodule ReqLLM.Providers.OpenAICodex do
       |> Keyword.put(:context, context)
       |> Keyword.put(:base_url, base_url)
 
-    body = build_codex_body(context, model.id, cleaned_opts, nil)
+    body = build_codex_body(context, model, cleaned_opts, nil)
     create_event = Map.put(body, "type", "response.create")
 
     {:ok,
@@ -406,13 +412,13 @@ defmodule ReqLLM.Providers.OpenAICodex do
     base_url = ReqLLM.Provider.Options.effective_base_url(__MODULE__, model, opts)
 
     ReqLLM.Streaming.WebSocketSession.start_link(codex_websocket_url(base_url),
-      headers: websocket_headers(credential.token, account_id, opts)
+      headers: websocket_headers(model, credential.token, account_id, opts)
     )
   end
 
-  defp build_codex_body(context, model_name, opts, request) do
+  defp build_codex_body(context, %LLMDB.Model{} = model, opts, request) do
     opts = opts |> ensure_provider_options() |> force_store_false()
-    body = ResponsesAPI.build_request_body(context, model_name, opts, request)
+    body = ResponsesAPI.build_request_body(context, effective_model_id(model), opts, request)
     provider_opts = provider_options(opts)
     instructions = extract_instructions(context) || ""
 
@@ -434,6 +440,7 @@ defmodule ReqLLM.Providers.OpenAICodex do
     |> Map.put("instructions", instructions)
     |> maybe_put_web_search(provider_opts[:web_search])
     |> maybe_put_parallel_tool_calls(provider_opts[:openai_parallel_tool_calls])
+    |> ResponsesLite.apply_body(model)
   end
 
   # Append the server-side `web_search` builtin to the request `tools` array.
@@ -652,7 +659,7 @@ defmodule ReqLLM.Providers.OpenAICodex do
     |> ReqLLM.Providers.OpenAI.WebSocket.websocket_url("")
   end
 
-  defp websocket_headers(token, account_id, opts) do
+  defp websocket_headers(model, token, account_id, opts) do
     request_id = codex_request_id(opts)
 
     [
@@ -662,8 +669,13 @@ defmodule ReqLLM.Providers.OpenAICodex do
       {"openai-beta", "responses_websockets=2026-02-06"},
       {"x-client-request-id", request_id},
       {"session_id", request_id}
-    ] ++ ReqLLM.Provider.Utils.extract_custom_headers(opts[:req_http_options])
+    ]
+    |> ResponsesLite.put_header(model)
+    |> Kernel.++(ReqLLM.Provider.Utils.extract_custom_headers(opts[:req_http_options]))
   end
+
+  defp effective_model_id(%LLMDB.Model{provider_model_id: id}) when is_binary(id), do: id
+  defp effective_model_id(%LLMDB.Model{id: id}), do: id
 
   defp codex_request_id(opts) do
     opts

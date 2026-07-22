@@ -281,6 +281,31 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
              ] = body["input"]
     end
 
+    test "encodes explicitly owned OpenAI file references without ownership metadata" do
+      file_part =
+        ReqLLM.Message.ContentPart.owned_file_id("file-owned", :openai,
+          purpose: :assistants,
+          status: :processed
+        )
+
+      context = %ReqLLM.Context{
+        messages: [
+          %ReqLLM.Message{
+            role: :user,
+            content: [file_part]
+          }
+        ]
+      }
+
+      body = context |> then(&build_request(context: &1)) |> ResponsesAPI.encode_body()
+      decoded = ReqLLM.Test.Helpers.json_body(body)
+
+      assert [%{"content" => [%{"type" => "input_file", "file_id" => "file-owned"}]}] =
+               decoded["input"]
+
+      refute Jason.encode!(decoded) =~ "req_llm"
+    end
+
     test "omits tools when empty list" do
       request = build_request(tools: [])
 
@@ -352,6 +377,31 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert Jason.decode!(tool_output["output"]) == %{"temp" => 72}
     end
 
+    test "prefers explicit model-facing content over application output" do
+      tool_result =
+        ReqLLM.Context.tool_result(
+          "call_1",
+          "search_documents",
+          %ReqLLM.ToolResult{
+            output: %{records: [%{id: 1}], internal_cursor: "cursor_123"},
+            content: [ReqLLM.Message.ContentPart.text("One matching document was found.")]
+          }
+        )
+
+      context = %ReqLLM.Context{messages: [tool_result]}
+      request = build_request(context: context)
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = ReqLLM.Test.Helpers.json_body(encoded)
+
+      tool_output =
+        Enum.find(body["input"], fn item ->
+          item["type"] == "function_call_output"
+        end)
+
+      assert tool_output["output"] == "One matching document was found."
+    end
+
     test "skips builtin tool calls when replaying assistant context" do
       contexts = [
         %ReqLLM.Context{
@@ -392,6 +442,46 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
 
         refute Enum.any?(body["input"], &(&1["type"] == "function_call"))
       end
+    end
+
+    test "requires and encodes explicit results for provider-native calls" do
+      base_context = ReqLLM.Context.new([ReqLLM.Context.user("Search provider data")])
+
+      provider_native_call =
+        "native_1"
+        |> ReqLLM.ToolCall.new("provider_search", ~s({"query":"elixir"}))
+        |> ReqLLM.ToolCall.put_metadata(%{provider_native: :openai})
+
+      assistant =
+        ReqLLM.Context.assistant("", tool_calls: [provider_native_call])
+
+      assert {:error, %ReqLLM.Error.Validation.Error{context: error_context}} =
+               ReqLLM.Context.append_tool_exchange(base_context, assistant, [])
+
+      assert error_context[:kind] == :missing_tool_results
+
+      result =
+        ReqLLM.Context.tool_result(
+          "native_1",
+          "provider_search",
+          "provider search complete"
+        )
+
+      assert {:ok, context} =
+               ReqLLM.Context.append_tool_exchange(base_context, assistant, [result])
+
+      request = build_request(context: context)
+      body = request |> ResponsesAPI.encode_body() |> ReqLLM.Test.Helpers.json_body()
+
+      function_items =
+        Enum.filter(body["input"], &(&1["type"] in ["function_call", "function_call_output"]))
+
+      assert Enum.map(function_items, & &1["type"]) == [
+               "function_call",
+               "function_call_output"
+             ]
+
+      assert Enum.map(function_items, & &1["call_id"]) == ["native_1", "native_1"]
     end
 
     test "encodes multimodal tool results as array function_call_output" do
@@ -2579,7 +2669,34 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
                  end)
         end)
 
-      assert log =~ "Skipping non-OpenAI reasoning detail from provider: :anthropic"
+      assert log =~ "Skipping reasoning detail from provider :anthropic for :openai request"
+    end
+
+    test "does not replay Meta reasoning details into OpenAI requests" do
+      meta_detail = %ReqLLM.Message.ReasoningDetails{
+        text: "Meta reasoning",
+        signature: "meta_encrypted_reasoning",
+        encrypted?: true,
+        provider: :meta,
+        format: "openai-responses-v1",
+        index: 0,
+        provider_data: %{"id" => "rs_meta_1", "type" => "reasoning"}
+      }
+
+      assistant_msg = %ReqLLM.Message{
+        role: :assistant,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Response"}],
+        reasoning_details: [meta_detail]
+      }
+
+      context = %ReqLLM.Context{messages: [assistant_msg]}
+
+      body =
+        build_request(context: context)
+        |> ResponsesAPI.encode_body()
+        |> ReqLLM.Test.Helpers.json_body()
+
+      refute Enum.any?(body["input"], &(&1["type"] == "reasoning"))
     end
 
     test "encodes summary from reasoning detail text" do

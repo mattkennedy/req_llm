@@ -18,7 +18,7 @@ defmodule ReqLLM.Streaming.Retry do
 
   require Logger
 
-  @retryable_reasons [:closed, :timeout, :econnrefused]
+  alias ReqLLM.Streaming.Failure
 
   @type callback_acc :: term()
   @type callback :: (term(), callback_acc() -> callback_acc())
@@ -50,7 +50,8 @@ defmodule ReqLLM.Streaming.Retry do
         stream_opts: stream_opts,
         stream_fun: stream_fun,
         max_retries: max_retries,
-        max_retry_after_ms: max_retry_after_ms
+        max_retry_after_ms: max_retry_after_ms,
+        on_retry: Keyword.get(opts, :on_retry)
       },
       0
     )
@@ -78,29 +79,41 @@ defmodule ReqLLM.Streaming.Retry do
 
     wrapped_callback = fn event, wrapped_acc -> apply_callback(event, wrapped_acc, callback) end
 
-    case stream_fun.(request, finch_name, initial_acc, wrapped_callback, stream_opts) do
-      {:ok, %{status: 429} = state} when attempt < max_retries ->
-        maybe_retry(params, attempt, state.callback_acc, :rate_limited, state)
+    started_at = System.monotonic_time()
 
-      {:ok, %{status: 429} = state} ->
-        deliver_rate_limit_failure(state, callback)
+    case stream_fun.(request, finch_name, initial_acc, wrapped_callback, stream_opts) do
+      {:ok, %{status: status} = state} when is_integer(status) and status >= 400 ->
+        handle_http_failure(params, attempt, :rate_limited, state, started_at)
 
       {:ok, %{callback_acc: callback_acc}} ->
         {:ok, callback_acc}
 
-      {:error, reason, %{status: 429} = state} when attempt < max_retries ->
-        maybe_retry(params, attempt, state.callback_acc, reason, state)
-
-      {:error, _reason, %{status: 429} = state} ->
-        deliver_rate_limit_failure(state, callback)
+      {:error, reason, %{status: status} = state}
+      when is_integer(status) and status >= 400 ->
+        handle_http_failure(params, attempt, reason, state, started_at)
 
       {:error, reason, %{data_received?: false, callback_acc: callback_acc} = state}
       when attempt < max_retries ->
-        maybe_retry(params, attempt, callback_acc, reason, state)
+        maybe_retry(params, attempt, callback_acc, reason, state, started_at)
 
       {:error, reason, %{callback_acc: callback_acc}} ->
         {:error, reason, callback_acc}
     end
+  end
+
+  defp handle_http_failure(
+         %{max_retries: max_retries} = params,
+         attempt,
+         reason,
+         %{status: 429} = state,
+         started_at
+       )
+       when attempt < max_retries do
+    maybe_retry(params, attempt, state.callback_acc, reason, state, started_at)
+  end
+
+  defp handle_http_failure(%{callback: callback}, _attempt, _reason, state, _started_at) do
+    deliver_http_failure(state, callback)
   end
 
   defp maybe_retry(
@@ -108,11 +121,13 @@ defmodule ReqLLM.Streaming.Retry do
          attempt,
          callback_acc,
          reason,
-         state
+         state,
+         started_at
        ) do
     case classify_error(reason, state, cap) do
       {:retry, delay_ms} ->
-        log_retry(reason, attempt + 1, max_retries, delay_ms)
+        log_retry(reason, attempt + 1, max_retries, delay_ms, state.status)
+        emit_retry(params, attempt, max_retries, delay_ms, state.status, started_at)
 
         if delay_ms > 0 do
           Process.sleep(delay_ms)
@@ -122,15 +137,30 @@ defmodule ReqLLM.Streaming.Retry do
 
       {:rate_limit_too_long, delay_ms} ->
         log_rate_limit_giveup(delay_ms, cap)
-        deliver_rate_limit_failure(state, callback)
+        deliver_http_failure(state, callback)
 
       :no_retry ->
         {:error, reason, callback_acc}
     end
   end
 
-  defp apply_callback({:status, 429}, wrapped_acc, _callback) do
-    %{wrapped_acc | status: 429}
+  defp emit_retry(%{on_retry: nil}, _attempt, _max_retries, _delay, _status, _started_at),
+    do: :ok
+
+  defp emit_retry(%{on_retry: on_retry}, attempt, max_retries, delay, status, started_at) do
+    on_retry.(%{
+      attempt: attempt + 1,
+      next_attempt: attempt + 2,
+      max_retries: max_retries,
+      delay: delay,
+      duration: System.monotonic_time() - started_at,
+      http_status: status
+    })
+  end
+
+  defp apply_callback({:status, status}, wrapped_acc, _callback)
+       when is_integer(status) and status >= 400 do
+    %{wrapped_acc | status: status}
   end
 
   defp apply_callback({:status, status}, %{callback_acc: callback_acc} = wrapped_acc, callback) do
@@ -138,7 +168,12 @@ defmodule ReqLLM.Streaming.Retry do
     %{wrapped_acc | callback_acc: new_acc, status: status}
   end
 
-  defp apply_callback({:headers, headers}, %{status: 429} = wrapped_acc, _callback) do
+  defp apply_callback(
+         {:headers, headers},
+         %{status: status} = wrapped_acc,
+         _callback
+       )
+       when is_integer(status) and status >= 400 do
     %{wrapped_acc | headers: headers}
   end
 
@@ -149,9 +184,10 @@ defmodule ReqLLM.Streaming.Retry do
 
   defp apply_callback(
          {:data, chunk},
-         %{status: 429, error_body: error_body} = wrapped_acc,
+         %{status: status, error_body: error_body} = wrapped_acc,
          _callback
-       ) do
+       )
+       when is_integer(status) and status >= 400 do
     %{wrapped_acc | error_body: [chunk | error_body]}
   end
 
@@ -159,23 +195,14 @@ defmodule ReqLLM.Streaming.Retry do
     %{wrapped_acc | callback_acc: callback.(event, callback_acc), data_received?: true}
   end
 
-  defp apply_callback(:done, %{status: 429} = wrapped_acc, _callback) do
+  defp apply_callback(:done, %{status: status} = wrapped_acc, _callback)
+       when is_integer(status) and status >= 400 do
     wrapped_acc
   end
 
   defp apply_callback(event, %{callback_acc: callback_acc} = wrapped_acc, callback) do
     %{wrapped_acc | callback_acc: callback.(event, callback_acc)}
   end
-
-  defp classify_error(%Mint.TransportError{reason: reason}, _state, _cap)
-       when reason in @retryable_reasons,
-       do: {:retry, 0}
-
-  defp classify_error(%Req.TransportError{reason: reason}, _state, _cap)
-       when reason in @retryable_reasons,
-       do: {:retry, 0}
-
-  defp classify_error(%Finch.Error{reason: :pool_not_available}, _state, _cap), do: {:retry, 250}
 
   defp classify_error(_reason, %{status: 429} = state, cap) do
     delay = extract_retry_after_delay(state.headers)
@@ -190,8 +217,17 @@ defmodule ReqLLM.Streaming.Retry do
     end
   end
 
-  defp classify_error(_reason, _state, _cap) do
-    :no_retry
+  defp classify_error(reason, _state, _cap) do
+    case Failure.classify(reason) do
+      {:transport, :pool_not_available, true} ->
+        {:retry, 250}
+
+      {:transport, _reason, true} ->
+        {:retry, 0}
+
+      _classification ->
+        :no_retry
+    end
   end
 
   defp exceeds_cap?(_delay, :infinity), do: false
@@ -233,12 +269,12 @@ defmodule ReqLLM.Streaming.Retry do
 
   defp extract_retry_after_delay(_), do: 1000
 
-  defp deliver_rate_limit_failure(state, callback) do
+  defp deliver_http_failure(state, callback) do
     callback_acc =
-      callback.({:status, 429}, state.callback_acc)
+      callback.({:status, state.status}, state.callback_acc)
       |> maybe_emit_headers(callback, state.headers)
 
-    {:error, build_rate_limit_error(state), callback_acc}
+    {:error, build_http_error(state), callback_acc}
   end
 
   defp maybe_emit_headers(callback_acc, _callback, []), do: callback_acc
@@ -247,36 +283,13 @@ defmodule ReqLLM.Streaming.Retry do
     callback.({:headers, headers}, callback_acc)
   end
 
-  defp build_rate_limit_error(state) do
+  defp build_http_error(state) do
     response_body =
       state.error_body
       |> Enum.reverse()
       |> IO.iodata_to_binary()
-      |> decode_rate_limit_body()
 
-    reason =
-      case response_body do
-        %{"error" => %{"message" => message}} when is_binary(message) and message != "" -> message
-        %{"message" => message} when is_binary(message) and message != "" -> message
-        body when is_binary(body) and body != "" -> body
-        _ -> "HTTP 429"
-      end
-
-    ReqLLM.Error.API.Request.exception(
-      reason: reason,
-      status: 429,
-      response_body: response_body,
-      headers: state.headers
-    )
-  end
-
-  defp decode_rate_limit_body(""), do: ""
-
-  defp decode_rate_limit_body(body) when is_binary(body) do
-    case Jason.decode(body) do
-      {:ok, decoded} -> decoded
-      {:error, _} -> body
-    end
+    Failure.api_error(state.status, response_body, state.headers, use_body_as_reason?: true)
   end
 
   defp log_rate_limit_giveup(delay_ms, cap) do
@@ -286,8 +299,8 @@ defmodule ReqLLM.Streaming.Retry do
     )
   end
 
-  defp log_retry(reason, attempt, max_retries, delay_ms) do
-    if delay_ms > 0 do
+  defp log_retry(reason, attempt, max_retries, delay_ms, status) do
+    if status == 429 do
       Logger.warning(
         "Retrying streaming request after rate limit (429), waiting #{delay_ms}ms " <>
           "(reason=#{inspect(reason)}, attempt=#{attempt}, max_retries=#{max_retries})"

@@ -30,6 +30,12 @@ defmodule ReqLLM.StreamServer.CoreTest do
       assert :ok = StreamServer.cancel(server)
     end
 
+    test "requires a positive high watermark" do
+      assert_raise ArgumentError, ":high_watermark must be a positive integer, got: 0", fn ->
+        start_server(high_watermark: 0)
+      end
+    end
+
     test "handles HTTP task attachment and monitoring" do
       server = start_server()
       task = mock_http_task(server)
@@ -90,6 +96,34 @@ defmodule ReqLLM.StreamServer.CoreTest do
 
       assert {:ok, metadata} = StreamServer.await_metadata(server, 100)
       assert metadata.finish_reason == :stop
+
+      StreamServer.cancel(server)
+    end
+
+    test "keeps failed streams alive for metadata when consumer exits" do
+      server = start_server()
+      _task = mock_http_task(server)
+
+      consumer =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      assert :ok = StreamServer.monitor_consumer(server, consumer)
+      assert :ok = StreamServer.http_event(server, {:error, :connection_lost})
+
+      consumer_ref = Process.monitor(consumer)
+      send(consumer, :stop)
+      assert_receive {:DOWN, ^consumer_ref, :process, ^consumer, :normal}
+
+      Process.sleep(20)
+      assert Process.alive?(server)
+
+      assert {:ok, metadata} = StreamServer.await_metadata(server, 100)
+      assert metadata.finish_reason == :error
+      assert metadata.error == :connection_lost
 
       StreamServer.cancel(server)
     end

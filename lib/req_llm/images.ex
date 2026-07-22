@@ -100,6 +100,10 @@ defmodule ReqLLM.Images do
                    type: :pos_integer,
                    doc: "Timeout for receiving HTTP responses in milliseconds"
                  ],
+                 total_timeout: [
+                   type: {:or, [:pos_integer, {:in, [:infinity]}]},
+                   doc: "Optional total model-call timeout in milliseconds, including retries"
+                 ],
                  max_retries: [
                    type: :non_neg_integer,
                    default: 3,
@@ -138,12 +142,22 @@ defmodule ReqLLM.Images do
           keyword()
         ) :: {:ok, Response.t()} | {:error, term()}
   def generate_image(model_spec, prompt_or_messages, opts \\ []) do
+    opts = ReqLLM.ModelInput.merge_tuple_defaults(model_spec, :image, opts)
+    deadline = ReqLLM.TimeoutBudget.deadline(opts)
+
     with {:ok, model} <- ReqLLM.model(model_spec),
          {:ok, provider_module} <- ReqLLM.provider(model.provider),
+         {:ok, opts} <-
+           ReqLLM.Provider.Options.normalize_namespaced_provider_options(
+             provider_module,
+             :image,
+             model,
+             opts
+           ),
          {:ok, request} <-
            provider_module.prepare_request(:image, model, prompt_or_messages, opts),
          {:ok, %Req.Response{status: status, body: response}} when status in 200..299 <-
-           Req.request(request) do
+           ReqLLM.TimeoutBudget.request(request, deadline) do
       {:ok, response}
     else
       {:ok, %Req.Response{status: status, body: body}} ->

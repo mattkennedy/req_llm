@@ -430,6 +430,43 @@ defmodule ReqLLM.Providers.GoogleTest do
       assert function_response["response"]["temperature"] == 72
     end
 
+    test "encode_body prefers explicit model-facing content over application output" do
+      {:ok, model} = ReqLLM.model("google:gemini-1.5-flash")
+
+      tool_result =
+        Context.tool_result(
+          "call_1",
+          "search_documents",
+          %ReqLLM.ToolResult{
+            output: %{records: [%{id: 1}], internal_cursor: "cursor_123"},
+            content: [ReqLLM.Message.ContentPart.text("One matching document was found.")]
+          }
+        )
+
+      context = Context.new([tool_result])
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false,
+          operation: :chat
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = ReqLLM.Test.Helpers.json_body(updated_request)
+
+      [tool_part] =
+        decoded["contents"]
+        |> Enum.flat_map(& &1["parts"])
+        |> Enum.filter(&Map.has_key?(&1, "functionResponse"))
+
+      assert tool_part["functionResponse"]["response"] == %{
+               "content" => "One matching document was found."
+             }
+    end
+
     test "encode_body nests file content in functionResponse.parts for Gemini 3+" do
       {:ok, model} = ReqLLM.model("google:gemini-3-pro-preview")
 
@@ -1554,7 +1591,8 @@ defmodule ReqLLM.Providers.GoogleTest do
         {:low, 4_096},
         {:medium, 8_192},
         {:high, 16_384},
-        {:xhigh, 32_768}
+        {:xhigh, 32_768},
+        {:max, 32_768}
       ]
 
       for {effort, expected_budget} <- test_cases do
@@ -1575,7 +1613,8 @@ defmodule ReqLLM.Providers.GoogleTest do
         {:low, :low},
         {:medium, :medium},
         {:high, :high},
-        {:xhigh, :high}
+        {:xhigh, :high},
+        {:max, :high}
       ]
 
       for {effort, expected_level} <- test_cases do
@@ -2120,6 +2159,38 @@ defmodule ReqLLM.Providers.GoogleTest do
       assert Map.has_key?(part, "inline_data")
       assert part["inline_data"]["mime_type"] == "application/pdf"
       assert Base.decode64!(part["inline_data"]["data"]) == file_content
+    end
+
+    test "encode_body consumes explicitly owned Google file references" do
+      file_part =
+        ReqLLM.Message.ContentPart.owned_file_id(
+          "https://generativelanguage.googleapis.com/v1beta/files/report",
+          :google,
+          media_type: "application/pdf",
+          purpose: :analysis,
+          status: :active
+        )
+
+      context = %ReqLLM.Context{
+        messages: [%ReqLLM.Message{role: :user, content: [file_part]}]
+      }
+
+      request = %Req.Request{
+        options: [context: context, id: "gemini-1.5-flash", stream: false]
+      }
+
+      decoded = request |> Google.encode_body() |> ReqLLM.Test.Helpers.json_body()
+
+      assert [%{"parts" => [part]}] = decoded["contents"]
+
+      assert part == %{
+               "fileData" => %{
+                 "fileUri" => "https://generativelanguage.googleapis.com/v1beta/files/report",
+                 "mimeType" => "application/pdf"
+               }
+             }
+
+      refute Jason.encode!(decoded) =~ "req_llm"
     end
 
     test "encode_body handles video ContentPart with inline_data format" do
