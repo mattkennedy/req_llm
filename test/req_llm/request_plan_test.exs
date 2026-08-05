@@ -105,14 +105,23 @@ defmodule ReqLLM.RequestPlanTest do
       model_input =
         {:openai, "chat-latest", [stream_transport: :http, unsupported_default: true]}
 
-      assert capture_io(:stderr, fn ->
-               send(
-                 self(),
-                 RequestPlan.build(model_input, :chat,
-                   provider_options: [openai_stream_transport: :websocket]
-                 )
-               )
-             end) == ""
+      # `capture_io(:stderr, ...)` taps the shared :stderr device, so asserting it
+      # is entirely empty also captures warnings emitted by other async tests
+      # running concurrently (e.g. LLMDB "unverified model" notices) and flakes by
+      # scheduling order. The intent here is narrower: build/3 must return its
+      # planning warnings in plan.warnings rather than printing them.
+      captured =
+        capture_io(:stderr, fn ->
+          send(
+            self(),
+            RequestPlan.build(model_input, :chat,
+              provider_options: [openai_stream_transport: :websocket]
+            )
+          )
+        end)
+
+      refute captured =~ "Ignoring tuple model defaults"
+      refute captured =~ "Defaulted to OpenAI Chat Completions"
 
       assert_received {:ok, plan}
 

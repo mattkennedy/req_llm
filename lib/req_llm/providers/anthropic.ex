@@ -216,7 +216,7 @@ defmodule ReqLLM.Providers.Anthropic do
             url: request_path(plan),
             method: :post,
             receive_timeout: timeout,
-            pool_timeout: timeout
+            finch: [pool_timeout: timeout]
           ] ++ http_opts
         )
         |> Req.Request.register_options(req_keys)

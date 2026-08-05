@@ -416,7 +416,7 @@ defmodule ReqLLM.Providers.OpenAI do
             url: path,
             method: :post,
             receive_timeout: timeout,
-            pool_timeout: timeout
+            finch: [pool_timeout: timeout]
           ] ++ form_multipart_options ++ http_opts
         )
         |> Req.Request.register_options(req_keys)
@@ -465,7 +465,7 @@ defmodule ReqLLM.Providers.OpenAI do
             url: path,
             method: :post,
             receive_timeout: timeout,
-            pool_timeout: timeout
+            finch: [pool_timeout: timeout]
           ] ++ http_opts
         )
         |> Req.Request.register_options(req_keys)
@@ -530,7 +530,7 @@ defmodule ReqLLM.Providers.OpenAI do
             method: :post,
             base_url: Keyword.get(opts, :base_url, base_url()),
             receive_timeout: timeout,
-            pool_timeout: timeout,
+            finch: [pool_timeout: timeout],
             form_multipart: form_parts
           ] ++ auth_req_options(credential) ++ http_opts
         )

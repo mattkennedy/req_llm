@@ -173,7 +173,7 @@ defmodule ReqLLM.Providers.OpenAICodex do
             url: codex_path(),
             method: :post,
             receive_timeout: timeout,
-            pool_timeout: timeout
+            finch: [pool_timeout: timeout]
           ] ++ http_opts
         )
         |> Req.Request.register_options(req_keys)

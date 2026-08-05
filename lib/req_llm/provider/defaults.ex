@@ -407,7 +407,7 @@ defmodule ReqLLM.Provider.Defaults do
             method: :post,
             base_url: Keyword.get(opts, :base_url, provider_mod.default_base_url()),
             receive_timeout: timeout,
-            pool_timeout: timeout,
+            finch: [pool_timeout: timeout],
             form_multipart: form_parts,
             auth: {:bearer, api_key}
           ] ++ http_opts
@@ -495,7 +495,7 @@ defmodule ReqLLM.Provider.Defaults do
             method: :post,
             base_url: Keyword.get(opts, :base_url, provider_mod.default_base_url()),
             receive_timeout: timeout,
-            pool_timeout: timeout,
+            finch: [pool_timeout: timeout],
             body: Jason.encode!(body),
             auth: {:bearer, api_key},
             # Disable Req's automatic JSON decoding — response is raw audio binary
@@ -593,10 +593,23 @@ defmodule ReqLLM.Provider.Defaults do
     |> ReqLLM.Step.Fixture.maybe_attach(model, user_opts)
   end
 
+  # Req 0.7 takes Finch settings as a nested keyword list (`finch: [name: ...,
+  # pool_timeout: ...]`); a bare pool name and a top-level `pool_timeout` are both
+  # deprecated. Providers set `finch: [pool_timeout: ...]` when they build the
+  # request, so this must MERGE the pool name into whatever is already there —
+  # replacing the key would drop the caller's pool_timeout, and returning the
+  # bare list would drop the pool name and silently route LLM traffic to Req's
+  # default Finch instance instead of req_llm's own pool.
   @spec finch_option(Req.Request.t()) :: keyword()
   def finch_option(%Req.Request{} = request) do
-    [finch: request.options[:finch] || ReqLLM.Application.finch_name()]
+    case request.options[:finch] do
+      nil -> [finch: [name: ReqLLM.Application.finch_name()]]
+      opts when is_list(opts) -> [finch: Keyword.put_new_lazy(opts, :name, &default_finch_name/0)]
+      name -> [finch: [name: name]]
+    end
   end
+
+  defp default_finch_name, do: ReqLLM.Application.finch_name()
 
   @doc """
   Fetches API key and extra common option keys.

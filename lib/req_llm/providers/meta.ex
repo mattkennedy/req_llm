@@ -225,7 +225,7 @@ defmodule ReqLLM.Providers.Meta do
             url: ResponsesAPI.path(),
             method: :post,
             receive_timeout: timeout,
-            pool_timeout: timeout
+            finch: [pool_timeout: timeout]
           ] ++ Keyword.get(opts, :req_http_options, [])
         )
         |> Req.Request.register_options(request_option_keys())

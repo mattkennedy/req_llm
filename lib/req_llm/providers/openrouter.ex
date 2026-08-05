@@ -244,7 +244,7 @@ defmodule ReqLLM.Providers.OpenRouter do
             method: :post,
             base_url: Keyword.get(opts, :base_url, base_url()),
             receive_timeout: timeout,
-            pool_timeout: timeout,
+            finch: [pool_timeout: timeout],
             json: body,
             auth: {:bearer, api_key}
           ] ++ http_opts

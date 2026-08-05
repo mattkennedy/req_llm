@@ -110,7 +110,7 @@ defmodule ReqLLM.Providers.ElevenLabs do
             base_url: Keyword.get(opts, :base_url, default_base_url()),
             params: [output_format: format_string],
             receive_timeout: timeout,
-            pool_timeout: timeout,
+            finch: [pool_timeout: timeout],
             body: Jason.encode!(body),
             decode_body: false
           ] ++ http_opts
@@ -162,7 +162,7 @@ defmodule ReqLLM.Providers.ElevenLabs do
             base_url: Keyword.get(opts, :base_url, default_base_url()),
             params: transcription_query_params(provider_options),
             receive_timeout: timeout,
-            pool_timeout: timeout,
+            finch: [pool_timeout: timeout],
             form_multipart: form_parts
           ] ++ http_opts
         )
