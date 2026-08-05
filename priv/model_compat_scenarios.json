@@ -1306,15 +1306,13 @@
       }
     },
     "fireworks_ai:accounts/fireworks/models/glm-5p1": {
-      "catalog_status": "present",
-      "declared_operations": [
-        "text"
-      ],
+      "catalog_status": "missing",
+      "declared_operations": [],
       "model": "accounts/fireworks/models/glm-5p1",
       "provider": "fireworks_ai",
       "surfaces": {
         "fireworks_ai.chat_completions": {
-          "declaration": "declared",
+          "declaration": "unknown",
           "operation": "text",
           "provider": "fireworks_ai",
           "scenarios": {
@@ -1556,15 +1554,13 @@
       }
     },
     "fireworks_ai:accounts/fireworks/routers/glm-5p1-fast": {
-      "catalog_status": "present",
-      "declared_operations": [
-        "text"
-      ],
+      "catalog_status": "missing",
+      "declared_operations": [],
       "model": "accounts/fireworks/routers/glm-5p1-fast",
       "provider": "fireworks_ai",
       "surfaces": {
         "fireworks_ai.unrecorded_text": {
-          "declaration": "declared",
+          "declaration": "unknown",
           "operation": "text",
           "provider": "fireworks_ai",
           "scenarios": {
@@ -9147,15 +9143,13 @@
       }
     },
     "openrouter:inflection/inflection-3-pi": {
-      "catalog_status": "present",
-      "declared_operations": [
-        "text"
-      ],
+      "catalog_status": "missing",
+      "declared_operations": [],
       "model": "inflection/inflection-3-pi",
       "provider": "openrouter",
       "surfaces": {
         "openrouter.chat_completions": {
-          "declaration": "declared",
+          "declaration": "unknown",
           "operation": "text",
           "provider": "openrouter",
           "scenarios": {
@@ -9179,15 +9173,13 @@
       }
     },
     "openrouter:inflection/inflection-3-productivity": {
-      "catalog_status": "present",
-      "declared_operations": [
-        "text"
-      ],
+      "catalog_status": "missing",
+      "declared_operations": [],
       "model": "inflection/inflection-3-productivity",
       "provider": "openrouter",
       "surfaces": {
         "openrouter.chat_completions": {
-          "declaration": "declared",
+          "declaration": "unknown",
           "operation": "text",
           "provider": "openrouter",
           "scenarios": {
@@ -9553,15 +9545,13 @@
       }
     },
     "openrouter:meta-llama/llama-3.2-11b-vision-instruct": {
-      "catalog_status": "present",
-      "declared_operations": [
-        "text"
-      ],
+      "catalog_status": "missing",
+      "declared_operations": [],
       "model": "meta-llama/llama-3.2-11b-vision-instruct",
       "provider": "openrouter",
       "surfaces": {
         "openrouter.chat_completions": {
-          "declaration": "declared",
+          "declaration": "unknown",
           "operation": "text",
           "provider": "openrouter",
           "scenarios": {
@@ -9649,15 +9639,13 @@
       }
     },
     "openrouter:meta-llama/llama-3.2-3b-instruct:free": {
-      "catalog_status": "present",
-      "declared_operations": [
-        "text"
-      ],
+      "catalog_status": "missing",
+      "declared_operations": [],
       "model": "meta-llama/llama-3.2-3b-instruct:free",
       "provider": "openrouter",
       "surfaces": {
         "openrouter.unrecorded_text": {
-          "declaration": "declared",
+          "declaration": "unknown",
           "operation": "text",
           "provider": "openrouter",
           "scenarios": {
@@ -11195,15 +11183,13 @@
       }
     },
     "openrouter:nousresearch/hermes-3-llama-3.1-405b:free": {
-      "catalog_status": "present",
-      "declared_operations": [
-        "text"
-      ],
+      "catalog_status": "missing",
+      "declared_operations": [],
       "model": "nousresearch/hermes-3-llama-3.1-405b:free",
       "provider": "openrouter",
       "surfaces": {
         "openrouter.unrecorded_text": {
-          "declaration": "declared",
+          "declaration": "unknown",
           "operation": "text",
           "provider": "openrouter",
           "scenarios": {
@@ -11291,15 +11277,13 @@
       }
     },
     "openrouter:nvidia/llama-3.3-nemotron-super-49b-v1.5": {
-      "catalog_status": "present",
-      "declared_operations": [
-        "text"
-      ],
+      "catalog_status": "missing",
+      "declared_operations": [],
       "model": "nvidia/llama-3.3-nemotron-super-49b-v1.5",
       "provider": "openrouter",
       "surfaces": {
         "openrouter.chat_completions": {
-          "declaration": "declared",
+          "declaration": "unknown",
           "operation": "text",
           "provider": "openrouter",
           "scenarios": {
@@ -12247,15 +12231,13 @@
       }
     },
     "openrouter:poolside/laguna-m.1:free": {
-      "catalog_status": "present",
-      "declared_operations": [
-        "text"
-      ],
+      "catalog_status": "missing",
+      "declared_operations": [],
       "model": "poolside/laguna-m.1:free",
       "provider": "openrouter",
       "surfaces": {
         "openrouter.chat_completions": {
-          "declaration": "declared",
+          "declaration": "unknown",
           "operation": "text",
           "provider": "openrouter",
           "scenarios": {
@@ -13013,15 +12995,13 @@
       }
     },
     "openrouter:qwen/qwen3-next-80b-a3b-instruct:free": {
-      "catalog_status": "present",
-      "declared_operations": [
-        "text"
-      ],
+      "catalog_status": "missing",
+      "declared_operations": [],
       "model": "qwen/qwen3-next-80b-a3b-instruct:free",
       "provider": "openrouter",
       "surfaces": {
         "openrouter.unrecorded_text": {
-          "declaration": "declared",
+          "declaration": "unknown",
           "operation": "text",
           "provider": "openrouter",
           "scenarios": {
@@ -15071,15 +15051,13 @@
       }
     },
     "venice:claude-opus-4-7-fast": {
-      "catalog_status": "present",
-      "declared_operations": [
-        "text"
-      ],
+      "catalog_status": "missing",
+      "declared_operations": [],
       "model": "claude-opus-4-7-fast",
       "provider": "venice",
       "surfaces": {
         "venice.chat_completions": {
-          "declaration": "declared",
+          "declaration": "unknown",
           "operation": "text",
           "provider": "venice",
           "scenarios": {
@@ -15967,15 +15945,13 @@
       }
     },
     "venice:nvidia-nemotron-cascade-2-30b-a3b": {
-      "catalog_status": "present",
-      "declared_operations": [
-        "text"
-      ],
+      "catalog_status": "missing",
+      "declared_operations": [],
       "model": "nvidia-nemotron-cascade-2-30b-a3b",
       "provider": "venice",
       "surfaces": {
         "venice.chat_completions": {
-          "declaration": "declared",
+          "declaration": "unknown",
           "operation": "text",
           "provider": "venice",
           "scenarios": {
@@ -19357,15 +19333,13 @@
       }
     },
     "zenmux:deepseek/deepseek-reasoner": {
-      "catalog_status": "present",
-      "declared_operations": [
-        "text"
-      ],
+      "catalog_status": "missing",
+      "declared_operations": [],
       "model": "deepseek/deepseek-reasoner",
       "provider": "zenmux",
       "surfaces": {
         "zenmux.chat_completions": {
-          "declaration": "declared",
+          "declaration": "unknown",
           "operation": "text",
           "provider": "zenmux",
           "scenarios": {

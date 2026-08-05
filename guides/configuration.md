@@ -7,7 +7,8 @@ This guide covers all global configuration options for ReqLLM, including timeout
 ```elixir
 # config/config.exs
 config :req_llm,
-  # HTTP timeouts (all values in milliseconds)
+  # Timeouts (finite values are milliseconds)
+  connect_timeout: 10_000,           # WebSocket TCP/TLS/upgrade timeout
   receive_timeout: 120_000,          # Default response timeout
   stream_receive_timeout: 120_000,   # Streaming chunk timeout
   stream_pool_timeout: 120_000,      # Streaming connection checkout timeout
@@ -143,6 +144,11 @@ ReqLLM.stream_text(model, messages, total_timeout: 120_000)
 Set `total_timeout: :infinity` to disable the total deadline. Omitting the
 option preserves ReqLLM 1.x's unlimited total-call behavior.
 
+### `connect_timeout` (WebSocket default: 10,000ms)
+
+The maximum time allowed for the TCP/TLS connection and HTTP upgrade. It does
+not limit model generation or stream inactivity.
+
 ### `receive_timeout` (default: 30,000ms)
 
 The existing provider-transport inactivity timeout. For buffered requests it
@@ -160,8 +166,8 @@ Per-request override:
 ReqLLM.generate_text("openai:gpt-4o", "Hello", receive_timeout: 60_000)
 ```
 
-`receive_timeout` is not a total-call deadline and is unchanged by the additive
-timeout options.
+For streams, use `receive_timeout: :infinity` to disable this inactivity
+timeout. `receive_timeout` is not a total-call deadline.
 
 ### `stream_receive_timeout` (default: inherits from `receive_timeout`)
 
@@ -169,7 +175,7 @@ The global default for streaming `receive_timeout`. If no raw transport chunk
 arrives within this window, the transport fails.
 
 ```elixir
-config :req_llm, stream_receive_timeout: 120_000
+config :req_llm, stream_receive_timeout: :infinity
 ```
 
 ### `stream_idle_timeout` (default: not configured)
@@ -193,7 +199,8 @@ place.
 
 ### `stream_pool_timeout` (when unset: inherits from `stream_receive_timeout`)
 
-Timeout for checking out a Finch connection before a streaming request starts. Increase this when short bursts of concurrent streams can queue behind long-running responses.
+Timeout for checking out a Finch connection before a streaming request starts.
+When the receive timeout is `:infinity`, the default is 30 seconds.
 
 ```elixir
 config :req_llm, stream_pool_timeout: 300_000

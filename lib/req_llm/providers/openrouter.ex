@@ -22,6 +22,7 @@ defmodule ReqLLM.Providers.OpenRouter do
   - `openrouter_usage` - Usage options (e.g., `%{include: true}`)
   - `openrouter_plugins` - Array of plugins (e.g., `[%{id: "web"}]`)
   - `openrouter_session_id` - Session ID for grouping related requests in OpenRouter
+  - `openrouter_safety_settings` - Google safety filter settings, forwarded to Gemini models
   - `app_referer` - HTTP-Referer header for app identification
   - `app_title` - X-Title header for app title in rankings
 
@@ -116,6 +117,11 @@ defmodule ReqLLM.Providers.OpenRouter do
     openrouter_session_id: [
       type: :string,
       doc: "OpenRouter session ID for grouping related LLM calls"
+    ],
+    openrouter_safety_settings: [
+      type: {:list, :map},
+      doc:
+        "Google safety filter settings, forwarded to Gemini models as the top-level `safety_settings` body field"
     ],
     dimensions: [
       type: :pos_integer,
@@ -401,156 +407,141 @@ defmodule ReqLLM.Providers.OpenRouter do
     |> maybe_put(:usage, request.options[:openrouter_usage])
     |> maybe_put(:plugins, request.options[:openrouter_plugins])
     |> maybe_put(:session_id, request.options[:openrouter_session_id])
+    |> maybe_put(:safety_settings, request.options[:openrouter_safety_settings])
     |> add_openrouter_specific_options(request.options)
     |> add_stream_options(request.options)
   end
 
   defp encode_openrouter_content_parts(body, request_options) do
     context = request_options[:context]
-    plugins = request_options[:openrouter_plugins]
 
     if match?(%ReqLLM.Context{}, context) do
-      replace_openrouter_content_messages(body, context, file_parser_plugin?(plugins))
+      replace_openrouter_content_messages(body, context)
     else
       body
     end
   end
 
-  defp file_parser_plugin?(plugins) when is_list(plugins) do
-    Enum.any?(plugins, fn
-      %{id: "file-parser"} -> true
-      %{"id" => "file-parser"} -> true
-      _ -> false
-    end)
-  end
-
-  defp file_parser_plugin?(_plugins), do: false
-
   defp replace_openrouter_content_messages(
          %{messages: encoded_messages} = body,
-         context,
-         pdf_files?
+         context
        )
        when is_list(encoded_messages) do
     Map.put(
       body,
       :messages,
-      encode_openrouter_content_messages(encoded_messages, context.messages, pdf_files?)
+      encode_openrouter_content_messages(encoded_messages, context.messages)
     )
   end
 
   defp replace_openrouter_content_messages(
          %{"messages" => encoded_messages} = body,
-         context,
-         pdf_files?
+         context
        )
        when is_list(encoded_messages) do
     Map.put(
       body,
       "messages",
-      encode_openrouter_content_messages(encoded_messages, context.messages, pdf_files?)
+      encode_openrouter_content_messages(encoded_messages, context.messages)
     )
   end
 
-  defp replace_openrouter_content_messages(body, _context, _pdf_files?), do: body
+  defp replace_openrouter_content_messages(body, _context), do: body
 
-  defp encode_openrouter_content_messages(encoded_messages, context_messages, pdf_files?)
+  defp encode_openrouter_content_messages(encoded_messages, context_messages)
        when length(encoded_messages) == length(context_messages) do
     encoded_messages
     |> Enum.zip(context_messages)
     |> Enum.map(fn {encoded_message, context_message} ->
-      encode_openrouter_content_message(encoded_message, context_message, pdf_files?)
+      encode_openrouter_content_message(encoded_message, context_message)
     end)
   end
 
-  defp encode_openrouter_content_messages(encoded_messages, _context_messages, _pdf_files?),
+  defp encode_openrouter_content_messages(encoded_messages, _context_messages),
     do: encoded_messages
 
   defp encode_openrouter_content_message(
          encoded_message,
-         %ReqLLM.Message{content: content},
-         pdf_files?
+         %ReqLLM.Message{content: content}
        )
        when is_list(content) do
-    if Enum.any?(content, &openrouter_reencoded_content_part?(&1, pdf_files?)) do
-      put_message_content(encoded_message, encode_openrouter_content(content, pdf_files?))
+    if Enum.any?(content, &openrouter_reencoded_content_part?/1) do
+      rewrite_openrouter_message_content(encoded_message, content)
     else
       encoded_message
     end
   end
 
-  defp encode_openrouter_content_message(encoded_message, _message, _pdf_files?),
+  defp encode_openrouter_content_message(encoded_message, _message),
     do: encoded_message
 
-  defp put_message_content(%{content: _} = message, content),
-    do: Map.put(message, :content, content)
-
-  defp put_message_content(%{"content" => _} = message, content),
-    do: Map.put(message, "content", content)
-
-  defp put_message_content(message, content), do: Map.put(message, :content, content)
-
-  defp encode_openrouter_content(content, pdf_files?) do
-    content
-    |> Enum.map(&encode_openrouter_content_part(&1, pdf_files?))
-    |> Enum.reject(&is_nil/1)
-    |> normalize_openrouter_content()
+  defp rewrite_openrouter_message_content(%{content: encoded_content} = message, content)
+       when is_list(encoded_content) do
+    Map.put(message, :content, rewrite_openrouter_content(encoded_content, content))
   end
 
-  defp normalize_openrouter_content([]), do: ""
-
-  defp normalize_openrouter_content([%{type: "text", text: text} = block]) do
-    if map_size(block) == 2, do: text, else: [block]
+  defp rewrite_openrouter_message_content(%{"content" => encoded_content} = message, content)
+       when is_list(encoded_content) do
+    Map.put(message, "content", rewrite_openrouter_content(encoded_content, content))
   end
 
-  defp normalize_openrouter_content(content), do: content
+  defp rewrite_openrouter_message_content(message, _content), do: message
 
-  defp encode_openrouter_content_part(
-         %ContentPart{type: :text, text: text, metadata: metadata},
-         _pdf_files?
+  defp rewrite_openrouter_content(encoded_content, content) do
+    case rewrite_openrouter_content_parts(content, encoded_content, []) do
+      {:ok, rewritten_content} ->
+        rewritten_content
+
+      :error ->
+        raise ReqLLM.Error.Invalid.Message.exception(
+                reason: "OpenRouter could not align encoded message content parts."
+              )
+    end
+  end
+
+  defp rewrite_openrouter_content_parts([], encoded_content, rewritten_content) do
+    {:ok, Enum.reverse(rewritten_content, encoded_content)}
+  end
+
+  defp rewrite_openrouter_content_parts([part | parts], encoded_content, rewritten_content) do
+    if openai_encoded_content_part?(part) do
+      rewrite_openrouter_encoded_content_part(
+        part,
+        parts,
+        encoded_content,
+        rewritten_content
+      )
+    else
+      rewrite_openrouter_content_parts(parts, encoded_content, rewritten_content)
+    end
+  end
+
+  defp rewrite_openrouter_encoded_content_part(
+         part,
+         parts,
+         [encoded_part | encoded_content],
+         rewritten_content
        ) do
-    %{type: "text", text: text}
-    |> merge_content_metadata(metadata)
+    rewritten_part = rewrite_openrouter_content_part(part, encoded_part)
+
+    rewrite_openrouter_content_parts(
+      parts,
+      encoded_content,
+      [rewritten_part | rewritten_content]
+    )
   end
 
-  defp encode_openrouter_content_part(
-         %ContentPart{
-           type: :image,
-           data: data,
-           media_type: media_type,
-           metadata: metadata
-         },
-         _pdf_files?
+  defp rewrite_openrouter_encoded_content_part(_part, _parts, [], _rewritten_content),
+    do: :error
+
+  defp rewrite_openrouter_content_part(
+         %ContentPart{type: :file, file_id: file_id},
+         encoded_part
        )
-       when is_binary(data) do
-    data
-    |> image_url_content_part(media_type)
-    |> merge_content_metadata(metadata)
-  end
+       when is_binary(file_id) and file_id != "",
+       do: encoded_part
 
-  defp encode_openrouter_content_part(
-         %ContentPart{
-           type: :image_url,
-           url: url,
-           media_type: media_type,
-           metadata: metadata
-         },
-         _pdf_files?
-       ) do
-    image_url_map = %{url: url}
-
-    image_url_map =
-      if is_binary(media_type) and media_type != "" do
-        Map.put(image_url_map, :media_type, media_type)
-      else
-        image_url_map
-      end
-
-    %{type: "image_url", image_url: image_url_map}
-    |> merge_content_metadata(metadata)
-  end
-
-  defp encode_openrouter_content_part(%ContentPart{type: :file, data: data} = part, pdf_files?)
+  defp rewrite_openrouter_content_part(%ContentPart{data: data} = part, encoded_part)
        when is_binary(data) do
     cond do
       openrouter_input_audio_part?(part) ->
@@ -564,30 +555,43 @@ defmodule ReqLLM.Providers.OpenRouter do
                   "OpenRouter chat audio input supports only mp3 and wav file parts; got #{inspect(part.media_type)}."
               )
 
-      pdf_files? and openrouter_pdf_file_part?(part) ->
-        %{
-          type: "file",
-          file: %{
-            filename: openrouter_file_filename(part),
-            file_data: "data:#{openrouter_file_media_type(part)};base64,#{Base.encode64(data)}"
-          }
-        }
+      openrouter_pdf_file_part?(part) ->
+        openrouter_pdf_content_part(part)
 
       true ->
-        image_url_content_part(data, part.media_type)
+        encoded_part
     end
   end
 
-  defp encode_openrouter_content_part(%ContentPart{type: :thinking}, _pdf_files?), do: nil
-  defp encode_openrouter_content_part(_part, _pdf_files?), do: nil
+  defp rewrite_openrouter_content_part(_part, encoded_part), do: encoded_part
 
-  defp openrouter_reencoded_content_part?(part, true) do
+  defp openai_encoded_content_part?(%ContentPart{type: type})
+       when type in [:text, :image, :image_url],
+       do: true
+
+  defp openai_encoded_content_part?(%ContentPart{type: :file, file_id: file_id})
+       when is_binary(file_id) and file_id != "",
+       do: true
+
+  defp openai_encoded_content_part?(%ContentPart{type: :file, data: data})
+       when is_binary(data),
+       do: true
+
+  defp openai_encoded_content_part?(_part), do: false
+
+  defp openrouter_reencoded_content_part?(part) do
     openrouter_input_audio_part?(part) or openrouter_audio_file_part?(part) or
       openrouter_pdf_file_part?(part)
   end
 
-  defp openrouter_reencoded_content_part?(part, _pdf_files?) do
-    openrouter_input_audio_part?(part) or openrouter_audio_file_part?(part)
+  defp openrouter_pdf_content_part(%ContentPart{data: data} = part) do
+    %{
+      type: "file",
+      file: %{
+        filename: openrouter_file_filename(part),
+        file_data: "data:#{openrouter_file_media_type(part)};base64,#{Base.encode64(data)}"
+      }
+    }
   end
 
   defp input_audio_content_part(data, format) do
@@ -596,15 +600,6 @@ defmodule ReqLLM.Providers.OpenRouter do
       input_audio: %{
         data: Base.encode64(data),
         format: format
-      }
-    }
-  end
-
-  defp image_url_content_part(data, media_type) do
-    %{
-      type: "image_url",
-      image_url: %{
-        url: "data:#{media_type};base64,#{Base.encode64(data)}"
       }
     }
   end

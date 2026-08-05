@@ -52,12 +52,13 @@ defmodule ReqLLM.OpenAI.Realtime do
     with {:ok, model} <- normalize_model(model_spec),
          url <- ReqLLM.Providers.OpenAI.WebSocket.realtime_url(model, opts),
          headers <- ReqLLM.Providers.OpenAI.WebSocket.headers(model, opts),
-         {:ok, pid} <- WebSocketSession.start_link(url, headers: headers),
-         :ok <-
-           WebSocketSession.await_connected(
-             pid,
-             Keyword.get(opts, :connect_timeout, @default_connect_timeout)
-           ) do
+         connect_timeout = Keyword.get(opts, :connect_timeout, @default_connect_timeout),
+         {:ok, pid} <-
+           WebSocketSession.start_link(url,
+             headers: headers,
+             connect_timeout: connect_timeout
+           ),
+         :ok <- WebSocketSession.await_connected(pid, connect_timeout) do
       {:ok, %Session{pid: pid, model: model}}
     end
   end
@@ -67,7 +68,7 @@ defmodule ReqLLM.OpenAI.Realtime do
     WebSocketSession.send_json(pid, event)
   end
 
-  @spec next_event(Session.t(), non_neg_integer()) :: {:ok, map()} | :halt | {:error, term()}
+  @spec next_event(Session.t(), timeout()) :: {:ok, map()} | :halt | {:error, term()}
   def next_event(%Session{pid: pid}, timeout \\ 30_000) do
     with {:ok, message} <- WebSocketSession.next_message(pid, timeout) do
       Jason.decode(message)
@@ -85,7 +86,7 @@ defmodule ReqLLM.OpenAI.Realtime do
   @spec next_projected_event(Session.t()) :: {:ok, Event.t()} | :halt | {:error, term()}
   def next_projected_event(%Session{} = session), do: next_projected_event(session, 30_000, [])
 
-  @spec next_projected_event(Session.t(), non_neg_integer() | keyword()) ::
+  @spec next_projected_event(Session.t(), timeout() | keyword()) ::
           {:ok, Event.t()} | :halt | {:error, term()}
   def next_projected_event(%Session{} = session, opts) when is_list(opts),
     do: next_projected_event(session, 30_000, opts)

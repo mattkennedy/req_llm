@@ -78,6 +78,15 @@ defmodule ReqLLM.Streaming.FinchClientTest do
       assert opts[:pool_timeout] == 42_000
     end
 
+    test "keeps pool checkout finite when receive timeout is infinite" do
+      Application.delete_env(:req_llm, :stream_pool_timeout)
+
+      opts = FinchClient.stream_options(%{}, receive_timeout: :infinity)
+
+      assert opts[:receive_timeout] == :infinity
+      assert opts[:pool_timeout] == 30_000
+    end
+
     test "uses stream_pool_timeout config when request pool_timeout is not provided" do
       Application.put_env(:req_llm, :stream_pool_timeout, 180_000)
 
@@ -449,7 +458,8 @@ defmodule ReqLLM.Streaming.FinchClientTest do
       assert http_context.status == 200
       assert canonical_json["model"] == "google/gemini-3-flash-preview"
 
-      Process.sleep(50)
+      assert_receive {task_ref, :ok}, 5_000
+      assert_receive {:DOWN, ^task_ref, :process, ^task_pid, :normal}, 5_000
 
       assert Enum.any?(EventStreamServer.events(stream_server), &match?({:status, 200}, &1))
     end
@@ -818,8 +828,6 @@ defmodule ReqLLM.Streaming.FinchClientTest do
       {:ok, pid} = TerminatingStreamServer.start_link()
       GenServer.stop(pid)
 
-      Process.sleep(10)
-
       result =
         try do
           ReqLLM.StreamServer.http_event(pid, {:data, "test"})
@@ -845,7 +853,6 @@ defmodule ReqLLM.Streaming.FinchClientTest do
         )
 
       GenServer.stop(stream_server)
-      Process.sleep(10)
 
       ref = Process.monitor(task_pid)
       Process.unlink(task_pid)

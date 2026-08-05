@@ -430,6 +430,122 @@ defmodule ReqLLM.Providers.GoogleTest do
       assert function_response["response"]["temperature"] == 72
     end
 
+    test "encode_body emits text tool results only inside functionResponse" do
+      {:ok, model} = ReqLLM.model("google:gemini-2.5-flash-lite")
+
+      context =
+        Context.new([
+          Context.user("Check NPI 1234567890."),
+          Context.assistant("",
+            tool_calls: [
+              %ReqLLM.ToolCall{
+                id: "call_1",
+                type: "function",
+                function: %{name: "lookup_npi", arguments: ~s({"npi":"1234567890"})}
+              }
+            ]
+          ),
+          Context.tool_result(
+            "call_1",
+            "lookup_npi",
+            "NPI 1234567890 is valid and active"
+          )
+        ])
+
+      request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false,
+          operation: :chat
+        ]
+      }
+
+      decoded = request |> Google.encode_body() |> ReqLLM.Test.Helpers.json_body()
+
+      tool_result_entry =
+        Enum.find(decoded["contents"], fn entry ->
+          Enum.any?(entry["parts"], &Map.has_key?(&1, "functionResponse"))
+        end)
+
+      assert tool_result_entry["parts"] == [
+               %{
+                 "functionResponse" => %{
+                   "name" => "lookup_npi",
+                   "response" => %{"content" => "NPI 1234567890 is valid and active"}
+                 }
+               }
+             ]
+    end
+
+    test "encode_body preserves video_url media in raw tool result messages" do
+      video_url = "https://example.com/tool-result.mp4"
+
+      messages = [
+        %{
+          "role" => "tool",
+          "name" => "inspect_video",
+          "tool_call_id" => "call_1",
+          "content" => [
+            %{"type" => "text", "text" => "The video shows a blue car."},
+            %{"type" => "video_url", "video_url" => %{"url" => video_url}}
+          ]
+        }
+      ]
+
+      encode_for_model = fn model_id ->
+        {:ok, model} = ReqLLM.model("google:#{model_id}")
+
+        %Req.Request{
+          options: [
+            messages: messages,
+            model: model.model,
+            stream: false,
+            operation: :chat
+          ]
+        }
+        |> Google.encode_body()
+        |> ReqLLM.Test.Helpers.json_body()
+      end
+
+      gemini_2_5_body = encode_for_model.("gemini-2.5-flash-lite")
+
+      assert [%{"parts" => parts}] = gemini_2_5_body["contents"]
+
+      assert parts == [
+               %{
+                 "fileData" => %{
+                   "fileUri" => video_url,
+                   "mimeType" => "video/mp4"
+                 }
+               },
+               %{
+                 "functionResponse" => %{
+                   "name" => "inspect_video",
+                   "response" => %{"content" => "The video shows a blue car."}
+                 }
+               }
+             ]
+
+      gemini_3_body = encode_for_model.("gemini-3-pro-preview")
+
+      assert [%{"parts" => [%{"functionResponse" => function_response}]}] =
+               gemini_3_body["contents"]
+
+      assert function_response["response"] == %{
+               "content" => "The video shows a blue car."
+             }
+
+      assert function_response["parts"] == [
+               %{
+                 "fileData" => %{
+                   "fileUri" => video_url,
+                   "mimeType" => "video/mp4"
+                 }
+               }
+             ]
+    end
+
     test "encode_body prefers explicit model-facing content over application output" do
       {:ok, model} = ReqLLM.model("google:gemini-1.5-flash")
 
@@ -611,9 +727,12 @@ defmodule ReqLLM.Providers.GoogleTest do
                _ -> false
              end),
              "Gemini 2.5 must keep the file as a sibling inline_data part (legacy behavior)"
+
+      refute Enum.any?(tool_user_msg["parts"], &Map.has_key?(&1, "text")),
+             "tool result text must only appear in functionResponse.response"
     end
 
-    test "encode_body keeps text-only tool results unchanged on Gemini 3+" do
+    test "encode_body keeps text-only tool results inside functionResponse on Gemini 3+" do
       {:ok, model} = ReqLLM.model("google:gemini-3-pro-preview")
 
       tool_result = %ReqLLM.Message{
@@ -665,6 +784,13 @@ defmodule ReqLLM.Providers.GoogleTest do
 
       refute Map.has_key?(function_response_part["functionResponse"], "parts"),
              "text-only tool results must not gain a functionResponse.parts field"
+
+      assert function_response_part["functionResponse"]["response"] == %{
+               "content" => "just text"
+             }
+
+      refute Enum.any?(tool_user_msg["parts"], &Map.has_key?(&1, "text")),
+             "tool result text must only appear in functionResponse.response"
     end
 
     test "encode_body excludes id from functionCall parts" do
@@ -1516,6 +1642,130 @@ defmodule ReqLLM.Providers.GoogleTest do
       assert meta_chunk.type == :meta
       assert meta_chunk.metadata[:finish_reason] == "stop"
       assert meta_chunk.metadata[:terminal?] == true
+    end
+
+    test "preserves raw finishReason and finishMessage on abnormal finishes", %{model: model} do
+      event = %{
+        data: %{
+          "candidates" => [
+            %{
+              "content" => %{
+                "parts" => [%{"text" => "", "thoughtSignature" => "sig"}],
+                "role" => "model"
+              },
+              "finishReason" => "MALFORMED_FUNCTION_CALL",
+              "finishMessage" =>
+                "Malformed function call: Failed to parse function call: Function call is empty - no input to parse.",
+              "index" => 0
+            }
+          ],
+          "usageMetadata" => %{
+            "promptTokenCount" => 10,
+            "candidatesTokenCount" => 5,
+            "totalTokenCount" => 15
+          }
+        }
+      }
+
+      chunks = Google.decode_stream_event(event, model)
+      meta_chunk = Enum.find(chunks, &(&1.type == :meta))
+      assert meta_chunk.metadata[:finish_reason] == "error"
+      assert meta_chunk.metadata[:finish_reason_raw] == "MALFORMED_FUNCTION_CALL"
+      assert meta_chunk.metadata[:finish_message] =~ "Function call is empty"
+      assert meta_chunk.metadata[:terminal?] == true
+    end
+
+    test "preserves raw finishReason without finishMessage", %{model: model} do
+      event = %{
+        data: %{"candidates" => [%{"finishReason" => "UNEXPECTED_TOOL_CALL", "index" => 0}]}
+      }
+
+      [meta_chunk] = Google.decode_stream_event(event, model)
+      assert meta_chunk.metadata[:finish_reason] == "error"
+      assert meta_chunk.metadata[:finish_reason_raw] == "UNEXPECTED_TOOL_CALL"
+      refute Map.has_key?(meta_chunk.metadata, :finish_message)
+    end
+
+    test "normal STOP finishes carry the raw reason too", %{model: model} do
+      event = %{data: %{"candidates" => [%{"finishReason" => "STOP", "index" => 0}]}}
+
+      [meta_chunk] = Google.decode_stream_event(event, model)
+      assert meta_chunk.metadata[:finish_reason] == "stop"
+      assert meta_chunk.metadata[:finish_reason_raw] == "STOP"
+    end
+
+    test "policy stops normalize to content_filter like SAFETY", %{model: model} do
+      for reason <- [
+            "BLOCKLIST",
+            "PROHIBITED_CONTENT",
+            "SPII",
+            "LANGUAGE",
+            "IMAGE_SAFETY",
+            "IMAGE_PROHIBITED_CONTENT",
+            "IMAGE_RECITATION"
+          ] do
+        event = %{data: %{"candidates" => [%{"finishReason" => reason, "index" => 0}]}}
+
+        [meta_chunk] = Google.decode_stream_event(event, model)
+
+        assert meta_chunk.metadata[:finish_reason] == "content_filter",
+               "#{reason} should be a content filter stop, got #{inspect(meta_chunk.metadata[:finish_reason])}"
+      end
+    end
+
+    # These are stops, but not content flags, and they want handling the
+    # content_filter path cannot give them ("the model refused" would be wrong).
+    # Pinning them keeps a later pass from sweeping the whole enum into
+    # content_filter for tidiness.
+    test "non-content-flag stops stay error", %{model: model} do
+      for reason <- [
+            "UNEXPECTED_TOOL_CALL",
+            "TOO_MANY_TOOL_CALLS",
+            "NO_IMAGE",
+            "IMAGE_OTHER",
+            "OTHER"
+          ] do
+        event = %{data: %{"candidates" => [%{"finishReason" => reason, "index" => 0}]}}
+
+        [meta_chunk] = Google.decode_stream_event(event, model)
+
+        assert meta_chunk.metadata[:finish_reason] == "error",
+               "#{reason} is not a content flag and should stay error, got #{inspect(meta_chunk.metadata[:finish_reason])}"
+      end
+    end
+
+    # Body captured verbatim from gemini-2.5-pro on the non-streaming endpoint
+    # with no tools declared: the candidate carries only a finishReason and no
+    # "content" key. This used to fall through to the catch-all and report
+    # "stop", making a provider abort look like a successful empty answer.
+    test "non-streaming abort with no content keeps its reason and raw name" do
+      google_response = %{
+        "candidates" => [
+          %{
+            "finishReason" => "UNEXPECTED_TOOL_CALL",
+            "finishMessage" => "Unexpected tool call",
+            "index" => 0
+          }
+        ],
+        "usageMetadata" => %{"promptTokenCount" => 22, "totalTokenCount" => 22},
+        "modelVersion" => "gemini-2.5-pro"
+      }
+
+      mock_resp = %Req.Response{status: 200, body: google_response}
+      {:ok, model} = ReqLLM.model("google:gemini-2.5-pro")
+
+      mock_req = %Req.Request{
+        options: [context: context_fixture(), stream: false, model: model.model]
+      }
+
+      {_req, resp} = Google.decode_response({mock_req, mock_resp})
+
+      refute ReqLLM.Response.finish_reason(resp.body) == :stop,
+             "an abort must not be reported as a clean stop"
+
+      assert ReqLLM.Response.finish_reason(resp.body) == :error
+      assert resp.body.provider_meta["finish_reason_raw"] == "UNEXPECTED_TOOL_CALL"
+      assert resp.body.provider_meta["finish_message"] == "Unexpected tool call"
     end
 
     test "usageMetadata alone still has no finish_reason (unchanged)", %{model: model} do

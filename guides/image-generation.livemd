@@ -4,20 +4,45 @@
 
 ```elixir
 Mix.install([
-  {:req_llm, "~> 1.4"},
+  {:req_llm, "~> 1.18"},
   {:kino, "~> 0.14.2"}
 ])
 ```
 
 ## Setup
 
-Configure your API keys. Set them as environment variables, Livebook secrets, or replace the fallback values below.
+Configure your API keys as standard environment variables or as Livebook secrets named `OPENAI_API_KEY`, `XAI_API_KEY`, and `GOOGLE_API_KEY`. Livebook exposes these secrets to the notebook with an `LB_` prefix.
 
 ```elixir
-ReqLLM.put_key(:openai_api_key, System.get_env("OPENAI_API_KEY") || "your-openai-key")
-ReqLLM.put_key(:xai_api_key, System.get_env("XAI_API_KEY") || "your-xai-key")
-ReqLLM.put_key(:google_api_key, System.get_env("GOOGLE_API_KEY") || "your-google-key")
-:ok
+provider_env_vars = [
+  openai: "OPENAI_API_KEY",
+  xai: "XAI_API_KEY",
+  google: "GOOGLE_API_KEY"
+]
+
+Enum.each(provider_env_vars, fn {provider, env_var} ->
+  case System.get_env("LB_" <> env_var) do
+    key when is_binary(key) and key != "" ->
+      ReqLLM.put_key(ReqLLM.Keys.config_key(provider), key)
+
+    _ ->
+      :ok
+  end
+end)
+
+missing_keys =
+  Enum.flat_map(provider_env_vars, fn {provider, env_var} ->
+    case ReqLLM.Keys.get(provider) do
+      {:ok, _key, _source} -> []
+      {:error, _reason} -> [env_var]
+    end
+  end)
+
+if missing_keys == [] do
+  Kino.Markdown.new("✅ **API keys configured**")
+else
+  Kino.Markdown.new("⚠️ **Missing API keys:** `#{Enum.join(missing_keys, "`, `")}`")
+end
 ```
 
 ## Image Generation Comparison
@@ -26,11 +51,11 @@ Generate images from three different providers in parallel and compare the resul
 
 ### Models Used
 
-| Provider | Model                    | Notes                                      |
-| -------- | ------------------------ | ------------------------------------------ |
-| OpenAI   | `gpt-image-1.5`          | State-of-the-art quality, 1:1 aspect ratio |
-| xAI      | `grok-imagine-image`     | Grok's image generation                    |
-| Google   | `gemini-2.5-flash-image` | Fast generation, good for iteration        |
+| Provider | Model                          | Notes                                      |
+| -------- | ------------------------------ | ------------------------------------------ |
+| OpenAI   | `gpt-image-2`                  | High-quality image generation              |
+| xAI      | `grok-imagine-image-quality`   | Grok's quality image model                 |
+| Google   | `gemini-3.1-flash-image`       | Fast generation, good for iteration        |
 
 ```elixir
 prompt_input = Kino.Input.textarea("Enter your image prompt",
@@ -93,9 +118,9 @@ Click "Evaluate" to generate images from all three providers in parallel.
 prompt = Kino.Input.read(prompt_input)
 
 models = [
-  {"openai:gpt-image-1.5", [size: "1024x1024"]},
-  {"xai:grok-imagine-image", [aspect_ratio: "1:1"]},
-  {"google:gemini-2.5-flash-image", [aspect_ratio: "1:1"]}
+  {"openai:gpt-image-2", [size: "1024x1024"]},
+  {"xai:grok-imagine-image-quality", [aspect_ratio: "1:1"]},
+  {"google:gemini-3.1-flash-image", [aspect_ratio: "1:1"]}
 ]
 
 # Run all three generations in parallel

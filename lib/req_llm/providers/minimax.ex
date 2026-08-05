@@ -514,6 +514,20 @@ defmodule ReqLLM.Providers.Minimax do
     |> Enum.map(&normalize_reasoning_detail/1)
   end
 
+  defp normalize_reasoning_detail({%ReqLLM.Message.ReasoningDetails{} = detail, fallback_index}) do
+    provider_data = normalize_provider_data(detail.provider_data)
+
+    %ReqLLM.Message.ReasoningDetails{
+      text: detail.text,
+      signature: detail.signature || provider_data["id"],
+      encrypted?: false,
+      provider: :minimax,
+      format: detail.format || "minimax-response-v1",
+      index: detail.index || fallback_index,
+      provider_data: Map.drop(provider_data, ["text", "id", "format", "index"])
+    }
+  end
+
   defp normalize_reasoning_detail({raw, fallback_index}) when is_map(raw) do
     %ReqLLM.Message.ReasoningDetails{
       text: raw["text"],

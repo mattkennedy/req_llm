@@ -108,6 +108,31 @@ defmodule ReqLLM.Provider.DefaultsTest do
              ]
     end
 
+    test "preserves explicit prompt cache breakpoints on supported content blocks" do
+      breakpoint = %{mode: "explicit"}
+
+      message = %Message{
+        role: :user,
+        content: [
+          ContentPart.text("Stable text", %{prompt_cache_breakpoint: breakpoint}),
+          ContentPart.image_url("https://example.com/image.png", %{
+            "prompt_cache_breakpoint" => breakpoint
+          }),
+          ContentPart.file_id("file_123", %{prompt_cache_breakpoint: breakpoint})
+        ]
+      }
+
+      context = %Context{messages: [message]}
+      result = Defaults.encode_context_to_openai_format(context, "gpt-5.6")
+
+      [encoded_message] = result.messages
+
+      assert [text_block, image_block, file_block] = encoded_message.content
+      assert text_block.prompt_cache_breakpoint == breakpoint
+      assert image_block.prompt_cache_breakpoint == breakpoint
+      assert file_block.prompt_cache_breakpoint == breakpoint
+    end
+
     test "ignores non-passthrough metadata keys" do
       content_with_extra_meta = %ContentPart{
         type: :text,
@@ -553,6 +578,25 @@ defmodule ReqLLM.Provider.DefaultsTest do
       end
     end
 
+    test "decodes prompt cache write usage", %{model: model} do
+      response_data = %{
+        "choices" => [%{"message" => %{"content" => "Cached"}, "finish_reason" => "stop"}],
+        "usage" => %{
+          "prompt_tokens" => 2_000,
+          "completion_tokens" => 10,
+          "total_tokens" => 2_010,
+          "prompt_tokens_details" => %{
+            "cached_tokens" => 1_200,
+            "cache_write_tokens" => 800
+          }
+        }
+      }
+
+      assert {:ok, response} = Defaults.decode_response_body_openai_format(response_data, model)
+      assert response.usage.cached_tokens == 1_200
+      assert response.usage.cache_creation_tokens == 800
+    end
+
     test "decodes reasoning_details to normalized structs", %{model: model} do
       response_data = %{
         "id" => "chatcmpl-reasoning",
@@ -659,6 +703,44 @@ defmodule ReqLLM.Provider.DefaultsTest do
 
       assert ReqLLM.Response.thinking(result) == "Okay, let me plan this."
       assert ReqLLM.Response.text(result) == "Build a broad foundation first."
+    end
+
+    test "decodes generated images from OpenRouter responses" do
+      model = %LLMDB.Model{provider: :openrouter, id: "google/gemini-3-pro-image"}
+      image_data = <<255, 216, 255, 224>>
+      data_uri = "data:image/jpeg;base64,#{Base.encode64(image_data)}"
+      invalid_data_uri = "data:image/png;base64,not-valid-base64!"
+
+      response_data = %{
+        "choices" => [
+          %{
+            "message" => %{
+              "role" => "assistant",
+              "content" => "",
+              "images" => [
+                %{"type" => "image_url", "image_url" => %{"url" => data_uri}},
+                %{
+                  "type" => "image_url",
+                  "image_url" => %{
+                    "url" => "https://example.com/generated.png",
+                    "detail" => "high"
+                  }
+                },
+                %{"type" => "image_url", "image_url" => %{"url" => invalid_data_uri}}
+              ]
+            },
+            "finish_reason" => "stop"
+          }
+        ]
+      }
+
+      {:ok, result} = Defaults.decode_response_body_openai_format(response_data, model)
+
+      assert ReqLLM.Response.images(result) == [
+               ContentPart.image(image_data, "image/jpeg"),
+               ContentPart.image_url("https://example.com/generated.png", %{"detail" => "high"}),
+               ContentPart.image_url(invalid_data_uri)
+             ]
     end
   end
 
@@ -825,6 +907,108 @@ defmodule ReqLLM.Provider.DefaultsTest do
                %StreamChunk{type: :thinking, text: ", streaming thoughts."},
                %StreamChunk{type: :content, text: "Then answer."}
              ] = chunks
+    end
+
+    test "retains generated images from OpenRouter streaming deltas" do
+      model = %LLMDB.Model{provider: :openrouter, id: "google/gemini-3-pro-image"}
+      image_data = <<255, 216, 255, 224>>
+      data_uri = "data:image/jpeg;base64,#{Base.encode64(image_data)}"
+
+      event = %{
+        data: %{
+          "choices" => [
+            %{
+              "index" => 0,
+              "finish_reason" => nil,
+              "delta" => %{
+                "role" => "assistant",
+                "content" => "",
+                "images" => [
+                  %{"type" => "image_url", "image_url" => %{"url" => data_uri}}
+                ]
+              }
+            }
+          ]
+        }
+      }
+
+      chunks = Defaults.default_decode_stream_event(event, model)
+
+      assert [
+               %{
+                 type: :content_part,
+                 content_part: %ContentPart{
+                   type: :image,
+                   data: ^image_data,
+                   media_type: "image/jpeg"
+                 }
+               }
+             ] = chunks
+
+      {:ok, response} =
+        ResponseBuilder.build_response(chunks, %{},
+          context: Context.new([]),
+          model: model
+        )
+
+      assert ReqLLM.Response.images(response) == [
+               ContentPart.image(image_data, "image/jpeg")
+             ]
+    end
+
+    test "emits text and images from the same streaming delta" do
+      model = %LLMDB.Model{provider: :openrouter, id: "google/gemini-3-pro-image"}
+      image_url = "https://example.com/generated.png"
+
+      event = %{
+        data: %{
+          "choices" => [
+            %{
+              "delta" => %{
+                "content" => "Generated image:",
+                "images" => [
+                  %{"type" => "image_url", "image_url" => %{"url" => image_url}}
+                ]
+              }
+            }
+          ]
+        }
+      }
+
+      assert [
+               %StreamChunk{type: :content, text: "Generated image:"},
+               %StreamChunk{
+                 type: :content_part,
+                 content_part: %ContentPart{type: :image_url, url: ^image_url}
+               }
+             ] = Defaults.default_decode_stream_event(event, model)
+    end
+
+    test "preserves image and text order in streaming responses" do
+      model = %LLMDB.Model{provider: :openrouter, id: "google/gemini-3-pro-image"}
+      first_image = ContentPart.image(<<1>>, "image/png")
+      second_image = ContentPart.image(<<2>>, "image/png")
+
+      chunks = [
+        StreamChunk.content_part(first_image),
+        StreamChunk.text("First caption"),
+        StreamChunk.content_part(second_image),
+        StreamChunk.text("Second "),
+        StreamChunk.text("caption")
+      ]
+
+      {:ok, response} =
+        ResponseBuilder.build_response(chunks, %{},
+          context: Context.new([]),
+          model: model
+        )
+
+      assert response.message.content == [
+               first_image,
+               ContentPart.text("First caption"),
+               second_image,
+               ContentPart.text("Second caption")
+             ]
     end
 
     test "handles nil tool names in streaming deltas", %{model: model} do

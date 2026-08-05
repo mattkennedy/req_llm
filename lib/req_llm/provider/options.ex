@@ -170,7 +170,7 @@ defmodule ReqLLM.Provider.Options do
                                tool_choice: [
                                  type: {:or, [:string, :atom, :map]},
                                  doc:
-                                   "Tool selection strategy (auto, none, required, or specific)"
+                                   "Tool selection strategy (auto, none, required, or %{type: \"tool\", name: name})"
                                ],
 
                                # Output control
@@ -247,11 +247,16 @@ defmodule ReqLLM.Provider.Options do
                                    "ReqLLM telemetry options. Currently supports [payloads: :none | :raw]"
                                ],
 
-                               # HTTP client options
-                               receive_timeout: [
+                               # Transport options
+                               connect_timeout: [
                                  type: :pos_integer,
                                  doc:
-                                   "Timeout for receiving HTTP responses in milliseconds (defaults to global config)"
+                                   "Timeout for establishing WebSocket connections in milliseconds"
+                               ],
+                               receive_timeout: [
+                                 type: {:or, [:pos_integer, {:in, [:infinity]}]},
+                                 doc:
+                                   "Timeout for receiving provider data in milliseconds, or :infinity"
                                ],
                                total_timeout: [
                                  type: {:or, [:pos_integer, {:in, [:infinity]}]},

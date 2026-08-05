@@ -1,7 +1,7 @@
 defmodule ReqLLM.MixProject do
   use Mix.Project
 
-  @version "1.17.1"
+  @version "1.19.0"
   @source_url "https://github.com/agentjido/req_llm"
 
   def project do
@@ -36,10 +36,6 @@ defmodule ReqLLM.MixProject do
         extras: [
           {"README.md", title: "Overview", filename: "overview"},
           "COMPATIBILITY.md",
-          "ROADMAP.md",
-          "ROADMAP_V1.md",
-          "ROADMAP_V2.md",
-          "V1_EXECUTION_GOAL.md",
           "CHANGELOG.md",
           "CONTRIBUTING.md",
           "guides/getting-started.md",
@@ -88,12 +84,6 @@ defmodule ReqLLM.MixProject do
           Overview: [
             "README.md",
             "COMPATIBILITY.md"
-          ],
-          Roadmaps: [
-            "ROADMAP.md",
-            "ROADMAP_V1.md",
-            "ROADMAP_V2.md",
-            "V1_EXECUTION_GOAL.md"
           ],
           Guides: [
             "guides/getting-started.md",
@@ -244,7 +234,7 @@ defmodule ReqLLM.MixProject do
       {:websockex, "~> 0.5.1"},
       {:zoi, "~> 0.14"},
       {:jsv, "~> 0.11"},
-      {:llm_db, "~> 2026.7.2"},
+      {:llm_db, "~> 2026.7.5"},
 
       # Dev/test dependencies
       {:bandit, "~> 1.8", only: [:dev, :test], runtime: false},
@@ -276,7 +266,7 @@ defmodule ReqLLM.MixProject do
         "Website" => "https://agentjido.xyz"
       },
       files:
-        ~w(lib priv mix.exs LICENSE README.md COMPATIBILITY.md ROADMAP.md ROADMAP_V1.md ROADMAP_V2.md V1_EXECUTION_GOAL.md CHANGELOG.md CONTRIBUTING.md AGENTS.md usage-rules.md guides .formatter.exs)
+        ~w(lib priv mix.exs LICENSE README.md COMPATIBILITY.md CHANGELOG.md CONTRIBUTING.md AGENTS.md usage-rules.md guides .formatter.exs)
     ]
   end
 

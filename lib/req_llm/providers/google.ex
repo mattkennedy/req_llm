@@ -587,7 +587,10 @@ defmodule ReqLLM.Providers.Google do
     request
     # Google uses query parameter for API key, not Authorization header
     |> Req.Request.register_options(extra_option_keys)
-    |> Req.Request.merge_options([model: model.id, params: [key: api_key]] ++ req_opts)
+    |> Req.Request.merge_options(
+      ReqLLM.Provider.Defaults.finch_option(request) ++
+        [model: model.id, params: [key: api_key]] ++ req_opts
+    )
     |> ReqLLM.Step.Error.attach()
     |> ReqLLM.Step.Retry.attach(user_opts)
     |> Req.Request.prepend_request_steps(llm_encode_body: &__MODULE__.encode_body/1)
@@ -1441,10 +1444,13 @@ defmodule ReqLLM.Providers.Google do
                   }
               end
 
+            response_with_raw_finish =
+              put_raw_finish_provider_meta(response_with_grounding, body)
+
             merged_response =
               ReqLLM.Context.merge_response(
                 req.options[:context] || %ReqLLM.Context{messages: []},
-                response_with_grounding
+                response_with_raw_finish
               )
 
             {req, %{resp | body: merged_response}}
@@ -1768,6 +1774,12 @@ defmodule ReqLLM.Providers.Google do
             "finish_reason" => normalize_google_finish_reason(finish_reason)
           }
 
+        %{"finishReason" => finish_reason} when is_binary(finish_reason) ->
+          %{
+            "message" => %{"role" => "assistant", "content" => ""},
+            "finish_reason" => normalize_google_finish_reason(finish_reason)
+          }
+
         _ ->
           %{
             "message" => %{"role" => "assistant", "content" => ""},
@@ -1784,6 +1796,32 @@ defmodule ReqLLM.Providers.Google do
 
   defp convert_google_to_openai_format(body) when is_map(body), do: body
   defp convert_google_to_openai_format(_body), do: %{}
+
+  # Non-streaming counterpart of put_raw_finish_meta/3. Normalization collapses
+  # the abort reasons into "error" (or, before the clause above, into "stop"),
+  # so without this the caller cannot tell UNEXPECTED_TOOL_CALL from any other
+  # failure on this path — the streaming path has carried the raw value since
+  # the finish-reason-preservation commit.
+  defp put_raw_finish_provider_meta(%ReqLLM.Response{} = response, body) when is_map(body) do
+    case body do
+      %{"candidates" => [%{"finishReason" => raw} | _]} when is_binary(raw) ->
+        meta = Map.put(response.provider_meta, "finish_reason_raw", raw)
+
+        meta =
+          case body do
+            %{"candidates" => [%{"finishMessage" => message} | _]} when is_binary(message) ->
+              Map.put(meta, "finish_message", message)
+
+            _ ->
+              meta
+          end
+
+        %{response | provider_meta: meta}
+
+      _ ->
+        response
+    end
+  end
 
   defp convert_google_json_mode_to_openai_format(%{"candidates" => candidates} = body) do
     choice =
@@ -1912,10 +1950,58 @@ defmodule ReqLLM.Providers.Google do
 
   defp attach_reasoning_details(response, _details), do: response
 
+  # Preserve the provider's original finishReason (and finishMessage, when
+  # present) alongside the normalized value. Normalization collapses every
+  # unrecognized reason (MALFORMED_FUNCTION_CALL, UNEXPECTED_TOOL_CALL,
+  # OTHER, ...) into "error", which makes provider failures undiagnosable
+  # downstream.
+  defp put_raw_finish_meta(meta, finish_reason, data) do
+    finish_message =
+      case data do
+        %{"candidates" => [%{"finishMessage" => message} | _]} when is_binary(message) -> message
+        _ -> nil
+      end
+
+    meta
+    |> Map.put(:finish_reason_raw, finish_reason)
+    |> then(fn m ->
+      if finish_message, do: Map.put(m, :finish_message, finish_message), else: m
+    end)
+  end
+
   defp normalize_google_finish_reason("STOP"), do: "stop"
   defp normalize_google_finish_reason("MAX_TOKENS"), do: "length"
   defp normalize_google_finish_reason("SAFETY"), do: "content_filter"
   defp normalize_google_finish_reason("RECITATION"), do: "content_filter"
+
+  # Gemini flags generated content under several names beyond SAFETY. The proto
+  # describes this whole group in the same words — "the response candidate
+  # content was flagged for ..." — so they are one outcome wearing different
+  # labels and normalize the same way. Collapsing them into "error" instead
+  # makes a deterministic, non-retryable stop look like a transient provider
+  # fault, which callers then retry pointlessly.
+  #
+  # Source of truth is the FinishReason enum in googleapis/googleapis
+  # (google/ai/generativelanguage/v1beta/generative_service.proto). Cross-check
+  # both generated clients before adding names: the public REST reference omits
+  # the IMAGE_* values, and google-genai's Python types omit
+  # TOO_MANY_TOOL_CALLS, so neither is complete on its own.
+  #
+  # Deliberately NOT mapped here, because they are not content flags and want
+  # different handling than "the model refused": UNEXPECTED_TOOL_CALL (a tool
+  # call with no tools enabled in the request — a request-construction fault),
+  # TOO_MANY_TOOL_CALLS (the system aborted a tool-call runaway), NO_IMAGE /
+  # IMAGE_OTHER, and OTHER. Retrying most of these is equally futile, but they
+  # need a non-retryable non-refusal classification that does not exist yet, so
+  # they keep the existing "error" behaviour rather than borrow the wrong one.
+  defp normalize_google_finish_reason("BLOCKLIST"), do: "content_filter"
+  defp normalize_google_finish_reason("PROHIBITED_CONTENT"), do: "content_filter"
+  defp normalize_google_finish_reason("SPII"), do: "content_filter"
+  defp normalize_google_finish_reason("LANGUAGE"), do: "content_filter"
+  defp normalize_google_finish_reason("IMAGE_SAFETY"), do: "content_filter"
+  defp normalize_google_finish_reason("IMAGE_PROHIBITED_CONTENT"), do: "content_filter"
+  defp normalize_google_finish_reason("IMAGE_RECITATION"), do: "content_filter"
+
   defp normalize_google_finish_reason("OTHER"), do: "error"
   defp normalize_google_finish_reason(_), do: "error"
 
@@ -2303,6 +2389,14 @@ defmodule ReqLLM.Providers.Google do
         nest_multimodal? ->
           []
 
+        tool_result? and is_list(raw_content) ->
+          raw_content
+          |> Enum.filter(&multimodal_part?/1)
+          |> Enum.map(&convert_content_part/1)
+
+        tool_result? ->
+          []
+
         is_binary(raw_content) ->
           [%{text: raw_content}]
 
@@ -2349,12 +2443,21 @@ defmodule ReqLLM.Providers.Google do
   defp multimodal_tool_result?(_), do: false
 
   defp multimodal_part?(%ReqLLM.Message.ContentPart{type: type})
-       when type in [:file, :image, :image_url],
+       when type in [:file, :image, :image_url, :video_url],
        do: true
 
-  defp multimodal_part?(%{type: type}) when type in [:file, :image, :image_url], do: true
-  defp multimodal_part?(%{type: type}) when type in ["file", "image", "image_url"], do: true
-  defp multimodal_part?(%{"type" => type}) when type in ["file", "image", "image_url"], do: true
+  defp multimodal_part?(%{type: type})
+       when type in [:file, :image, :image_url, :video_url],
+       do: true
+
+  defp multimodal_part?(%{type: type})
+       when type in ["file", "image", "image_url", "video_url"],
+       do: true
+
+  defp multimodal_part?(%{"type" => type})
+       when type in ["file", "image", "image_url", "video_url"],
+       do: true
+
   defp multimodal_part?(_), do: false
 
   # Gemini requires that consecutive messages with the same role are merged
@@ -2772,12 +2875,14 @@ defmodule ReqLLM.Providers.Google do
       when finish_reason != nil ->
         chunks = extract_chunks_from_parts(parts)
 
-        meta = %{
-          usage: convert_google_usage_for_streaming(usage),
-          finish_reason: normalize_google_finish_reason(finish_reason),
-          model: model.id,
-          terminal?: true
-        }
+        meta =
+          %{
+            usage: convert_google_usage_for_streaming(usage),
+            finish_reason: normalize_google_finish_reason(finish_reason),
+            model: model.id,
+            terminal?: true
+          }
+          |> put_raw_finish_meta(finish_reason, data)
 
         meta = if provider_meta, do: Map.put(meta, :provider_meta, provider_meta), else: meta
         chunks ++ [ReqLLM.StreamChunk.meta(meta)]
@@ -2788,10 +2893,12 @@ defmodule ReqLLM.Providers.Google do
       when finish_reason != nil ->
         chunks = extract_chunks_from_parts(parts)
 
-        meta = %{
-          finish_reason: normalize_google_finish_reason(finish_reason),
-          terminal?: true
-        }
+        meta =
+          %{
+            finish_reason: normalize_google_finish_reason(finish_reason),
+            terminal?: true
+          }
+          |> put_raw_finish_meta(finish_reason, data)
 
         meta = if provider_meta, do: Map.put(meta, :provider_meta, provider_meta), else: meta
         chunks ++ [ReqLLM.StreamChunk.meta(meta)]
@@ -2821,22 +2928,26 @@ defmodule ReqLLM.Providers.Google do
         "usageMetadata" => usage
       }
       when finish_reason != nil ->
-        meta = %{
-          usage: convert_google_usage_for_streaming(usage),
-          finish_reason: normalize_google_finish_reason(finish_reason),
-          model: model.id,
-          terminal?: true
-        }
+        meta =
+          %{
+            usage: convert_google_usage_for_streaming(usage),
+            finish_reason: normalize_google_finish_reason(finish_reason),
+            model: model.id,
+            terminal?: true
+          }
+          |> put_raw_finish_meta(finish_reason, data)
 
         meta = if provider_meta, do: Map.put(meta, :provider_meta, provider_meta), else: meta
         [ReqLLM.StreamChunk.meta(meta)]
 
       %{"candidates" => [%{"finishReason" => finish_reason} | _]}
       when finish_reason != nil ->
-        meta = %{
-          finish_reason: normalize_google_finish_reason(finish_reason),
-          terminal?: true
-        }
+        meta =
+          %{
+            finish_reason: normalize_google_finish_reason(finish_reason),
+            terminal?: true
+          }
+          |> put_raw_finish_meta(finish_reason, data)
 
         meta = if provider_meta, do: Map.put(meta, :provider_meta, provider_meta), else: meta
         [ReqLLM.StreamChunk.meta(meta)]

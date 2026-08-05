@@ -828,6 +828,8 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       |> maybe_put_string("tool_choice", tool_choice)
       |> maybe_put_string("parallel_tool_calls", opts_map[:parallel_tool_calls])
       |> maybe_put_string("service_tier", service_tier)
+      |> maybe_put_string("prompt_cache_key", provider_opts[:prompt_cache_key])
+      |> maybe_put_string("prompt_cache_options", provider_opts[:prompt_cache_options])
       |> maybe_put_string("include", include)
       |> maybe_put_string("text", text_format)
 
@@ -968,25 +970,53 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
   defp has_image_content?(_), do: false
 
-  defp encode_input_content_part(%ReqLLM.Message.ContentPart{type: :text, text: text}, type) do
-    [%{"type" => type, "text" => text}]
+  defp encode_input_content_part(
+         %ReqLLM.Message.ContentPart{type: :text, text: text, metadata: metadata},
+         type
+       ) do
+    block =
+      %{"type" => type, "text" => text}
+      |> maybe_put_prompt_cache_breakpoint(metadata)
+
+    [block]
   end
 
   defp encode_input_content_part(
-         %ReqLLM.Message.ContentPart{type: :image, data: data, media_type: media_type},
+         %ReqLLM.Message.ContentPart{
+           type: :image,
+           data: data,
+           media_type: media_type,
+           metadata: metadata
+         },
          _type
        ) do
     base64 = Base.encode64(data)
-    [%{"type" => "input_image", "image_url" => "data:#{media_type};base64,#{base64}"}]
-  end
 
-  defp encode_input_content_part(%ReqLLM.Message.ContentPart{type: :image_url, url: url}, _type) do
-    [%{"type" => "input_image", "image_url" => url}]
+    block =
+      %{"type" => "input_image", "image_url" => "data:#{media_type};base64,#{base64}"}
+      |> maybe_put_prompt_cache_breakpoint(metadata)
+
+    [block]
   end
 
   defp encode_input_content_part(
-         %ReqLLM.Message.ContentPart{type: :file, file_id: legacy_file_id, filename: filename} =
-           part,
+         %ReqLLM.Message.ContentPart{type: :image_url, url: url, metadata: metadata},
+         _type
+       ) do
+    block =
+      %{"type" => "input_image", "image_url" => url}
+      |> maybe_put_prompt_cache_breakpoint(metadata)
+
+    [block]
+  end
+
+  defp encode_input_content_part(
+         %ReqLLM.Message.ContentPart{
+           type: :file,
+           file_id: legacy_file_id,
+           filename: filename,
+           metadata: metadata
+         } = part,
          _type
        )
        when is_binary(legacy_file_id) and legacy_file_id != "" do
@@ -995,6 +1025,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     file =
       %{"type" => "input_file", "file_id" => file_id}
       |> maybe_put_string("filename", filename)
+      |> maybe_put_prompt_cache_breakpoint(metadata)
 
     [file]
   end
@@ -1004,7 +1035,8 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
            type: :file,
            data: data,
            media_type: media_type,
-           filename: filename
+           filename: filename,
+           metadata: metadata
          },
          _type
        )
@@ -1014,11 +1046,25 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     file =
       %{"type" => "input_file", "file_data" => "data:#{media_type};base64,#{base64}"}
       |> maybe_put_string("filename", filename)
+      |> maybe_put_prompt_cache_breakpoint(metadata)
 
     [file]
   end
 
   defp encode_input_content_part(_, _type), do: []
+
+  @prompt_cache_block_types ~w(input_text input_image input_file)
+
+  defp maybe_put_prompt_cache_breakpoint(%{"type" => type} = block, metadata)
+       when type in @prompt_cache_block_types and is_map(metadata) do
+    breakpoint =
+      Map.get(metadata, :prompt_cache_breakpoint) ||
+        Map.get(metadata, "prompt_cache_breakpoint")
+
+    maybe_put_string(block, "prompt_cache_breakpoint", breakpoint)
+  end
+
+  defp maybe_put_prompt_cache_breakpoint(block, _metadata), do: block
 
   defp provider_file_id(part, provider, legacy_file_id) do
     case ReqLLM.ProviderFileReference.reference_id(part, provider) do
@@ -1736,6 +1782,10 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
   defp encode_tool_choice(nil), do: nil
 
+  defp encode_tool_choice(%{type: "tool", name: name}) do
+    %{"type" => "function", "name" => name}
+  end
+
   defp encode_tool_choice(%{type: "function", function: %{name: name}}) do
     %{"type" => "function", "name" => name}
   end
@@ -2293,10 +2343,15 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       get_in(response_data, ["usage", "input_tokens_details", "cached_tokens"]) ||
         get_in(response_data, ["usage", "prompt_tokens_details", "cached_tokens"]) || 0
 
+    cache_creation_tokens =
+      get_in(response_data, ["usage", "input_tokens_details", "cache_write_tokens"]) ||
+        get_in(response_data, ["usage", "prompt_tokens_details", "cache_write_tokens"])
+
     usage =
       usage
       |> Map.put(:cached_tokens, cached_tokens)
       |> Map.put(:reasoning_tokens, reasoning_tokens)
+      |> maybe_put_cache_creation_tokens(cache_creation_tokens)
 
     tool_call_counts = extract_tool_call_counts(response_data)
 
@@ -2306,6 +2361,11 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       usage
     end
   end
+
+  defp maybe_put_cache_creation_tokens(usage, nil), do: usage
+
+  defp maybe_put_cache_creation_tokens(usage, tokens),
+    do: Map.put(usage, :cache_creation_tokens, tokens)
 
   # The Responses API returns "completed" status even when tool calls are present.
   # We need to check for tool calls and return :tool_calls in that case.

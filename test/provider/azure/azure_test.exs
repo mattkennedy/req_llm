@@ -529,7 +529,7 @@ defmodule ReqLLM.Providers.AzureTest do
     end
 
     test "delegates to OpenAI for o1 reasoning models - translates max_tokens" do
-      {:ok, model} = ReqLLM.model("azure:o1-mini")
+      {:ok, model} = ReqLLM.model("azure:o1")
 
       opts = [max_tokens: 1000, temperature: 0.7]
       {translated_opts, warnings} = Azure.translate_options(:chat, model, opts)
@@ -565,7 +565,7 @@ defmodule ReqLLM.Providers.AzureTest do
     end
 
     test "passes through options unchanged for non-chat operations" do
-      {:ok, model} = ReqLLM.model("azure:o1-mini")
+      {:ok, model} = ReqLLM.model("azure:o1")
 
       opts = [max_tokens: 1000, temperature: 0.7]
       {translated_opts, warnings} = Azure.translate_options(:embedding, model, opts)
@@ -704,7 +704,7 @@ defmodule ReqLLM.Providers.AzureTest do
     end
 
     test "extracts reasoning tokens for o1 models" do
-      {:ok, model} = ReqLLM.model("azure:o1-mini")
+      {:ok, model} = ReqLLM.model("azure:o1")
 
       body = %{
         "usage" => %{

@@ -362,6 +362,65 @@ defmodule ReqLLM.Providers.MinimaxTest do
       assert List.last(response.context.messages).reasoning_details ==
                response.message.reasoning_details
     end
+
+    test "stream decoding matches non-streaming reasoning details" do
+      reasoning_detail = %{
+        "type" => "reasoning.text",
+        "id" => "reasoning-text-1",
+        "format" => "MiniMax-response-v1",
+        "index" => 0,
+        "text" => "Think"
+      }
+
+      event = %{
+        data: %{
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "reasoning_content" => "Think",
+                "reasoning_details" => [reasoning_detail]
+              }
+            }
+          ]
+        }
+      }
+
+      assert [%StreamChunk{type: :thinking}, %StreamChunk{type: :meta} = metadata_chunk] =
+               Minimax.decode_stream_event(event, minimax_model())
+
+      body =
+        openai_format_json_fixture(model: "MiniMax-M2.7", content: "Done")
+        |> put_in(
+          ["choices", Access.at(0), "message", "reasoning_details"],
+          [reasoning_detail]
+        )
+
+      request = %Req.Request{
+        options: [
+          context: context_fixture(),
+          model: "MiniMax-M2.7",
+          operation: :chat
+        ]
+      }
+
+      {_request, response} =
+        Minimax.decode_response({request, %Req.Response{status: 200, body: body}})
+
+      assert metadata_chunk.metadata.reasoning_details ==
+               response.body.message.reasoning_details
+
+      assert [
+               %ReasoningDetails{
+                 text: "Think",
+                 signature: "reasoning-text-1",
+                 provider: :minimax,
+                 format: "MiniMax-response-v1",
+                 index: 0,
+                 provider_data: %{"type" => "reasoning.text"}
+               }
+             ] = metadata_chunk.metadata.reasoning_details
+    end
   end
 
   describe "image generation" do

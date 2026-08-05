@@ -873,6 +873,18 @@ defmodule ReqLLM.StreamServer do
     end
   end
 
+  defp process_http_event(:done, %{http_status: status} = state)
+       when is_integer(status) and status >= 400 do
+    error = build_http_error(status, nil, state.headers)
+
+    new_state =
+      state
+      |> finalize_failed_stream(error)
+      |> reply_to_waiting_callers()
+
+    {:reply, :ok, new_state}
+  end
+
   defp process_http_event(:done, state) do
     new_state = finalize_stream_with_fixture(state) |> reply_to_waiting_callers()
     {:reply, :ok, new_state}
@@ -1504,7 +1516,7 @@ defmodule ReqLLM.StreamServer do
   end
 
   defp semantic_progress_chunk?(%StreamChunk{type: type})
-       when type in [:content, :thinking, :tool_call],
+       when type in [:content, :content_part, :thinking, :tool_call],
        do: true
 
   defp semantic_progress_chunk?(%StreamChunk{type: :meta, metadata: metadata})

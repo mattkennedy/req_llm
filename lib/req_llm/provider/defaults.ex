@@ -1028,19 +1028,22 @@ defmodule ReqLLM.Provider.Defaults do
 
   defp encode_openai_content_part(%ReqLLM.Message.ContentPart{
          type: :file,
-         file_id: file_id
+         file_id: file_id,
+         metadata: metadata
        })
        when is_binary(file_id) and file_id != "" do
     %{
       type: "file",
       file: %{file_id: file_id}
     }
+    |> merge_content_metadata(metadata)
   end
 
   defp encode_openai_content_part(%ReqLLM.Message.ContentPart{
          type: :file,
          data: data,
-         media_type: media_type
+         media_type: media_type,
+         metadata: metadata
        })
        when is_binary(data) do
     # Encode file as image_url data URI (OpenAI format supports various media types this way)
@@ -1052,6 +1055,7 @@ defmodule ReqLLM.Provider.Defaults do
         url: "data:#{media_type};base64,#{base64}"
       }
     }
+    |> merge_content_metadata(metadata)
   end
 
   # Thinking content is extracted to the top-level reasoning_content field
@@ -1068,7 +1072,12 @@ defmodule ReqLLM.Provider.Defaults do
 
   defp maybe_put_image_detail(image_url, _metadata), do: image_url
 
-  @passthrough_metadata_keys [:cache_control, "cache_control"]
+  @passthrough_metadata_keys [
+    :cache_control,
+    "cache_control",
+    :prompt_cache_breakpoint,
+    "prompt_cache_breakpoint"
+  ]
 
   defp merge_content_metadata(base, metadata) when is_map(metadata) and map_size(metadata) > 0 do
     passthrough =
@@ -1076,6 +1085,7 @@ defmodule ReqLLM.Provider.Defaults do
       |> Map.take(@passthrough_metadata_keys)
       |> Map.new(fn
         {"cache_control", v} -> {:cache_control, v}
+        {"prompt_cache_breakpoint", v} -> {:prompt_cache_breakpoint, v}
         {k, v} -> {k, v}
       end)
 
@@ -1266,8 +1276,9 @@ defmodule ReqLLM.Provider.Defaults do
   defp decode_openai_message(message) when is_map(message) do
     content_chunks = decode_openai_content(message)
     reasoning_chunks = decode_openai_reasoning(message)
+    image_chunks = decode_openai_images(message)
     tool_call_chunks = decode_openai_tool_calls(message)
-    content_chunks ++ reasoning_chunks ++ tool_call_chunks
+    content_chunks ++ reasoning_chunks ++ image_chunks ++ tool_call_chunks
   end
 
   defp decode_openai_message(_), do: []
@@ -1310,6 +1321,12 @@ defmodule ReqLLM.Provider.Defaults do
 
   defp decode_openai_tool_calls(_), do: []
 
+  defp decode_openai_images(%{"images" => images}) when is_list(images) do
+    Enum.flat_map(images, &decode_openai_content_part/1)
+  end
+
+  defp decode_openai_images(_), do: []
+
   defp openai_reasoning_details_chunks(%{"reasoning_details" => details}, provider)
        when is_list(details) and details != [] do
     case decode_openai_reasoning_details(details, provider) do
@@ -1348,7 +1365,53 @@ defmodule ReqLLM.Provider.Defaults do
     decode_openai_thinking_content(thinking)
   end
 
+  defp decode_openai_content_part(%{
+         "type" => "image_url",
+         "image_url" => %{"url" => url} = image_url
+       })
+       when is_binary(url) do
+    metadata = Map.delete(image_url, "url")
+    decode_openai_image_url(url, metadata)
+  end
+
+  defp decode_openai_content_part(%{"type" => "image_url", "image_url" => url})
+       when is_binary(url) do
+    decode_openai_image_url(url, %{})
+  end
+
   defp decode_openai_content_part(_), do: []
+
+  defp decode_openai_image_url(url, metadata) do
+    content_part =
+      case decode_image_data_uri(url) do
+        {:ok, data, media_type} ->
+          ReqLLM.Message.ContentPart.image(data, media_type, metadata)
+
+        :error ->
+          ReqLLM.Message.ContentPart.image_url(url, metadata)
+      end
+
+    [ReqLLM.StreamChunk.content_part(content_part)]
+  end
+
+  defp decode_image_data_uri("data:" <> data_uri) do
+    with [media_type, encoded] when media_type != "" <-
+           String.split(data_uri, ";base64,", parts: 2),
+         {:ok, data} <- decode_base64_image(encoded) do
+      {:ok, data, media_type}
+    else
+      _ -> :error
+    end
+  end
+
+  defp decode_image_data_uri(_url), do: :error
+
+  defp decode_base64_image(encoded) do
+    case Base.decode64(encoded, ignore: :whitespace) do
+      :error -> Base.decode64(encoded, padding: false, ignore: :whitespace)
+      decoded -> decoded
+    end
+  end
 
   defp decode_openai_thinking_content(thinking) when is_binary(thinking) do
     [ReqLLM.StreamChunk.thinking(thinking)]
@@ -1394,33 +1457,24 @@ defmodule ReqLLM.Provider.Defaults do
 
   defp decode_openai_tool_call(_), do: nil
 
-  defp decode_openai_delta(%{"content" => content}) when is_binary(content) and content != "" do
-    [ReqLLM.StreamChunk.text(content)]
+  defp decode_openai_delta(delta) when is_map(delta) do
+    content_chunks = decode_openai_content(delta)
+    reasoning_chunks = decode_openai_reasoning(delta)
+    image_chunks = decode_openai_images(delta)
+    tool_call_chunks = decode_openai_tool_call_deltas(delta)
+
+    content_chunks ++ reasoning_chunks ++ image_chunks ++ tool_call_chunks
   end
 
-  defp decode_openai_delta(%{"content" => parts}) when is_list(parts) do
-    parts
-    |> Enum.flat_map(&decode_openai_content_part/1)
-    |> Enum.reject(&is_nil/1)
-  end
+  defp decode_openai_delta(_), do: []
 
-  defp decode_openai_delta(%{"reasoning_content" => reasoning})
-       when is_binary(reasoning) and reasoning != "" do
-    [ReqLLM.StreamChunk.thinking(reasoning)]
-  end
-
-  defp decode_openai_delta(%{"reasoning" => reasoning})
-       when is_binary(reasoning) and reasoning != "" do
-    [ReqLLM.StreamChunk.thinking(reasoning)]
-  end
-
-  defp decode_openai_delta(%{"tool_calls" => tool_calls}) when is_list(tool_calls) do
+  defp decode_openai_tool_call_deltas(%{"tool_calls" => tool_calls}) when is_list(tool_calls) do
     tool_calls
     |> Enum.map(&decode_openai_tool_call_delta/1)
     |> Enum.reject(&is_nil/1)
   end
 
-  defp decode_openai_delta(_), do: []
+  defp decode_openai_tool_call_deltas(_), do: []
 
   # Handle complete tool call delta with all fields
   defp decode_openai_tool_call_delta(%{
@@ -1543,6 +1597,7 @@ defmodule ReqLLM.Provider.Defaults do
       end
 
     cached_tokens = get_in(usage, ["prompt_tokens_details", "cached_tokens"]) || 0
+    cache_creation_tokens = get_in(usage, ["prompt_tokens_details", "cache_write_tokens"])
 
     base = %{
       input_tokens: input,
@@ -1551,6 +1606,8 @@ defmodule ReqLLM.Provider.Defaults do
       cached_tokens: cached_tokens,
       reasoning_tokens: reasoning_tokens
     }
+
+    base = maybe_put_cache_creation_tokens(base, cache_creation_tokens)
 
     extra =
       Map.drop(usage, [
@@ -1572,6 +1629,11 @@ defmodule ReqLLM.Provider.Defaults do
       cached_tokens: 0,
       reasoning_tokens: 0
     }
+
+  defp maybe_put_cache_creation_tokens(usage, nil), do: usage
+
+  defp maybe_put_cache_creation_tokens(usage, tokens),
+    do: Map.put(usage, :cache_creation_tokens, tokens)
 
   # DeepSeek R1 models return reasoning in "reasoning_content" field
   # When present, we use completion_tokens as reasoning_tokens

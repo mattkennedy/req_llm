@@ -125,10 +125,13 @@ defmodule ReqLLM.Streaming.WebSocketClient do
   end
 
   defp start_owned_session(config, stream_server_pid, opts) do
+    connect_timeout = connect_timeout(opts)
+
     case WebSocketSession.start_link(
            config.url,
            headers: config.headers,
-           initial_messages: config.initial_messages
+           initial_messages: config.initial_messages,
+           connect_timeout: connect_timeout
          ) do
       {:ok, session_pid} ->
         await_connect_and_stream(session_pid, stream_server_pid, opts, close_on_terminal?: true)
@@ -140,10 +143,7 @@ defmodule ReqLLM.Streaming.WebSocketClient do
   end
 
   defp await_connect_and_stream(session_pid, stream_server_pid, opts, session_opts) do
-    connect_timeout =
-      Keyword.get(opts, :connect_timeout, Keyword.get(opts, :receive_timeout, 30_000))
-
-    case WebSocketSession.await_connected(session_pid, connect_timeout) do
+    case WebSocketSession.await_connected(session_pid, connect_timeout(opts)) do
       :ok ->
         safe_http_event(stream_server_pid, {:status, 101})
         safe_http_event(stream_server_pid, {:headers, [{"upgrade", "websocket"}]})
@@ -166,9 +166,7 @@ defmodule ReqLLM.Streaming.WebSocketClient do
   end
 
   defp relay_messages(session_pid, stream_server_pid, opts, relay_opts) do
-    receive_timeout = Keyword.get(opts, :receive_timeout, 30_000)
-
-    case WebSocketSession.next_message(session_pid, receive_timeout) do
+    case WebSocketSession.next_message(session_pid, receive_timeout(opts)) do
       {:ok, message} ->
         case WebSocketProtocol.decode_message(message) do
           {:ok, decoded} ->
@@ -222,6 +220,20 @@ defmodule ReqLLM.Streaming.WebSocketClient do
 
   defp maybe_close_session(session_pid, true), do: WebSocketSession.close(session_pid)
   defp maybe_close_session(_session_pid, false), do: :ok
+
+  defp connect_timeout(opts) do
+    Keyword.get(opts, :connect_timeout, Application.get_env(:req_llm, :connect_timeout, 10_000))
+  end
+
+  defp receive_timeout(opts) do
+    Keyword.get_lazy(opts, :receive_timeout, fn ->
+      Application.get_env(
+        :req_llm,
+        :stream_receive_timeout,
+        Application.get_env(:req_llm, :receive_timeout, 30_000)
+      )
+    end)
+  end
 
   defp maybe_replay_fixture(model, opts) do
     case Code.ensure_loaded(ReqLLM.Test.Fixtures) do

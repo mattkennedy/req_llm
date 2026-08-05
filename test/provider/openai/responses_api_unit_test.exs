@@ -62,6 +62,44 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert body["stream"] == true
     end
 
+    test "encodes explicit prompt cache controls" do
+      breakpoint = %{mode: "explicit"}
+
+      context =
+        ReqLLM.Context.new([
+          ReqLLM.Context.user([
+            ReqLLM.Message.ContentPart.text("Stable text", %{
+              prompt_cache_breakpoint: breakpoint
+            }),
+            ReqLLM.Message.ContentPart.image_url("https://example.com/image.png", %{
+              "prompt_cache_breakpoint" => breakpoint
+            }),
+            ReqLLM.Message.ContentPart.file_id("file_123", %{
+              prompt_cache_breakpoint: breakpoint
+            })
+          ])
+        ])
+
+      request =
+        build_request(
+          context: context,
+          provider_options: [
+            prompt_cache_key: "tenant:acme:knowledge-v1",
+            prompt_cache_options: %{mode: "explicit", ttl: "30m"}
+          ]
+        )
+
+      body = request |> ResponsesAPI.encode_body() |> ReqLLM.Test.Helpers.json_body()
+
+      assert body["prompt_cache_key"] == "tenant:acme:knowledge-v1"
+      assert body["prompt_cache_options"] == %{"mode" => "explicit", "ttl" => "30m"}
+
+      assert [%{"content" => [text_block, image_block, file_block]}] = body["input"]
+      assert text_block["prompt_cache_breakpoint"] == %{"mode" => "explicit"}
+      assert image_block["prompt_cache_breakpoint"] == %{"mode" => "explicit"}
+      assert file_block["prompt_cache_breakpoint"] == %{"mode" => "explicit"}
+    end
+
     test "encodes tools when present" do
       tool =
         ReqLLM.Tool.new!(
@@ -571,7 +609,16 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
              end)
     end
 
-    test "encodes specific tool choice with atom keys" do
+    test "encodes canonical specific tool choice with atom keys" do
+      request = build_request(tool_choice: %{type: "tool", name: "get_weather"})
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = ReqLLM.Test.Helpers.json_body(encoded)
+
+      assert body["tool_choice"] == %{"type" => "function", "name" => "get_weather"}
+    end
+
+    test "encodes OpenAI Chat-style specific tool choice with atom keys" do
       request =
         build_request(tool_choice: %{type: "function", function: %{name: "get_weather"}})
 
@@ -581,7 +628,7 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert body["tool_choice"] == %{"type" => "function", "name" => "get_weather"}
     end
 
-    test "encodes specific tool choice with string keys" do
+    test "encodes OpenAI Chat-style specific tool choice with string keys" do
       request =
         build_request(tool_choice: %{"type" => "function", "function" => %{"name" => "search"}})
 
@@ -1757,6 +1804,10 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
           "usage" => %{
             "input_tokens" => 10,
             "output_tokens" => 20,
+            "input_tokens_details" => %{
+              "cached_tokens" => 4,
+              "cache_write_tokens" => 6
+            },
             "output_tokens_details" => %{
               "reasoning_tokens" => 5
             }
@@ -1768,7 +1819,8 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert chunk.metadata.usage.input_tokens == 10
       assert chunk.metadata.usage.output_tokens == 20
       assert chunk.metadata.usage.total_tokens == 30
-      assert chunk.metadata.usage.cached_tokens == 0
+      assert chunk.metadata.usage.cached_tokens == 4
+      assert chunk.metadata.usage.cache_creation_tokens == 6
       assert chunk.metadata.usage.reasoning_tokens == 5
     end
 
