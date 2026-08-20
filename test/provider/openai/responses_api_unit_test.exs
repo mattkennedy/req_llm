@@ -2213,17 +2213,22 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert [chunk] = ResponsesAPI.decode_stream_event(event, model)
       assert chunk.type == :meta
 
-      assert chunk.metadata.provider_meta.citations == [
+      # Upstream surfaces every annotation type verbatim under the string
+      # `"annotations"` key. The app reads it in `CodexLLM.append_sources/2`,
+      # which is what filters down to `url_citation`.
+      assert chunk.metadata.provider_meta["annotations"] == [
                %{
-                 url: "https://elixir-lang.org/blog/2024/12/19/elixir-v1-18-0-released/",
-                 title: "Elixir v1.18 released",
-                 start_index: 0,
-                 end_index: 37
-               }
+                 "type" => "url_citation",
+                 "url" => "https://elixir-lang.org/blog/2024/12/19/elixir-v1-18-0-released/",
+                 "title" => "Elixir v1.18 released",
+                 "start_index" => 0,
+                 "end_index" => 37
+               },
+               %{"type" => "file_citation", "file_id" => "file_xyz"}
              ]
     end
 
-    test "omits citations key when completed event has no url_citation annotations", %{
+    test "omits the annotations key when the completed event has no annotations", %{
       model: model
     } do
       event = %{
@@ -2239,7 +2244,7 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       }
 
       assert [chunk] = ResponsesAPI.decode_stream_event(event, model)
-      refute Map.has_key?(Map.get(chunk.metadata, :provider_meta, %{}), :citations)
+      refute Map.has_key?(Map.get(chunk.metadata, :provider_meta, %{}), "annotations")
     end
 
     test "decodes incomplete event", %{model: model} do

@@ -1,7 +1,7 @@
 defmodule ReqLLM.MixProject do
   use Mix.Project
 
-  @version "1.19.0"
+  @version "1.20.0"
   @source_url "https://github.com/agentjido/req_llm"
 
   def project do
@@ -13,6 +13,7 @@ defmodule ReqLLM.MixProject do
       deps: deps(),
       aliases: aliases(),
       elixirc_paths: elixirc_paths(Mix.env()),
+      test_ignore_filters: [&String.starts_with?(&1, "test/fixtures/")],
 
       # Test coverage
       test_coverage: [tool: ExCoveralls, export: "cov", exclude: [:coverage]],
@@ -215,7 +216,6 @@ defmodule ReqLLM.MixProject do
   def application do
     [
       extra_applications: [:logger, :crypto],
-      included_applications: [:llm_db],
       mod: {ReqLLM.Application, []}
     ]
   end
@@ -234,7 +234,7 @@ defmodule ReqLLM.MixProject do
       {:websockex, "~> 0.5.1"},
       {:zoi, "~> 0.14"},
       {:jsv, "~> 0.11"},
-      {:llm_db, "~> 2026.7.5"},
+      {:llm_db, "~> 2026.8.2"},
 
       # Dev/test dependencies
       {:bandit, "~> 1.8", only: [:dev, :test], runtime: false},

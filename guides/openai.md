@@ -14,7 +14,7 @@ OPENAI_API_KEY=sk-...
 
 For the full model-spec workflow, see [Model Specs](model-specs.md).
 
-Use exact OpenAI IDs from [LLMDB.xyz](https://llmdb.xyz) when possible. For brand-new model IDs, local OpenAI-compatible servers, or proxies, use `ReqLLM.model!/1` with `provider: :openai`, an explicit `id`, and `base_url` when needed.
+Use exact OpenAI IDs from [LLM Catalog](https://llmcatalog.dev) when possible. For brand-new model IDs, local OpenAI-compatible servers, or proxies, use `ReqLLM.model!/1` with `provider: :openai`, an explicit `id`, and `base_url` when needed.
 
 ### OAuth Access Token (optional)
 
@@ -421,6 +421,186 @@ response.usage.cost
 ```
 
 Responses API server-side tools may also appear in `response.message.tool_calls` as builtin records (for example `web_search_call` or `file_search_call`). They are preserved for observability, but the provider already executed them: do not replay them as local tool calls. `ReqLLM.Response.classify/1` and `ReqLLM.StreamResponse.classify/1` treat builtin-only responses as final answers.
+
+### Citations
+
+When a model cites its sources — web search being the common case — the citations
+are retained as annotations and read back with `ReqLLM.Response.annotations/1`:
+
+```elixir
+{:ok, response} = ReqLLM.generate_text(
+  "openai:gpt-5-mini",
+  "Find one recent AI model announcement and cite the source.",
+  tools: [%{"type" => "web_search"}]
+)
+
+ReqLLM.Response.annotations(response)
+#=> [
+#=>   %{
+#=>     "type" => "url_citation",
+#=>     "url" => "https://example.com/announcement",
+#=>     "title" => "Example Announcement",
+#=>     "start_index" => 120,
+#=>     "end_index" => 168
+#=>   }
+#=> ]
+```
+
+`start_index` and `end_index` locate the citation inside `ReqLLM.Response.text/1`.
+The same list is available unprojected at `response.provider_meta["annotations"]`.
+
+Note that OpenAI usually points the span at an inline Markdown link it already wrote
+into the text, not at the prose the citation supports:
+
+```elixir
+text = ReqLLM.Response.text(response)
+String.slice(text, annotation["start_index"], annotation["end_index"] - annotation["start_index"])
+#=> "([example.com](https://example.com/announcement))"
+```
+
+So treat the span as "where this citation is already rendered" rather than "the
+claim to hyperlink" — wrapping it in another link would nest one link inside another.
+If you want your own citation markers, strip those Markdown links from the text and
+render footnotes from the annotation list instead.
+
+#### One shape across both API surfaces
+
+OpenAI's two API surfaces disagree on the wire format: Chat Completions nests the
+citation fields under a `"url_citation"` key, while the Responses API returns them
+flat. ReqLLM normalizes Chat Completions to the flat form, so consumers match one
+shape regardless of which surface a model uses:
+
+```
+Chat Completions, on the wire        What annotations/1 returns
+─────────────────────────────        ──────────────────────────
+%{"type" => "url_citation",          %{"type" => "url_citation",
+  "url_citation" => %{                 "url" => "https://…",
+    "url" => "https://…",       ──►    "title" => "…",
+    "title" => "…",                    "start_index" => 120,
+    "start_index" => 120,              "end_index" => 168}
+    "end_index" => 168}}
+```
+
+Annotation types that OpenAI already returns flat (`file_citation`, `file_path`,
+and others) pass through unchanged.
+
+The two surfaces also differ in how you *ask* for web search. The Responses API takes
+it as a tool; Chat Completions takes a `web_search_options` body field and serves it
+only on `*-search-preview` models:
+
+| | Responses API | Chat Completions |
+| --- | --- | --- |
+| Models | `gpt-5-mini`, `gpt-4o`, … | `gpt-4o-search-preview`, `gpt-4o-mini-search-preview` |
+| Enable with | `tools: [%{"type" => "web_search"}]` | `web_search_options: %{}` |
+| Citations on the wire | flat | nested under `"url_citation"` |
+
+```elixir
+{:ok, response} = ReqLLM.generate_text(
+  "openai:gpt-4o-mini-search-preview",
+  "Find one recent AI model announcement and cite the source.",
+  web_search_options: %{}
+)
+
+ReqLLM.Response.annotations(response)
+#=> flat url_citation maps, same as the Responses API
+```
+
+Pass `%{}` for OpenAI's defaults, or a configuration map such as
+`%{"search_context_size" => "high"}`. ReqLLM routes `*-search-preview` models to Chat
+Completions automatically, even though they share the `gpt-4o` prefix that otherwise
+selects the Responses API.
+
+#### Streaming
+
+Streaming needs no special handling — citations arrive incrementally and are
+accumulated for you, so the materialized response carries the full list:
+
+```elixir
+{:ok, stream_response} = ReqLLM.stream_text(
+  "openai:gpt-5-mini",
+  "Find one recent AI model announcement and cite the source.",
+  stream: true,
+  tools: [%{"type" => "web_search"}]
+)
+
+{:ok, response} = ReqLLM.StreamResponse.to_response(stream_response)
+ReqLLM.Response.annotations(response)
+#=> same list as the buffered call
+```
+
+To surface citations *during* the stream — to render footnotes as text arrives —
+consume `ReqLLM.StreamResponse.events/1` and watch for annotation output items:
+
+```elixir
+{:ok, stream_response} = ReqLLM.stream_text(
+  "openai:gpt-5-mini",
+  "Find one recent AI model announcement and cite the source.",
+  stream: true,
+  tools: [%{"type" => "web_search"}]
+)
+
+stream_response
+|> ReqLLM.StreamResponse.events()
+|> Stream.filter(&match?(%ReqLLM.StreamEvent{type: :output_item, data: %{type: :annotation}}, &1))
+|> Enum.each(fn event -> IO.inspect(event.data.data) end)
+```
+
+> #### Pick one consumer per stream {: .warning}
+>
+> A `StreamResponse` carries a single consumable stream, so `events/1`, `tokens/1`,
+> `to_response/1`, and the raw chunk stream are alternatives, not steps. Calling
+> `to_response/1` after draining `events/1` exits with `{:noproc, ...}` because the
+> stream is already spent. Each example above starts its own `stream_text/3` call
+> for that reason.
+>
+> To watch citations live *and* get the materialized response from one request, use
+> `ReqLLM.StreamResponse.process_stream/2`, which streams through your callbacks and
+> returns the final `Response`:
+>
+> ```elixir
+> {:ok, response} =
+>   ReqLLM.StreamResponse.process_stream(stream_response,
+>     on_meta: fn %ReqLLM.StreamChunk{metadata: meta} ->
+>       Enum.each(meta[:annotations] || [], &IO.inspect/1)
+>     end
+>   )
+>
+> ReqLLM.Response.annotations(response)
+> ```
+
+Each citation is emitted once. Providers that re-send a citation they already
+streamed, or that emit both incremental events and a final list, do not produce
+duplicates.
+
+#### Other OpenAI-format providers
+
+Citation normalization lives in the shared OpenAI-format decoders rather than in the
+OpenAI provider, so a provider inherits it by decoding through them — no
+per-provider work required. Providers that route both their buffered and streaming
+decode through the shared path get citations on both: Azure OpenAI, OpenRouter,
+Groq, MiniMax, ZenMux, Z.AI, Google Vertex (OpenAI-compatible endpoint), and xAI.
+
+Perplexity Sonar models routed through OpenRouter, for example, return nested
+`url_citation` annotations and read back through `ReqLLM.Response.annotations/1`
+in the same flat shape.
+
+The Responses API decoder is shared the same way, so Azure (Responses), OpenAI
+Codex, and Meta pick up annotations there. xAI is covered on both surfaces — it
+routes through the Responses API whenever built-in tools such as `web_search` or
+`x_search` are in play, and through Chat Completions otherwise.
+
+Some providers are covered only partially, because they hand-roll one half of their
+decoding:
+
+| Provider | Buffered | Streaming |
+| --- | --- | --- |
+| Amazon Bedrock (OpenAI models) | no — custom response parser | yes |
+| Google (OpenAI-compatible endpoint) | yes | no — native event decoder |
+
+Anthropic is not covered at all: it returns citations attached to its own content
+blocks rather than as OpenAI-style annotations. Google's native Gemini endpoints
+report grounding metadata through `ReqLLM.Response.sources/1`, a related but
+distinct channel.
 
 ### Code Interpreter (Responses API)
 

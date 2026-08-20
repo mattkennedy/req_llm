@@ -407,10 +407,9 @@ defmodule ReqLLM.Provider.Defaults do
             method: :post,
             base_url: Keyword.get(opts, :base_url, provider_mod.default_base_url()),
             receive_timeout: timeout,
-            finch: [pool_timeout: timeout],
             form_multipart: form_parts,
             auth: {:bearer, api_key}
-          ] ++ http_opts
+          ] ++ merge_finch_options(http_opts, pool_timeout: timeout)
         )
         |> Req.Request.put_header("authorization", "Bearer #{api_key}")
         |> ReqLLM.Step.Retry.attach(opts)
@@ -495,12 +494,11 @@ defmodule ReqLLM.Provider.Defaults do
             method: :post,
             base_url: Keyword.get(opts, :base_url, provider_mod.default_base_url()),
             receive_timeout: timeout,
-            finch: [pool_timeout: timeout],
             body: Jason.encode!(body),
             auth: {:bearer, api_key},
             # Disable Req's automatic JSON decoding — response is raw audio binary
             decode_body: false
-          ] ++ http_opts
+          ] ++ merge_finch_options(http_opts, pool_timeout: timeout)
         )
         |> Req.Request.put_header("content-type", "application/json")
         |> Req.Request.put_header("authorization", "Bearer #{api_key}")
@@ -593,23 +591,25 @@ defmodule ReqLLM.Provider.Defaults do
     |> ReqLLM.Step.Fixture.maybe_attach(model, user_opts)
   end
 
-  # Req 0.7 takes Finch settings as a nested keyword list (`finch: [name: ...,
-  # pool_timeout: ...]`); a bare pool name and a top-level `pool_timeout` are both
-  # deprecated. Providers set `finch: [pool_timeout: ...]` when they build the
-  # request, so this must MERGE the pool name into whatever is already there —
-  # replacing the key would drop the caller's pool_timeout, and returning the
-  # bare list would drop the pool name and silently route LLM traffic to Req's
-  # default Finch instance instead of req_llm's own pool.
-  @spec finch_option(Req.Request.t()) :: keyword()
-  def finch_option(%Req.Request{} = request) do
-    case request.options[:finch] do
-      nil -> [finch: [name: ReqLLM.Application.finch_name()]]
-      opts when is_list(opts) -> [finch: Keyword.put_new_lazy(opts, :name, &default_finch_name/0)]
-      name -> [finch: [name: name]]
-    end
+  @spec merge_finch_options(keyword(), keyword()) :: keyword()
+  def merge_finch_options(request_options, defaults \\ []) do
+    {finch, request_options} = Keyword.pop(request_options, :finch)
+    finch_options = Keyword.merge(defaults, normalize_finch_options(finch))
+
+    Keyword.put(request_options, :finch, finch_options)
   end
 
-  defp default_finch_name, do: ReqLLM.Application.finch_name()
+  @spec finch_option(Req.Request.t(), keyword()) :: keyword()
+  def finch_option(%Req.Request{} = request, options \\ []) do
+    current_options =
+      normalize_finch_options(request.options[:finch])
+
+    [finch: Keyword.merge(current_options, options)]
+  end
+
+  defp normalize_finch_options(nil), do: [name: ReqLLM.Application.finch_name()]
+  defp normalize_finch_options(name) when is_atom(name), do: [name: name]
+  defp normalize_finch_options(options) when is_list(options), do: options
 
   @doc """
   Fetches API key and extra common option keys.
@@ -1177,6 +1177,12 @@ defmodule ReqLLM.Provider.Defaults do
       |> then(fn meta ->
         if is_nil(logprobs), do: meta, else: Map.put(meta, :logprobs, logprobs)
       end)
+      |> then(fn meta ->
+        case normalize_openai_annotations(raw_message["annotations"]) do
+          [] -> meta
+          annotations -> Map.put(meta, "annotations", annotations)
+        end
+      end)
 
     metadata = %{
       response_id: id,
@@ -1242,6 +1248,8 @@ defmodule ReqLLM.Provider.Defaults do
                   []
               end
 
+            annotation_chunks = decode_openai_annotations(delta)
+
             # Extract finish_reason
             finish_reason = Map.get(choice, "finish_reason")
 
@@ -1250,9 +1258,9 @@ defmodule ReqLLM.Provider.Defaults do
               meta_chunk = ReqLLM.StreamChunk.meta(%{finish_reason: normalized_reason})
 
               content_chunks ++
-                reasoning_details_chunks ++ logprobs_chunks ++ [meta_chunk]
+                reasoning_details_chunks ++ logprobs_chunks ++ annotation_chunks ++ [meta_chunk]
             else
-              content_chunks ++ reasoning_details_chunks ++ logprobs_chunks
+              content_chunks ++ reasoning_details_chunks ++ logprobs_chunks ++ annotation_chunks
             end
           end)
 
@@ -1285,6 +1293,43 @@ defmodule ReqLLM.Provider.Defaults do
   end
 
   def default_decode_stream_event(_, _model), do: []
+
+  @doc """
+  Normalize OpenAI annotation maps to the flat Responses API shape.
+
+  Chat Completions nests url_citation fields under `"url_citation"`, while the
+  Responses API returns them flat. Both normalize to the flat form so
+  `ReqLLM.Response.annotations/1` yields a single shape across API surfaces:
+
+      %{"type" => "url_citation", "url" => ..., "title" => ..., "start_index" => ..., "end_index" => ...}
+
+  Other annotation types (`file_citation`, `file_path`, ...) are already flat
+  and pass through unchanged. Non-list input returns `[]`.
+  """
+  @spec normalize_openai_annotations(term()) :: [map()]
+  def normalize_openai_annotations(annotations) when is_list(annotations) do
+    annotations
+    |> Enum.filter(&is_map/1)
+    |> Enum.map(&normalize_openai_annotation/1)
+  end
+
+  def normalize_openai_annotations(_), do: []
+
+  defp normalize_openai_annotation(%{"type" => "url_citation", "url_citation" => %{} = inner}) do
+    Map.put(inner, "type", "url_citation")
+  end
+
+  defp normalize_openai_annotation(annotation), do: annotation
+
+  defp decode_openai_annotations(msg_or_delta) when is_map(msg_or_delta) do
+    case normalize_openai_annotations(msg_or_delta["annotations"]) do
+      [] ->
+        []
+
+      annotations ->
+        [ReqLLM.StreamChunk.meta(%{annotations: annotations})]
+    end
+  end
 
   defp decode_openai_message(message) when is_map(message) do
     content_chunks = decode_openai_content(message)

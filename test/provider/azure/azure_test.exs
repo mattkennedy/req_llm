@@ -91,7 +91,7 @@ defmodule ReqLLM.Providers.AzureTest do
           req_http_options: [finch: :custom_finch]
         )
 
-      assert request.options[:finch][:name] == :custom_finch
+      assert request.options[:finch] == [name: :custom_finch]
     end
 
     test "embedding operation uses correct endpoint" do
@@ -126,6 +126,26 @@ defmodule ReqLLM.Providers.AzureTest do
                  deployment: "my-deployment",
                  base_url: "https://my-resource.openai.azure.com/openai"
                )
+    end
+
+    test "embedding operation returns an error tuple for invalid options" do
+      model = %LLMDB.Model{
+        id: "text-embedding-3-small",
+        provider: :azure,
+        capabilities: %{embeddings: true}
+      }
+
+      assert {:error, error} =
+               Azure.prepare_request(
+                 :embedding,
+                 model,
+                 "Hello",
+                 deployment: "my-embedding-deployment",
+                 base_url: "https://my-resource.openai.azure.com/openai",
+                 provider_options: [dimensions: "not-an-integer"]
+               )
+
+      assert Exception.message(error) =~ "dimensions"
     end
   end
 

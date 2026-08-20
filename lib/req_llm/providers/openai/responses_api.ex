@@ -190,6 +190,12 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       "response.output_text.done" ->
         []
 
+      "response.output_text.annotation.added" ->
+        case ReqLLM.Provider.Defaults.normalize_openai_annotations([data["annotation"]]) do
+          [] -> []
+          annotations -> [ReqLLM.StreamChunk.meta(%{annotations: annotations})]
+        end
+
       "response.function_call.delta" ->
         handle_function_call_delta(data)
 
@@ -316,59 +322,26 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
     meta = merge_response_provider_meta(meta, data["response"] || %{})
 
-    meta = maybe_put_citations(meta, extract_url_citations(response_output))
+    meta = merge_annotations_meta(meta, response_output)
 
     [ReqLLM.StreamChunk.meta(meta)]
   end
 
-  # Web-search `url_citation` annotations ride on the assistant message's
-  # `output_text` content parts. The default response builder concatenates text
-  # and drops per-part metadata, so the cited URLs would otherwise be lost.
-  # Surface them on `provider_meta[:citations]` instead — the one bag that
-  # survives intact into the final `Response` (see `merge_response_provider_meta`).
-  defp extract_url_citations(output) when is_list(output) do
-    output
-    |> Enum.flat_map(&message_content_parts/1)
-    |> Enum.flat_map(&part_annotations/1)
-    |> Enum.filter(&(annotation_type(&1) == "url_citation"))
-    |> Enum.map(&normalize_url_citation/1)
-    |> Enum.uniq()
+  # The incremental `response.output_text.annotation.added` chunks are
+  # event-only; the completed/incomplete response's full output is the
+  # authoritative annotations list that lands in `provider_meta`.
+  defp merge_annotations_meta(meta, response_output) when is_list(response_output) do
+    case extract_annotations_from_segments(response_output) do
+      [] ->
+        meta
+
+      annotations ->
+        provider_meta = Map.get(meta, :provider_meta, %{})
+        Map.put(meta, :provider_meta, put_annotations_meta(provider_meta, annotations))
+    end
   end
 
-  defp extract_url_citations(_), do: []
-
-  # `output` comes from `get_in(data, ["response", "output"])` — always
-  # JSON-decoded string keys, matching the sibling `assistant_message_segment?`
-  # walker. Match string keys only (no atom fallback) so a future key-shape
-  # change fails loud here instead of silently yielding zero citations.
-  defp message_content_parts(%{"type" => "message", "content" => content}) when is_list(content),
-    do: content
-
-  defp message_content_parts(_), do: []
-
-  defp part_annotations(%{"annotations" => annotations}) when is_list(annotations),
-    do: annotations
-
-  defp part_annotations(_), do: []
-
-  defp annotation_type(%{"type" => type}), do: type
-  defp annotation_type(_), do: nil
-
-  defp normalize_url_citation(annotation) do
-    %{
-      url: annotation["url"],
-      title: annotation["title"],
-      start_index: annotation["start_index"],
-      end_index: annotation["end_index"]
-    }
-  end
-
-  defp maybe_put_citations(meta, []), do: meta
-
-  defp maybe_put_citations(meta, citations) do
-    provider_meta = Map.get(meta, :provider_meta, %{})
-    Map.put(meta, :provider_meta, Map.put(provider_meta, :citations, citations))
-  end
+  defp merge_annotations_meta(meta, _), do: meta
 
   defp maybe_put_reasoning_details(meta, []), do: meta
 
@@ -1203,7 +1176,8 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
        headers: headers,
        initial_messages: [Jason.encode!(create_event)],
        http_context: ReqLLM.Providers.OpenAI.WebSocket.http_context(url, headers),
-       canonical_json: body
+       canonical_json: body,
+       fallback_transport: :http
      }}
   rescue
     error ->
@@ -1922,6 +1896,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       base_provider_meta
       |> Map.merge(object_meta)
       |> put_code_interpreter_meta(code_interpreter_items)
+      |> put_annotations_meta(extract_annotations_from_segments(output_segments))
 
     ctx = req.options[:context] || %ReqLLM.Context{messages: []}
     chunks = buffered_response_chunks(text, thinking, tool_calls, reasoning_details)
@@ -2317,6 +2292,24 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
   defp put_code_interpreter_meta(provider_meta, items) when is_list(items) do
     Map.put(provider_meta, "code_interpreter", %{"items" => items})
+  end
+
+  defp extract_annotations_from_segments(segments) when is_list(segments) do
+    segments
+    |> Enum.filter(&(&1["type"] == "message"))
+    |> Enum.flat_map(fn seg ->
+      (seg["content"] || [])
+      |> Enum.filter(&(is_map(&1) and &1["type"] in ["output_text", "text"]))
+      |> Enum.flat_map(&ReqLLM.Provider.Defaults.normalize_openai_annotations(&1["annotations"]))
+    end)
+  end
+
+  defp extract_annotations_from_segments(_), do: []
+
+  defp put_annotations_meta(provider_meta, []), do: provider_meta
+
+  defp put_annotations_meta(provider_meta, annotations) when is_list(annotations) do
+    Map.put(provider_meta, "annotations", annotations)
   end
 
   defp normalize_arguments_json(nil), do: "{}"

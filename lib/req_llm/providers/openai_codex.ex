@@ -172,9 +172,8 @@ defmodule ReqLLM.Providers.OpenAICodex do
           [
             url: codex_path(),
             method: :post,
-            receive_timeout: timeout,
-            finch: [pool_timeout: timeout]
-          ] ++ http_opts
+            receive_timeout: timeout
+          ] ++ ReqLLM.Provider.Defaults.merge_finch_options(http_opts, pool_timeout: timeout)
         )
         |> Req.Request.register_options(req_keys)
         |> Req.Request.merge_options(
@@ -283,10 +282,14 @@ defmodule ReqLLM.Providers.OpenAICodex do
 
   def stream_transport(_model, opts) do
     provider_opts = Keyword.get(opts, :provider_options, [])
+    session = Keyword.get(provider_opts, :openai_websocket_session)
 
     case Keyword.get(provider_opts, :openai_stream_transport, :sse) do
-      transport when transport in [:websocket, "websocket"] -> :websocket
-      _ -> :http
+      transport when transport in [:websocket, "websocket"] ->
+        if websocket_session_fell_back?(session), do: :http, else: :websocket
+
+      _ ->
+        :http
     end
   end
 
@@ -393,7 +396,8 @@ defmodule ReqLLM.Providers.OpenAICodex do
        headers: headers,
        initial_messages: [Jason.encode!(create_event)],
        http_context: ReqLLM.Providers.OpenAI.WebSocket.http_context(url, headers),
-       canonical_json: body
+       canonical_json: body,
+       fallback_transport: :http
      }}
   rescue
     error ->
@@ -416,6 +420,14 @@ defmodule ReqLLM.Providers.OpenAICodex do
       connect_timeout: Keyword.get(opts, :connect_timeout, 10_000)
     )
   end
+
+  defp websocket_session_fell_back?(session) when is_pid(session) do
+    ReqLLM.Streaming.WebSocketSession.http_fallback?(session)
+  catch
+    :exit, _reason -> false
+  end
+
+  defp websocket_session_fell_back?(_session), do: false
 
   defp build_codex_body(context, %LLMDB.Model{} = model, opts, request) do
     opts = opts |> ensure_provider_options() |> force_store_false()

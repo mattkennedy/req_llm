@@ -215,9 +215,8 @@ defmodule ReqLLM.Providers.Anthropic do
             base_url: base_url,
             url: request_path(plan),
             method: :post,
-            receive_timeout: timeout,
-            finch: [pool_timeout: timeout]
-          ] ++ http_opts
+            receive_timeout: timeout
+          ] ++ ReqLLM.Provider.Defaults.merge_finch_options(http_opts, pool_timeout: timeout)
         )
         |> Req.Request.register_options(req_keys)
         |> Req.Request.merge_options(

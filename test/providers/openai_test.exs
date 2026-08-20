@@ -75,14 +75,19 @@ defmodule ReqLLM.Providers.OpenAITest do
       assert request.method == :post
     end
 
-    test "prepare_request preserves custom finch from req_http_options" do
+    test "prepare_request merges custom Finch options with the request timeout" do
       {:ok, model} = ReqLLM.model("openai:gpt-4-turbo")
       context = context_fixture()
 
       {:ok, request} =
-        OpenAI.prepare_request(:chat, model, context, req_http_options: [finch: :custom_finch])
+        OpenAI.prepare_request(:chat, model, context,
+          receive_timeout: 45_000,
+          req_http_options: [finch: [name: :custom_finch, pool_tag: :bulk]]
+        )
 
       assert request.options[:finch][:name] == :custom_finch
+      assert request.options[:finch][:pool_tag] == :bulk
+      assert request.options[:finch][:pool_timeout] == 45_000
     end
 
     test "prepare_request honors caller retry limits in chat and object pipelines" do
@@ -1384,6 +1389,18 @@ defmodule ReqLLM.Providers.OpenAITest do
     test "classifies gpt-4.1 as Responses without reasoning defaults" do
       refute ReqLLM.Providers.OpenAI.AdapterHelpers.reasoning_model?("gpt-4.1-mini")
       assert ReqLLM.Providers.OpenAI.AdapterHelpers.responses_model?("gpt-4.1-mini")
+    end
+
+    test "classifies search-preview models as Chat Completions only" do
+      alias ReqLLM.Providers.OpenAI.AdapterHelpers
+
+      for id <- ["gpt-4o-search-preview", "gpt-4o-mini-search-preview"] do
+        assert AdapterHelpers.search_preview_model?(id)
+        refute AdapterHelpers.responses_model?(id)
+      end
+
+      refute AdapterHelpers.search_preview_model?("gpt-4o-mini")
+      assert AdapterHelpers.responses_model?("gpt-4o-mini")
     end
   end
 

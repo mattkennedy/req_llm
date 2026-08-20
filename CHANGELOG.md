@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- changelog -->
 
+## [v1.20.0](https://github.com/agentjido/req_llm/compare/v1.19.0...v1.20.0) (2026-08-10)
+
+
+
+
+### Features:
+
+* add unverified model warning configuration (#954) by anagrius
+
+### Bug Fixes:
+
+* use current Req Finch options (#952) by mikehostetler
+
 ## [v1.19.0](https://github.com/agentjido/req_llm/compare/v1.18.0...v1.19.0) (2026-08-04)
 
 

@@ -45,7 +45,7 @@ defmodule ReqLLM.ProviderTest.ImageGeneration do
                 fixture_opts(
                   @provider,
                   ReqLLM.Test.CompatibilityScenario.fixture!(:image_basic),
-                  []
+                  ReqLLM.ProviderTest.ImageGeneration.provider_opts(@provider)
                 )
               )
 
@@ -75,4 +75,22 @@ defmodule ReqLLM.ProviderTest.ImageGeneration do
   def prompt(:google), do: "A simple blue square on a white background"
   def prompt(:xai), do: "A simple green square on a white background"
   def prompt(_provider), do: "A simple red square on a white background"
+
+  @azure_fixture_base_url "https://fixture.openai.azure.com/openai/v1"
+
+  @doc false
+  def provider_opts(:azure) do
+    opts =
+      case ReqLLM.Test.Env.fixtures_mode() do
+        :record -> []
+        :replay -> [api_key: "fixture-api-key", base_url: @azure_fixture_base_url]
+      end
+
+    case System.get_env("AZURE_IMAGE_DEPLOYMENT") do
+      nil -> opts
+      deployment -> Keyword.put(opts, :deployment, deployment)
+    end
+  end
+
+  def provider_opts(_provider), do: []
 end
