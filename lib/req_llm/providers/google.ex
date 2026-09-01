@@ -83,6 +83,8 @@ defmodule ReqLLM.Providers.Google do
 
   require Logger
 
+  @thinking_level_ranks %{minimal: 0, low: 1, medium: 2, high: 3}
+
   @provider_schema [
     google_api_version: [
       type: {:in, ["v1", "v1beta"]},
@@ -767,7 +769,7 @@ defmodule ReqLLM.Providers.Google do
               provider_opts
 
             :error ->
-              level = translate_reasoning_effort_to_level(effort_value)
+              level = translate_reasoning_effort_to_level(effort_value, model)
               Keyword.put(provider_opts, :google_thinking_level, level)
           end
 
@@ -828,8 +830,10 @@ defmodule ReqLLM.Providers.Google do
     end
   end
 
-  defp translate_reasoning_effort_to_level(effort) do
-    case ReqLLM.Provider.Reasoning.normalize_effort(effort) do
+  defp translate_reasoning_effort_to_level(effort, model) do
+    effort
+    |> ReqLLM.Provider.Reasoning.normalize_effort()
+    |> case do
       :none -> :minimal
       :minimal -> :minimal
       :low -> :low
@@ -839,7 +843,102 @@ defmodule ReqLLM.Providers.Google do
       :max -> :high
       _ -> :medium
     end
+    |> closest_supported_thinking_level(model)
   end
+
+  defp closest_supported_thinking_level(level, model) do
+    case supported_thinking_levels(model) do
+      [] ->
+        level
+
+      supported_levels ->
+        requested_rank = Map.fetch!(@thinking_level_ranks, level)
+
+        Enum.min_by(supported_levels, fn supported_level ->
+          supported_rank = Map.fetch!(@thinking_level_ranks, supported_level)
+          {abs(supported_rank - requested_rank), supported_rank}
+        end)
+    end
+  end
+
+  defp supported_thinking_levels(%LLMDB.Model{} = model) do
+    [
+      get_nested(model.capabilities, [:reasoning, :effort, :values]),
+      extra_thinking_levels(model.extra),
+      known_thinking_levels(model)
+    ]
+    |> Enum.find_value([], fn levels ->
+      case normalize_thinking_levels(levels) do
+        [] -> nil
+        normalized -> normalized
+      end
+    end)
+  end
+
+  defp supported_thinking_levels(_model), do: []
+
+  defp extra_thinking_levels(extra) do
+    extra
+    |> get_nested([:reasoning_options])
+    |> List.wrap()
+    |> Enum.find_value([], fn option ->
+      case {get_nested(option, [:type]), get_nested(option, [:values])} do
+        {type, values} when type in ["effort", :effort] and is_list(values) and values != [] ->
+          values
+
+        _ ->
+          nil
+      end
+    end)
+  end
+
+  defp normalize_thinking_levels(levels) do
+    levels
+    |> List.wrap()
+    |> Enum.map(&ReqLLM.Provider.Reasoning.normalize_effort/1)
+    |> Enum.filter(&Map.has_key?(@thinking_level_ranks, &1))
+    |> Enum.uniq()
+  end
+
+  defp known_thinking_levels(%LLMDB.Model{} = model) do
+    [model.provider_model_id, model.model, model.id]
+    |> Enum.find_value([], &known_thinking_levels/1)
+  end
+
+  defp known_thinking_levels(model_id) when is_binary(model_id) do
+    model_name = google_model_name(model_id)
+
+    cond do
+      model_name_matches?(model_name, "gemini-3.7-flash") -> [:low, :medium, :high]
+      model_name_matches?(model_name, "gemini-3.1-pro") -> [:low, :medium, :high]
+      true -> nil
+    end
+  end
+
+  defp known_thinking_levels(_model_id), do: nil
+
+  defp model_name_matches?(model_name, base_name),
+    do: model_name == base_name or String.starts_with?(model_name, base_name <> "-")
+
+  defp google_model_name(model_id) do
+    model_id
+    |> String.split("/")
+    |> List.last()
+    |> String.split(":", parts: 2)
+    |> List.last()
+  end
+
+  defp get_nested(value, []), do: value
+
+  defp get_nested(value, [key | rest]) when is_map(value) do
+    cond do
+      Map.has_key?(value, key) -> get_nested(Map.get(value, key), rest)
+      Map.has_key?(value, to_string(key)) -> get_nested(Map.get(value, to_string(key)), rest)
+      true -> nil
+    end
+  end
+
+  defp get_nested(_value, _path), do: nil
 
   @impl ReqLLM.Provider
   def translate_options(:image, _model, opts) do
@@ -874,7 +973,7 @@ defmodule ReqLLM.Providers.Google do
           Keyword.put(opts, :google_thinking_budget, reasoning_budget)
 
         reasoning_effort && gemini_3_or_later?(model) ->
-          level = translate_reasoning_effort_to_level(reasoning_effort)
+          level = translate_reasoning_effort_to_level(reasoning_effort, model)
           Keyword.put(opts, :google_thinking_level, level)
 
         reasoning_effort ->
@@ -1237,14 +1336,13 @@ defmodule ReqLLM.Providers.Google do
     |> maybe_put(:labels, request.options[:labels])
   end
 
-  defp gemini_3_or_later?(%LLMDB.Model{family: family}) when is_binary(family),
-    do: String.starts_with?(family, "gemini-3")
-
-  defp gemini_3_or_later?(%LLMDB.Model{id: id}) when is_binary(id),
-    do: String.starts_with?(id, "gemini-3")
+  defp gemini_3_or_later?(%LLMDB.Model{} = model) do
+    [model.provider_model_id, model.model, model.id, model.family]
+    |> Enum.any?(&gemini_3_or_later?/1)
+  end
 
   defp gemini_3_or_later?(id) when is_binary(id),
-    do: String.starts_with?(id, "gemini-3")
+    do: id |> google_model_name() |> String.starts_with?("gemini-3")
 
   defp gemini_3_or_later?(_), do: false
 

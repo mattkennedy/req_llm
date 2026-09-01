@@ -31,8 +31,8 @@ provider-native feature and are not consulted by request routing.
 | Tier | Surfaces |
 | --- | ---: |
 | First-class | 47 |
-| Best-effort | 458 |
-| Experimental | 89 |
+| Best-effort | 456 |
+| Experimental | 91 |
 | Unsupported | 97 |
 | **Total recorded surfaces** | **691** |
 
@@ -56,7 +56,7 @@ provider-native feature and are not consulted by request routing.
 | `llama3.1-8b` | `text` | `cerebras.unrecorded_text` | text → text | Experimental | 0/5 | 2026-05-29T23:27:04Z | surface declaration unknown |
 | `qwen-3-235b-a22b-instruct-2507` | `text` | `cerebras.chat_completions` | text → text | Unsupported | 0/5 | 2026-05-29T23:27:04Z | basic failed at provider_drift |
 | `qwen-3-coder-480b` | `text` | `cerebras.chat_completions` | text → text | Unsupported | 0/5 | 2026-05-29T23:27:04Z | basic failed at provider_drift |
-| `zai-glm-4.7` | `text` | `cerebras.chat_completions` | text → text | Best-effort | 1/5 | 2026-05-29T23:27:04Z | missing current evidence: usage, token_limit, context_append, streaming |
+| `zai-glm-4.7` | `text` | `cerebras.chat_completions` | text → text | Experimental | 0/5 | 2026-05-29T23:27:04Z | surface declaration unknown |
 
 ## cohere
 
@@ -425,7 +425,7 @@ provider-native feature and are not consulted by request routing.
 | `openai/gpt-oss-120b` | `text` | `openrouter.chat_completions` | text → text | Best-effort | 1/5 | 2026-05-29T23:45:45Z | missing current evidence: usage, token_limit, context_append, streaming |
 | `openai/gpt-oss-120b:free` | `text` | `openrouter.chat_completions` | text → text | Experimental | 0/5 | 2026-05-29T23:45:45Z | surface declaration unknown |
 | `openai/gpt-oss-20b` | `text` | `openrouter.chat_completions` | text → text | Best-effort | 1/5 | 2026-05-29T23:45:45Z | missing current evidence: usage, token_limit, context_append, streaming |
-| `openai/gpt-oss-20b:free` | `text` | `openrouter.chat_completions` | text → text | Best-effort | 1/5 | 2026-05-29T23:45:45Z | missing current evidence: usage, token_limit, context_append, streaming |
+| `openai/gpt-oss-20b:free` | `text` | `openrouter.chat_completions` | text → text | Experimental | 0/5 | 2026-05-29T23:45:45Z | surface declaration unknown |
 | `openai/gpt-oss-safeguard-20b` | `text` | `openrouter.chat_completions` | text → text | Best-effort | 1/5 | 2026-05-29T23:45:45Z | missing current evidence: usage, token_limit, context_append, streaming |
 | `openai/text-embedding-3-large` | `embedding` | `openrouter.embedding` | text → embedding | Best-effort | 1/3 | 2026-05-30T00:56:13Z | missing current evidence: embed_usage, embed_batch |
 | `openai/text-embedding-3-small` | `embedding` | `openrouter.embedding` | text → embedding | Best-effort | 1/3 | 2026-05-30T00:56:13Z | missing current evidence: embed_usage, embed_batch |

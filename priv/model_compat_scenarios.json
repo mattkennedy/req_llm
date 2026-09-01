@@ -562,15 +562,13 @@
       }
     },
     "cerebras:zai-glm-4.7": {
-      "catalog_status": "present",
-      "declared_operations": [
-        "text"
-      ],
+      "catalog_status": "missing",
+      "declared_operations": [],
       "model": "zai-glm-4.7",
       "provider": "cerebras",
       "surfaces": {
         "cerebras.chat_completions": {
-          "declaration": "declared",
+          "declaration": "unknown",
           "operation": "text",
           "provider": "cerebras",
           "scenarios": {
@@ -11681,15 +11679,13 @@
       }
     },
     "openrouter:openai/gpt-oss-20b:free": {
-      "catalog_status": "present",
-      "declared_operations": [
-        "text"
-      ],
+      "catalog_status": "missing",
+      "declared_operations": [],
       "model": "openai/gpt-oss-20b:free",
       "provider": "openrouter",
       "surfaces": {
         "openrouter.chat_completions": {
-          "declaration": "declared",
+          "declaration": "unknown",
           "operation": "text",
           "provider": "openrouter",
           "scenarios": {

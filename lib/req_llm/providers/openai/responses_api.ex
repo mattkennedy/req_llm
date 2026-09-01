@@ -58,6 +58,8 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   - `response.usage` → usage metrics with reasoning_tokens
   - `response.completed` → terminal event with finish_reason
   - `response.incomplete` → terminal event for truncated responses
+  - `response.failed` → terminal event with `finish_reason: :error` and the failure message
+  - `error` → terminal event with `finish_reason: :error` and the error message
 
   ## Usage Normalization
 
@@ -196,48 +198,8 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
           annotations -> [ReqLLM.StreamChunk.meta(%{annotations: annotations})]
         end
 
-      "response.function_call.delta" ->
-        handle_function_call_delta(data)
-
-      "response.function_call_arguments.delta" ->
-        handle_function_call_arguments_delta(data)
-
-      "response.function_call_arguments.done" ->
-        handle_function_call_arguments_done(data)
-
-      "response.function_call.name.delta" ->
-        handle_function_call_name_delta(data)
-
-      "response.output_item.added" ->
-        handle_output_item_added(data)
-
-      "response.output_item.done" ->
-        handle_output_item_done(data)
-
-      "response.completed" ->
-        capture_completion_metadata(
-          data,
-          %{terminal?: true, finish_reason: :stop},
-          model.provider
-        )
-
-      "response.incomplete" ->
-        reason =
-          get_in(data, ["response", "incomplete_details", "reason"]) ||
-            data["reason"] ||
-            "incomplete"
-
-        capture_completion_metadata(
-          data,
-          %{
-            terminal?: true,
-            finish_reason: normalize_finish_reason(reason)
-          },
-          model.provider
-        )
-
       _ ->
-        []
+        decode_output_or_terminal_event(event_type, data, model)
     end
   end
 
@@ -280,6 +242,83 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   defp decode_stream_event_with_state(event, model, _event_type, _data, _state) do
     decode_stream_event(event, model)
   end
+
+  defp decode_output_or_terminal_event("response.function_call.delta", data, _model) do
+    handle_function_call_delta(data)
+  end
+
+  defp decode_output_or_terminal_event(
+         "response.function_call_arguments.delta",
+         data,
+         _model
+       ) do
+    handle_function_call_arguments_delta(data)
+  end
+
+  defp decode_output_or_terminal_event(
+         "response.function_call_arguments.done",
+         data,
+         _model
+       ) do
+    handle_function_call_arguments_done(data)
+  end
+
+  defp decode_output_or_terminal_event("response.function_call.name.delta", data, _model) do
+    handle_function_call_name_delta(data)
+  end
+
+  defp decode_output_or_terminal_event("response.output_item.added", data, _model) do
+    handle_output_item_added(data)
+  end
+
+  defp decode_output_or_terminal_event("response.output_item.done", data, _model) do
+    handle_output_item_done(data)
+  end
+
+  defp decode_output_or_terminal_event("response.completed", data, model) do
+    capture_completion_metadata(
+      data,
+      %{terminal?: true, finish_reason: :stop},
+      model.provider
+    )
+  end
+
+  defp decode_output_or_terminal_event("response.incomplete", data, model) do
+    reason =
+      get_in(data, ["response", "incomplete_details", "reason"]) ||
+        data["reason"] ||
+        "incomplete"
+
+    capture_completion_metadata(
+      data,
+      %{
+        terminal?: true,
+        finish_reason: normalize_finish_reason(reason)
+      },
+      model.provider
+    )
+  end
+
+  defp decode_output_or_terminal_event("response.failed", data, model) do
+    message =
+      get_in(data, ["response", "error", "message"]) ||
+        get_in(data, ["response", "error", "code"]) ||
+        "response failed"
+
+    capture_completion_metadata(
+      data,
+      %{terminal?: true, finish_reason: :error, error: message},
+      model.provider
+    )
+  end
+
+  defp decode_output_or_terminal_event("error", data, _model) do
+    message = data["message"] || data["code"] || "stream error"
+
+    [ReqLLM.StreamChunk.meta(%{terminal?: true, finish_reason: :error, error: message})]
+  end
+
+  defp decode_output_or_terminal_event(_event_type, _data, _model), do: []
 
   defp capture_completion_metadata(data, meta, provider) do
     usage_data = get_in(data, ["response", "usage"])

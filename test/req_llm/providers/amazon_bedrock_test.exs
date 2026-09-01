@@ -3,6 +3,9 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
 
   alias ReqLLM.{Context, Providers.AmazonBedrock}
 
+  @arn "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abcdef123456"
+  @encoded_arn "arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Aapplication-inference-profile%2Fabcdef123456"
+
   describe "provider basics" do
     test "provider_id returns :amazon_bedrock" do
       assert AmazonBedrock.provider_id() == :amazon_bedrock
@@ -1087,5 +1090,359 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
       payload::binary,
       message_crc::32
     >>
+  end
+
+  describe "application inference profile ARNs" do
+    setup do
+      {:ok, model} = ReqLLM.model(%{provider: :amazon_bedrock, id: @arn})
+      context = Context.new([Context.user("Hello")])
+
+      opts = [
+        access_key_id: "AKIATEST",
+        secret_access_key: "secretTEST",
+        region: "us-east-1"
+      ]
+
+      {:ok, model: model, context: context, opts: opts}
+    end
+
+    test "routes through the Converse API as one encoded path segment", %{
+      model: model,
+      context: context,
+      opts: opts
+    } do
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+
+      assert request.url.path == "/model/#{@encoded_arn}/converse"
+      assert request.options[:use_converse] == true
+      assert %{"messages" => [%{"role" => "user"}]} = Jason.decode!(request.body)
+    end
+
+    test "streams through converse-stream", %{model: model, context: context, opts: opts} do
+      {:ok, finch_request} = AmazonBedrock.attach_stream(model, context, opts, ReqLLM.Finch)
+
+      assert finch_request.path == "/model/#{@encoded_arn}/converse-stream"
+    end
+
+    test "leaves other model ids unencoded", %{context: context, opts: opts} do
+      {:ok, model} = ReqLLM.model("amazon-bedrock:us.anthropic.claude-3-haiku-20240307-v1:0")
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+
+      assert request.url.path == "/model/us.anthropic.claude-3-haiku-20240307-v1:0/invoke"
+    end
+  end
+
+  describe "inference_profile_arn option" do
+    setup do
+      {:ok, model} = ReqLLM.model("amazon-bedrock:anthropic.claude-3-haiku-20240307-v1:0")
+      context = Context.new([Context.user("Hello")])
+
+      opts = [
+        access_key_id: "AKIATEST",
+        secret_access_key: "secretTEST",
+        region: "us-east-1",
+        provider_options: [inference_profile_arn: @arn]
+      ]
+
+      {:ok, model: model, context: context, opts: opts}
+    end
+
+    test "calls the profile while the model keeps its family and pricing", %{
+      model: model,
+      context: context,
+      opts: opts
+    } do
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+
+      assert request.url.path == "/model/#{@encoded_arn}/invoke"
+      assert request.options[:model] == "anthropic.claude-3-haiku-20240307-v1:0"
+      assert request.options[:model_family] == "anthropic"
+    end
+
+    test "takes the Converse API through the profile", %{
+      model: model,
+      context: context,
+      opts: opts
+    } do
+      opts = Keyword.update!(opts, :provider_options, &Keyword.put(&1, :use_converse, true))
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+
+      assert request.url.path == "/model/#{@encoded_arn}/converse"
+    end
+
+    test "streams through the profile", %{model: model, context: context, opts: opts} do
+      {:ok, finch_request} = AmazonBedrock.attach_stream(model, context, opts, ReqLLM.Finch)
+
+      assert finch_request.path == "/model/#{@encoded_arn}/invoke-with-response-stream"
+    end
+
+    test "names the likely cause of a native 400 through the profile", %{
+      model: model,
+      context: context,
+      opts: opts
+    } do
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+
+      rejected = %Req.Response{
+        status: 400,
+        body: %{"message" => "Malformed input request: 4 schema violations found"}
+      }
+
+      {_request, error} = AmazonBedrock.decode_response({request, rejected})
+
+      assert %ReqLLM.Error.API.Response{status: 400} = error
+      assert error.reason =~ "built in anthropic.claude-3-haiku-20240307-v1:0's native format"
+      assert error.reason =~ "the profile serves another model"
+    end
+
+    test "leaves a Converse 400 and a profile-less 400 alone", %{
+      model: model,
+      context: context,
+      opts: opts
+    } do
+      rejected = %Req.Response{status: 400, body: %{"message" => "Malformed input request"}}
+      converse = Keyword.update!(opts, :provider_options, &Keyword.put(&1, :use_converse, true))
+
+      for opts <- [converse, Keyword.delete(opts, :provider_options)] do
+        {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+        {_request, error} = AmazonBedrock.decode_response({request, rejected})
+
+        assert error.reason == "Bedrock API error"
+      end
+    end
+
+    test "embeds through the profile", %{opts: opts} do
+      {:ok, model} = ReqLLM.model("amazon-bedrock:cohere.embed-english-v3")
+      {:ok, request} = AmazonBedrock.prepare_request(:embedding, model, "Hello", opts)
+
+      assert request.url.path == "/model/#{@encoded_arn}/invoke"
+    end
+  end
+
+  describe "bedrock-mantle endpoint" do
+    setup do
+      context = Context.new([Context.user("Hello")])
+
+      opts = [
+        access_key_id: "AKIATEST",
+        secret_access_key: "secretTEST",
+        region: "eu-west-1",
+        provider_options: [endpoint: :mantle]
+      ]
+
+      {:ok, gpt_oss} = ReqLLM.model("amazon-bedrock:openai.gpt-oss-120b")
+      {:ok, claude} = ReqLLM.model("amazon-bedrock:anthropic.claude-3-haiku-20240307-v1:0")
+
+      {:ok, context: context, opts: opts, gpt_oss: gpt_oss, claude: claude}
+    end
+
+    test "stays on bedrock-runtime unless asked", %{context: context, opts: opts, gpt_oss: model} do
+      {:ok, request} =
+        AmazonBedrock.prepare_request(
+          :chat,
+          model,
+          context,
+          Keyword.delete(opts, :provider_options)
+        )
+
+      assert request.url.host == "bedrock-runtime.eu-west-1.amazonaws.com"
+      assert request.url.path == "/model/openai.gpt-oss-120b/invoke"
+      assert request.options[:endpoint] == :runtime
+    end
+
+    test "sends chat completions to bedrock-mantle", %{
+      context: context,
+      opts: opts,
+      gpt_oss: model
+    } do
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+
+      assert request.url.host == "bedrock-mantle.eu-west-1.api.aws"
+      assert request.url.path == "/v1/chat/completions"
+      assert request.options[:endpoint] == :mantle
+      assert request.options[:model_family] == "openai"
+      assert request.options[:use_converse] == false
+
+      assert %{"model" => "openai.gpt-oss-120b", "messages" => [%{"role" => "user"}]} =
+               Jason.decode!(request.body)
+    end
+
+    test "sends every other family as chat completions too", %{context: context, opts: opts} do
+      {:ok, model} =
+        ReqLLM.model(%{provider: :amazon_bedrock, id: "mistral.voxtral-mini-3b-2507"})
+
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+
+      assert request.url.path == "/v1/chat/completions"
+      assert request.options[:model_family] == "openai"
+      assert %{"model" => "mistral.voxtral-mini-3b-2507"} = Jason.decode!(request.body)
+    end
+
+    test "serves OpenAI-hosted models under /openai/v1", %{context: context, opts: opts} do
+      for id <- ["openai.gpt-5.4", "google.gemma-4-31b", "xai.grok-4.3"] do
+        {:ok, model} = ReqLLM.model(%{provider: :amazon_bedrock, id: id})
+        {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+
+        assert request.url.path == "/openai/v1/chat/completions"
+        assert request.options[:model_family] == "openai"
+        assert %{"model" => ^id} = Jason.decode!(request.body)
+
+        {:ok, finch_request} = AmazonBedrock.attach_stream(model, context, opts, ReqLLM.Finch)
+        assert finch_request.path == "/openai/v1/chat/completions"
+      end
+    end
+
+    test "mantle_base_path overrides the base picked from the model id", %{
+      context: context,
+      opts: opts,
+      gpt_oss: gpt_oss
+    } do
+      {:ok, gpt_5} = ReqLLM.model(%{provider: :amazon_bedrock, id: "openai.gpt-5.4"})
+
+      to_openai =
+        Keyword.put(opts, :provider_options, endpoint: :mantle, mantle_base_path: "/openai/v1")
+
+      to_v1 = Keyword.put(opts, :provider_options, endpoint: :mantle, mantle_base_path: "/v1")
+
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, gpt_oss, context, to_openai)
+      assert request.url.path == "/openai/v1/chat/completions"
+
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, gpt_5, context, to_v1)
+      assert request.url.path == "/v1/chat/completions"
+
+      {:ok, finch_request} =
+        AmazonBedrock.attach_stream(gpt_oss, context, to_openai, ReqLLM.Finch)
+
+      assert finch_request.path == "/openai/v1/chat/completions"
+    end
+
+    test "sends Claude through the Anthropic Messages API", %{
+      context: context,
+      opts: opts,
+      claude: model
+    } do
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+
+      assert request.url.host == "bedrock-mantle.eu-west-1.api.aws"
+      assert request.url.path == "/anthropic/v1/messages"
+      assert request.options[:model_family] == "anthropic"
+      assert Req.Request.get_header(request, "anthropic-version") == ["2023-06-01"]
+
+      body = Jason.decode!(request.body)
+      assert body["model"] == "anthropic.claude-3-haiku-20240307-v1:0"
+      refute Map.has_key?(body, "anthropic_version")
+      assert [%{"role" => "user"}] = body["messages"]
+    end
+
+    test "authenticates an API key the way each route expects", %{
+      context: context,
+      gpt_oss: gpt_oss,
+      claude: claude
+    } do
+      opts = [api_key: "bedrock-key", region: "eu-west-1", provider_options: [endpoint: :mantle]]
+
+      {:ok, chat} = AmazonBedrock.prepare_request(:chat, gpt_oss, context, opts)
+      assert Req.Request.get_header(chat, "authorization") == ["Bearer bedrock-key"]
+
+      {:ok, messages} = AmazonBedrock.prepare_request(:chat, claude, context, opts)
+      assert Req.Request.get_header(messages, "x-api-key") == ["bedrock-key"]
+      assert Req.Request.get_header(messages, "authorization") == []
+    end
+
+    test "streams as server-sent events", %{
+      context: context,
+      opts: opts,
+      gpt_oss: gpt_oss,
+      claude: claude
+    } do
+      {:ok, chat} = AmazonBedrock.attach_stream(gpt_oss, context, opts, ReqLLM.Finch)
+      headers = Map.new(chat.headers)
+
+      assert chat.host == "bedrock-mantle.eu-west-1.api.aws"
+      assert chat.path == "/v1/chat/completions"
+      assert headers["accept"] == "text/event-stream"
+      assert headers["authorization"] =~ "AWS4-HMAC-SHA256"
+      assert headers["authorization"] =~ "/bedrock-mantle/aws4_request"
+      assert %{"stream" => true} = Jason.decode!(chat.body)
+
+      {:ok, messages} = AmazonBedrock.attach_stream(claude, context, opts, ReqLLM.Finch)
+
+      assert messages.path == "/anthropic/v1/messages"
+      assert Map.new(messages.headers)["anthropic-version"] == "2023-06-01"
+
+      assert %{"stream" => true, "model" => "anthropic.claude-3-haiku-20240307-v1:0"} =
+               Jason.decode!(messages.body)
+    end
+
+    test "picks the stream parser from the endpoint", %{gpt_oss: model} do
+      sse = AmazonBedrock.stream_protocol_parser(model, provider_options: [endpoint: :mantle])
+
+      assert {:ok, [%{data: ~s({"a":1})}], %ServerSentEvents.Parser{} = state} =
+               sse.(~s(data: {"a":1}\n\n), nil)
+
+      assert {:ok, [%{data: ~s({"b":2})}], %ServerSentEvents.Parser{}} =
+               sse.(~s(data: {"b":2}\n\n), state)
+
+      event_stream = AmazonBedrock.stream_protocol_parser(model, [])
+      assert {:incomplete, <<0, 0>>} = event_stream.(<<0, 0>>, nil)
+    end
+
+    test "decodes chat completion and messages events", %{gpt_oss: gpt_oss, claude: claude} do
+      delta = %{data: %{"choices" => [%{"index" => 0, "delta" => %{"content" => "Hi"}}]}}
+
+      assert {[%ReqLLM.StreamChunk{type: :content, text: "Hi"}], nil} =
+               AmazonBedrock.decode_stream_event(delta, gpt_oss, nil)
+
+      delta = %{
+        event: "content_block_delta",
+        data: %{
+          "type" => "content_block_delta",
+          "index" => 0,
+          "delta" => %{"type" => "text_delta", "text" => "Hi"}
+        }
+      }
+
+      assert {[%ReqLLM.StreamChunk{type: :content, text: "Hi"}], _state} =
+               AmazonBedrock.decode_stream_event(
+                 delta,
+                 claude,
+                 AmazonBedrock.init_stream_state(claude)
+               )
+    end
+
+    test "sends the project header each bedrock-mantle route takes", %{
+      context: context,
+      opts: opts,
+      gpt_oss: gpt_oss,
+      claude: claude
+    } do
+      opts = put_in(opts, [:provider_options, :project], "proj_abc123")
+
+      {:ok, chat} = AmazonBedrock.prepare_request(:chat, gpt_oss, context, opts)
+      assert Req.Request.get_header(chat, "openai-project") == ["proj_abc123"]
+
+      {:ok, messages} = AmazonBedrock.prepare_request(:chat, claude, context, opts)
+      assert Req.Request.get_header(messages, "anthropic-workspace-id") == ["proj_abc123"]
+      assert Req.Request.get_header(messages, "openai-project") == []
+
+      {:ok, stream} = AmazonBedrock.attach_stream(gpt_oss, context, opts, ReqLLM.Finch)
+      headers = Map.new(stream.headers)
+      assert headers["openai-project"] == "proj_abc123"
+      assert headers["authorization"] =~ "openai-project"
+    end
+
+    test "sends no project header off bedrock-mantle", %{
+      context: context,
+      opts: opts,
+      gpt_oss: model
+    } do
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+      assert Req.Request.get_header(request, "openai-project") == []
+
+      runtime = Keyword.put(opts, :provider_options, project: "proj_abc123")
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, runtime)
+      assert request.url.host == "bedrock-runtime.eu-west-1.amazonaws.com"
+      assert Req.Request.get_header(request, "openai-project") == []
+    end
   end
 end

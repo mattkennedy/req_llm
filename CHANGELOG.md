@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- changelog -->
 
+## [v1.21.1](https://github.com/agentjido/req_llm/compare/v1.21.0...v1.21.1) (2026-08-26)
+
+
+
+
+### Bug Fixes:
+
+* openai: decode response.failed and error stream events as terminal error chunks (#977) by Eric Draut
+
+* anthropic: read thinking tokens from output_tokens_details (#976) by brent-emb
+
+* tool: ignore unknown schema input keys (#975) by Niklas Johansson
+
+* google: respect model thinking levels (#972) by mikehostetler
+
+## [v1.21.0](https://github.com/agentjido/req_llm/compare/v1.20.0...v1.21.0) (2026-08-23)
+
+
+
+
+### Features:
+
+* google: accept base_url, receive_timeout, and req_http_options in CachedContent (#970) by Aaron Renner
+
+* ollama: forward reasoning_effort to disable thinking on reasoning models by David Bluestein II
+
+* OpenAI (and compatible providers) web search citations (#964) by Vasilis Spilka
+
+* minimax: add video generation support (#961) by Gilbert
+
+* Azure image support (#956) by Vasilis Spilka
+
+### Bug Fixes:
+
+* test: stabilize llm db release fixture (#968) by mikehostetler
+
+* treat llm_db as a regular OTP dependency (#963) by mikehostetler
+
+* OpenAI cost per image (#957) by Vasilis Spilka
+
+* streaming: fall back after oversized websocket messages (#958) by Danila Poyarkov
+
 ## [v1.20.0](https://github.com/agentjido/req_llm/compare/v1.19.0...v1.20.0) (2026-08-10)
 
 
