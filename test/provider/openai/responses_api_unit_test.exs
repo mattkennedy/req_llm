@@ -1299,7 +1299,31 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
                "action" => %{"type" => "search", "query" => "elixir"}
              }
 
+      assert ReqLLM.ToolCall.metadata(tool_call) == %{status: "completed"}
       assert ReqLLM.Response.classify(resp.body).type == :final_answer
+    end
+
+    test "keeps a failed builtin call's status in its metadata, off the arguments" do
+      response_body = %{
+        "id" => "resp_123",
+        "model" => "gpt-5",
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "web_search_call",
+            "id" => "ws_1",
+            "status" => "failed",
+            "action" => %{"type" => "search", "query" => "elixir"}
+          }
+        ],
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 10}
+      }
+
+      {_req, resp} = ResponsesAPI.decode_response(build_response(200, response_body))
+
+      assert [tool_call] = resp.body.message.tool_calls
+      assert ReqLLM.ToolCall.metadata(tool_call) == %{status: "failed"}
+      refute Map.has_key?(Jason.decode!(tool_call.function.arguments), "status")
     end
 
     test "handles malformed tool call arguments" do
@@ -1911,7 +1935,29 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert chunk.arguments == %{"action" => %{"query" => "elixir telemetry"}}
       assert chunk.metadata.id == "ws_1"
       assert chunk.metadata.builtin? == true
+      assert chunk.metadata.status == "completed"
       assert is_integer(chunk.metadata.done_at_unix_nano)
+    end
+
+    test "carries a failed builtin item's status on the tool call chunk", %{model: model} do
+      event = %{
+        data: %{
+          "event" => "response.output_item.done",
+          "output_index" => 0,
+          "item" => %{
+            "id" => "ws_1",
+            "type" => "web_search_call",
+            "action" => %{"query" => "elixir telemetry"},
+            "status" => "failed"
+          }
+        }
+      }
+
+      assert [%ReqLLM.StreamChunk{type: :tool_call} = chunk] =
+               ResponsesAPI.decode_stream_event(event, model)
+
+      assert chunk.metadata.status == "failed"
+      refute Map.has_key?(chunk.arguments, "status")
     end
 
     test "decodes atom-keyed builtin output item events", %{model: model} do
@@ -2439,7 +2485,8 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       payload = Jason.decode!(message)
 
       assert payload["type"] == "response.create"
-      assert payload["response"] == config.canonical_json
+      assert Map.delete(payload, "type") == config.canonical_json
+      refute Map.has_key?(payload, "response")
     end
 
     test "keeps previous_response_id with store false over websocket transport" do
@@ -2639,6 +2686,70 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert reasoning_input["type"] == "reasoning"
       assert reasoning_input["id"] == "rs_prev123"
       assert reasoning_input["encrypted_content"] == "encrypted_sig_abc"
+    end
+
+    test "keeps each reasoning item at its own turn, so a later turn extends the input prefix" do
+      reasoning = fn id ->
+        %ReqLLM.Message.ReasoningDetails{
+          signature: "encrypted_#{id}",
+          encrypted?: true,
+          provider: :openai,
+          format: "openai-responses-v1",
+          index: 0,
+          provider_data: %{"id" => id, "type" => "reasoning"}
+        }
+      end
+
+      tool_turn =
+        ReqLLM.Context.assistant("",
+          tool_calls: [{"read", %{"path" => "a.ex"}, [id: "call_1"]}]
+        )
+
+      first_turn = [
+        ReqLLM.Context.user("Read the file"),
+        %{tool_turn | reasoning_details: [reasoning.("rs_1")]},
+        ReqLLM.Context.tool_result_message("read", "call_1", "file bytes", %{is_error: false}),
+        %{ReqLLM.Context.assistant("Done.") | reasoning_details: [reasoning.("rs_2")]}
+      ]
+
+      shape = fn body -> Enum.map(body["input"], &(&1["type"] || &1["role"])) end
+
+      encode = fn messages ->
+        %ReqLLM.Context{messages: messages}
+        |> then(&build_request(context: &1))
+        |> ResponsesAPI.encode_body()
+        |> ReqLLM.Test.Helpers.json_body()
+      end
+
+      before = encode.(first_turn ++ [ReqLLM.Context.user("Now edit it")])
+
+      assert shape.(before) == [
+               "user",
+               "reasoning",
+               "function_call",
+               "function_call_output",
+               "reasoning",
+               "assistant",
+               "user"
+             ]
+
+      assert Enum.map(before["input"], & &1["id"]) |> Enum.reject(&is_nil/1) == [
+               "rs_1",
+               "rs_2"
+             ]
+
+      later =
+        encode.(
+          first_turn ++
+            [
+              ReqLLM.Context.user("Now edit it"),
+              %{ReqLLM.Context.assistant("Edited.") | reasoning_details: [reasoning.("rs_3")]},
+              ReqLLM.Context.user("Continue")
+            ]
+        )
+
+      assert Enum.take(later["input"], length(before["input"])) == before["input"]
+      assert shape.(later) == shape.(before) ++ ["reasoning", "assistant", "user"]
     end
 
     test "does not include reasoning items when previous_response_id is present" do

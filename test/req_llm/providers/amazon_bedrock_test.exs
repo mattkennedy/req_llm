@@ -372,6 +372,53 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
       assert detail.index == 0
     end
 
+    test "maps native guardrail interventions in both stream decoders" do
+      model =
+        LLMDB.Model.new!(%{id: "meta.llama3-8b-instruct-v1:0", provider: :amazon_bedrock})
+
+      trace = %{"guardrail" => %{"actionReason" => "Guardrail blocked."}}
+
+      event = %{
+        "stop_reason" => "stop",
+        "amazon-bedrock-guardrailAction" => "INTERVENED",
+        "amazon-bedrock-trace" => trace
+      }
+
+      {stateful_chunks, _state} =
+        AmazonBedrock.decode_stream_event(event, model, AmazonBedrock.init_stream_state(model))
+
+      for chunks <- [stateful_chunks, AmazonBedrock.decode_stream_event(event, model)] do
+        assert [%ReqLLM.StreamChunk{type: :meta, metadata: metadata}] =
+                 Enum.filter(chunks, &match?(%{metadata: %{provider_meta: _}}, &1))
+
+        assert metadata.finish_reason == :content_filter
+
+        assert metadata.provider_meta == %{
+                 "amazon-bedrock-guardrailAction" => "INTERVENED",
+                 "amazon-bedrock-trace" => trace
+               }
+      end
+    end
+
+    test "keeps the finish reason when the guardrail did not intervene on message_stop" do
+      model =
+        LLMDB.Model.new!(%{
+          id: "anthropic.claude-3-haiku-20240307-v1:0",
+          provider: :amazon_bedrock
+        })
+
+      event = %{"type" => "message_stop", "amazon-bedrock-guardrailAction" => "NONE"}
+
+      {chunks, _state} =
+        AmazonBedrock.decode_stream_event(event, model, AmazonBedrock.init_stream_state(model))
+
+      assert [%ReqLLM.StreamChunk{metadata: metadata}] =
+               Enum.filter(chunks, &match?(%{metadata: %{provider_meta: _}}, &1))
+
+      refute Map.has_key?(metadata, :finish_reason)
+      assert metadata.provider_meta == %{"amazon-bedrock-guardrailAction" => "NONE"}
+    end
+
     test "native Anthropic streamed reasoning round-trips into a single thinking block" do
       model =
         LLMDB.Model.new!(%{
@@ -422,6 +469,52 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
       assert thinking_block[:thinking] == "First part second part"
       assert thinking_block[:signature] == "sig_test_123"
       assert text_block == %{type: "text", text: "Answer: 42"}
+    end
+  end
+
+  describe "Converse reasoning stream state" do
+    setup do
+      {:ok, model} =
+        ReqLLM.model(%{
+          provider: :amazon_bedrock,
+          id: "anthropic.claude-haiku-4-5-20251001-v1:0",
+          capabilities: %{chat: true, reasoning: %{enabled: true}}
+        })
+
+      {:ok, model: model}
+    end
+
+    test "starts from nil state and flushes pending reasoning for Claude", %{model: model} do
+      delta = %{
+        "contentBlockDelta" => %{
+          "contentBlockIndex" => 0,
+          "delta" => %{"reasoningContent" => %{"text" => "thought"}}
+        }
+      }
+
+      signature = %{
+        "contentBlockDelta" => %{
+          "contentBlockIndex" => 0,
+          "delta" => %{"reasoningContent" => %{"signature" => "sig"}}
+        }
+      }
+
+      {[%ReqLLM.StreamChunk{type: :thinking}], state} =
+        AmazonBedrock.decode_stream_event(delta, model, nil)
+
+      {[], state} = AmazonBedrock.decode_stream_event(signature, model, state)
+      {chunks, _state} = AmazonBedrock.flush_stream_state(model, state)
+
+      assert [
+               %ReqLLM.StreamChunk{
+                 type: :meta,
+                 metadata: %{
+                   reasoning_details: [
+                     %ReqLLM.Message.ReasoningDetails{text: "thought", signature: "sig"}
+                   ]
+                 }
+               }
+             ] = chunks
     end
   end
 
@@ -560,6 +653,86 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
     end
   end
 
+  describe "native guardrail responses" do
+    test "preserves guardrail assessments and normalizes interventions" do
+      trace = %{"guardrail" => %{"outputs" => [%{"wordPolicy" => %{}}]}}
+      request = %Req.Request{options: %{model_family: "meta"}}
+
+      model_output = %{
+        "prompt_token_count" => 10,
+        "generation_token_count" => 5,
+        "stop_reason" => "length"
+      }
+
+      for {action, finish_reason, output} <- [
+            {"INTERVENED", :content_filter, %{}},
+            {"NONE", :length, model_output}
+          ] do
+        body =
+          Map.merge(output, %{
+            "generation" => "Filtered response",
+            "amazon-bedrock-guardrailAction" => action,
+            "amazon-bedrock-trace" => trace
+          })
+
+        {^request, response} =
+          AmazonBedrock.decode_response({request, %Req.Response{status: 200, body: body}})
+
+        assert response.body.finish_reason == finish_reason
+        assert ReqLLM.Response.text(response.body) == "Filtered response"
+        assert response.body.provider_meta["amazon-bedrock-guardrailAction"] == action
+        assert response.body.provider_meta["amazon-bedrock-trace"] == trace
+      end
+    end
+  end
+
+  describe "guardrail request configuration" do
+    setup do
+      {:ok, model} = ReqLLM.model("amazon-bedrock:anthropic.claude-3-haiku-20240307-v1:0")
+      context = Context.new([Context.user("Hello")])
+
+      opts = [
+        access_key_id: "AKIATEST",
+        secret_access_key: "secretTEST",
+        region: "us-east-1",
+        provider_options: [
+          guardrail_identifier: "abc123",
+          guardrail_version: "1",
+          guardrail_trace: "enabled_full"
+        ]
+      ]
+
+      {:ok, model: model, context: context, opts: opts}
+    end
+
+    test "InvokeModel puts guardrail configuration in headers", %{
+      model: model,
+      context: context,
+      opts: opts
+    } do
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+
+      assert Req.Request.get_header(request, "x-amzn-bedrock-guardrailidentifier") == ["abc123"]
+      assert Req.Request.get_header(request, "x-amzn-bedrock-guardrailversion") == ["1"]
+      assert Req.Request.get_header(request, "x-amzn-bedrock-trace") == ["ENABLED_FULL"]
+    end
+
+    test "Converse puts guardrail configuration in the body", %{
+      model: model,
+      context: context,
+      opts: opts
+    } do
+      opts = Keyword.update!(opts, :provider_options, &Keyword.put(&1, :use_converse, true))
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+
+      assert Jason.decode!(request.body)["guardrailConfig"] == %{
+               "guardrailIdentifier" => "abc123",
+               "guardrailVersion" => "1",
+               "trace" => "enabled_full"
+             }
+    end
+  end
+
   describe "prepare_request/4 for embedding" do
     setup do
       System.put_env("AWS_ACCESS_KEY_ID", "AKIATEST")
@@ -585,13 +758,15 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
     end
 
     test "preserves inference profile prefix for Cohere embedding model" do
-      warning =
+      output =
         ExUnit.CaptureIO.capture_io(:stderr, fn ->
           send(self(), {:model_result, ReqLLM.model("amazon-bedrock:global.cohere.embed-v4:0")})
         end)
 
-      assert warning =~ "Using unverified model: amazon_bedrock:global.cohere.embed-v4:0"
+      assert output == ""
       assert_received {:model_result, {:ok, model}}
+      assert model.id == "cohere.embed-v4"
+      assert is_number(model.cost.input)
 
       text = "Hello, world!"
 
@@ -1231,9 +1406,10 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
       ]
 
       {:ok, gpt_oss} = ReqLLM.model("amazon-bedrock:openai.gpt-oss-120b")
+      {:ok, gpt_5} = ReqLLM.model(%{provider: :amazon_bedrock, id: "openai.gpt-5.6-terra"})
       {:ok, claude} = ReqLLM.model("amazon-bedrock:anthropic.claude-3-haiku-20240307-v1:0")
 
-      {:ok, context: context, opts: opts, gpt_oss: gpt_oss, claude: claude}
+      {:ok, context: context, opts: opts, gpt_oss: gpt_oss, gpt_5: gpt_5, claude: claude}
     end
 
     test "stays on bedrock-runtime unless asked", %{context: context, opts: opts, gpt_oss: model} do
@@ -1248,6 +1424,21 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
       assert request.url.host == "bedrock-runtime.eu-west-1.amazonaws.com"
       assert request.url.path == "/model/openai.gpt-oss-120b/invoke"
       assert request.options[:endpoint] == :runtime
+    end
+
+    test "preserves runtime token parameters", %{context: context, opts: opts} do
+      {:ok, model} = ReqLLM.model(%{provider: :amazon_bedrock, id: "openai.gpt-5.4"})
+
+      opts =
+        opts
+        |> Keyword.delete(:provider_options)
+        |> Keyword.put(:max_tokens, 400)
+
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+      body = Jason.decode!(request.body)
+
+      assert body["max_tokens"] == 400
+      refute Map.has_key?(body, "max_completion_tokens")
     end
 
     test "sends chat completions to bedrock-mantle", %{
@@ -1278,8 +1469,11 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
       assert %{"model" => "mistral.voxtral-mini-3b-2507"} = Jason.decode!(request.body)
     end
 
-    test "serves OpenAI-hosted models under /openai/v1", %{context: context, opts: opts} do
-      for id <- ["openai.gpt-5.4", "google.gemma-4-31b", "xai.grok-4.3"] do
+    test "keeps non-Responses OpenAI-compatible models on chat completions", %{
+      context: context,
+      opts: opts
+    } do
+      for id <- ["google.gemma-4-31b", "xai.grok-4.3"] do
         {:ok, model} = ReqLLM.model(%{provider: :amazon_bedrock, id: id})
         {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
 
@@ -1290,6 +1484,190 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
         {:ok, finch_request} = AmazonBedrock.attach_stream(model, context, opts, ReqLLM.Finch)
         assert finch_request.path == "/openai/v1/chat/completions"
       end
+    end
+
+    test "routes GPT-5 Responses bodies on both Mantle transports", %{
+      context: context,
+      opts: opts,
+      gpt_5: model
+    } do
+      tool =
+        ReqLLM.Tool.new!(
+          name: "get_weather",
+          description: "Get the weather",
+          parameter_schema: [location: [type: :string, required: true]],
+          callback: fn _args -> {:ok, "sunny"} end
+        )
+
+      opts =
+        Keyword.merge(opts,
+          max_tokens: 400,
+          reasoning_effort: :high,
+          tools: [tool]
+        )
+
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+      assert Regex.scan(~r/"model":/, request.body) == [["\"model\":"]]
+      assert request.body =~ ~s("model":"openai.gpt-5.6-terra")
+      body = Jason.decode!(request.body)
+
+      assert request.url.path == "/openai/v1/responses"
+      assert [%{"role" => "user"}] = body["input"]
+      refute Map.has_key?(body, "messages")
+      assert [%{"type" => "function", "name" => "get_weather"}] = body["tools"]
+      assert body["reasoning"] == %{"effort" => "high"}
+      assert body["max_output_tokens"] == 400
+      refute Map.has_key?(body, "max_tokens")
+
+      {:ok, stream} = AmazonBedrock.attach_stream(model, context, opts, ReqLLM.Finch)
+      assert Regex.scan(~r/"model":/, stream.body) == [["\"model\":"]]
+      assert stream.body =~ ~s("model":"openai.gpt-5.6-terra")
+      body = Jason.decode!(stream.body)
+
+      assert stream.path == "/openai/v1/responses"
+      assert [%{"role" => "user"}] = body["input"]
+      assert [%{"type" => "function", "name" => "get_weather"}] = body["tools"]
+      assert body["max_output_tokens"] == 400
+      refute Map.has_key?(body, "max_tokens")
+    end
+
+    test "uses model shape metadata and excludes GPT OSS", %{context: context, opts: opts} do
+      for extra <- [
+            %{"provider" => %{"shape" => "responses"}},
+            %{provider: %{shape: "responses"}}
+          ] do
+        {:ok, model} =
+          ReqLLM.model(%{
+            provider: :amazon_bedrock,
+            id: "xai.grok-4.3",
+            extra: extra
+          })
+
+        {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+        assert request.url.path == "/openai/v1/responses"
+      end
+
+      {:ok, model} =
+        ReqLLM.model(%{
+          provider: :amazon_bedrock,
+          id: "openai.gpt-oss-120b",
+          extra: %{"provider" => %{"shape" => "responses"}}
+        })
+
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+      assert request.url.path == "/v1/chat/completions"
+    end
+
+    test "constrains object requests with a strict schema on both Mantle transports", %{
+      context: context,
+      opts: opts,
+      gpt_5: model
+    } do
+      {:ok, compiled_schema} =
+        ReqLLM.Schema.compile(location: [type: :string, required: true])
+
+      opts = Keyword.merge(opts, operation: :object, compiled_schema: compiled_schema)
+      {:ok, request} = AmazonBedrock.prepare_request(:object, model, context, opts)
+      {:ok, stream} = AmazonBedrock.attach_stream(model, context, opts, ReqLLM.Finch)
+
+      for body <- [request.body, stream.body] do
+        body = Jason.decode!(body)
+        assert [tool] = body["tools"]
+        assert tool["name"] == "structured_output"
+        assert tool["strict"] == true
+        assert tool["parameters"]["properties"]["location"]["type"] == "string"
+        assert tool["parameters"]["required"] == ["location"]
+        assert tool["parameters"]["additionalProperties"] == false
+        assert body["tool_choice"] == %{"type" => "function", "name" => "structured_output"}
+        assert body["parallel_tool_calls"] == false
+      end
+
+      payload = %{
+        "id" => "resp_object",
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "function_call",
+            "call_id" => "call_object",
+            "name" => "structured_output",
+            "arguments" => ~s({"location":"Boston"})
+          }
+        ]
+      }
+
+      {_request, response} =
+        AmazonBedrock.decode_response({request, %Req.Response{status: 200, body: payload}})
+
+      assert response.body.object == %{"location" => "Boston"}
+      assert response.body.model == "openai.gpt-5.6-terra"
+      assert request.options[:compiled_schema] == compiled_schema
+    end
+
+    test "disables Responses storage by default and accepts explicit storage options", %{
+      context: context,
+      opts: opts,
+      gpt_5: model
+    } do
+      for store <- [:default, false, true] do
+        provider_opts = opts[:provider_options]
+
+        provider_opts =
+          if store == :default, do: provider_opts, else: Keyword.put(provider_opts, :store, store)
+
+        opts = Keyword.put(opts, :provider_options, provider_opts)
+        expected_store = store == true
+
+        {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+        {:ok, stream} = AmazonBedrock.attach_stream(model, context, opts, ReqLLM.Finch)
+
+        assert Jason.decode!(request.body)["store"] == expected_store
+        assert Jason.decode!(stream.body)["store"] == expected_store
+      end
+    end
+
+    test "decodes runtime GPT-5 chat deltas through the runtime parser", %{
+      context: context,
+      opts: opts,
+      gpt_5: model
+    } do
+      opts = Keyword.delete(opts, :provider_options)
+      {:ok, request} = AmazonBedrock.attach_stream(model, context, opts, ReqLLM.Finch)
+      assert request.path == "/model/openai.gpt-5.6-terra/invoke-with-response-stream"
+      assert Map.has_key?(Jason.decode!(request.body), "messages")
+
+      delta = %{
+        "object" => "chat.completion.chunk",
+        "choices" => [%{"index" => 0, "delta" => %{"content" => "Hello"}}]
+      }
+
+      payload = Jason.encode!(%{"bytes" => Base.encode64(Jason.encode!(delta))})
+      parser = AmazonBedrock.stream_protocol_parser(model, opts)
+      assert {:ok, [event], <<>>} = parser.(build_aws_event_stream_message(payload), nil)
+
+      for event <- [event, %{data: event}] do
+        assert {[%ReqLLM.StreamChunk{type: :content, text: "Hello"}], nil} =
+                 AmazonBedrock.decode_stream_event(event, model, nil)
+      end
+    end
+
+    test "preserves Anthropic token parameters on both Mantle transports", %{
+      context: context,
+      opts: opts,
+      claude: model
+    } do
+      opts = Keyword.put(opts, :max_tokens, 400)
+
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+      body = Jason.decode!(request.body)
+
+      assert body["max_tokens"] == 400
+      refute Map.has_key?(body, "max_completion_tokens")
+
+      {:ok, stream} = AmazonBedrock.attach_stream(model, context, opts, ReqLLM.Finch)
+      body = Jason.decode!(stream.body)
+
+      assert body["max_tokens"] == 400
+      refute Map.has_key?(body, "max_completion_tokens")
     end
 
     test "mantle_base_path overrides the base picked from the model id", %{
@@ -1308,7 +1686,7 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
       assert request.url.path == "/openai/v1/chat/completions"
 
       {:ok, request} = AmazonBedrock.prepare_request(:chat, gpt_5, context, to_v1)
-      assert request.url.path == "/v1/chat/completions"
+      assert request.url.path == "/v1/responses"
 
       {:ok, finch_request} =
         AmazonBedrock.attach_stream(gpt_oss, context, to_openai, ReqLLM.Finch)
@@ -1387,11 +1765,20 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
       assert {:incomplete, <<0, 0>>} = event_stream.(<<0, 0>>, nil)
     end
 
-    test "decodes chat completion and messages events", %{gpt_oss: gpt_oss, claude: claude} do
+    test "decodes each Mantle stream wire format", %{
+      gpt_oss: gpt_oss,
+      gpt_5: gpt_5,
+      claude: claude
+    } do
       delta = %{data: %{"choices" => [%{"index" => 0, "delta" => %{"content" => "Hi"}}]}}
 
       assert {[%ReqLLM.StreamChunk{type: :content, text: "Hi"}], nil} =
                AmazonBedrock.decode_stream_event(delta, gpt_oss, nil)
+
+      delta = %{data: %{"event" => "response.output_text.delta", "delta" => "Hi"}}
+
+      assert {[%ReqLLM.StreamChunk{type: :content, text: "Hi"}], _state} =
+               AmazonBedrock.decode_stream_event(delta, gpt_5, nil)
 
       delta = %{
         event: "content_block_delta",
@@ -1408,6 +1795,36 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
                  claude,
                  AmazonBedrock.init_stream_state(claude)
                )
+    end
+
+    test "decodes buffered Responses payloads with the routed formatter", %{
+      context: context,
+      opts: opts,
+      gpt_5: model
+    } do
+      {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
+
+      payload = %{
+        "id" => "resp_123",
+        "model" => "openai.gpt-5.6-terra",
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "function_call",
+            "call_id" => "call_123",
+            "name" => "get_weather",
+            "arguments" => ~s({"location":"Boston"})
+          }
+        ],
+        "usage" => %{"input_tokens" => 8, "output_tokens" => 12}
+      }
+
+      {_request, response} =
+        AmazonBedrock.decode_response({request, %Req.Response{status: 200, body: payload}})
+
+      assert [tool_call] = response.body.message.tool_calls
+      assert tool_call.id == "call_123"
+      assert tool_call.function.name == "get_weather"
     end
 
     test "sends the project header each bedrock-mantle route takes", %{

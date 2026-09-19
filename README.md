@@ -53,6 +53,10 @@ That breadth extends well beyond chat: ReqLLM tracks **92 non-text operation mod
 | [Z.AI Coding Plan](https://llmcatalog.dev/?providers=zai_coding_plan) | `zai_coding_plan` | 5 | text | 4 | — |
 | [Zenmux](https://llmcatalog.dev/?providers=zenmux) | `zenmux` | 149 | text, image 2 | 107 | [Guide](guides/zenmux.md) |
 
+Local inference is also supported through [Ollama](guides/ollama.md) and
+[LM Studio](guides/lmstudio.md), using model identifiers from your local server
+without requiring LLMDB catalog entries.
+
 \* _Streaming uses Finch directly due to known Req limitations with SSE responses._
 
 ## Installation
@@ -207,6 +211,43 @@ ReqLLM.StreamResponse.tokens(response)
 # Access usage metadata after streaming
 usage = ReqLLM.StreamResponse.usage(response)
 ```
+
+## Evaluation models
+
+Evaluation models answer named questions about one text or JSON state. They do
+not need to support chat. `ReqLLM.evaluation_models/0` lists specs that
+ReqLLM can call. Set `TYPESAFE_API_KEY` or `OPENROUTER_API_KEY` in `.env`:
+
+```elixir
+questions = %{
+  department: %{
+    type: :choice,
+    instructions: "Which team should handle this?",
+    criteria: %{billing: "Billing and refunds", support: "Other requests"}
+  },
+  urgent: %{type: :boolean, instructions: "Is this urgent?"}
+}
+
+{:ok, result} = ReqLLM.evaluate("typesafe:jev-latest", %{message: "Refund me today"}, questions)
+{:ok, routed} = ReqLLM.evaluate("openrouter:typesafe/jev-1.13", "Refund me today", questions)
+{:ok, moving} = ReqLLM.evaluate("openrouter:~typesafe/jev-latest", "Refund me today", questions)
+result.object["department"]["choice"]
+result.object["department"]["probabilities"]
+result.object["urgent"]["probability"]
+result.usage.input_tokens
+```
+
+Jev also supports `:score` questions with an ordered `criteria` list. Answers
+use string keys. The `ReqLLM.Response` keeps the full provider response in
+`provider_meta.raw_response`, including TypeSafe's `noul` value. `:boolean` is
+the common ReqLLM name for that question. The moving OpenRouter ID keeps its
+leading `~` in the request. An unknown model ID requires a full inline model
+spec with evaluation capability and execution metadata. Catalog models without
+evaluation support and gateways without an adapter return an error before HTTP.
+See [OpenRouter](guides/openrouter.md) for the gateway contract and an inline
+model example.
+Use `generate_object/4` for text models that generate JSON objects; it is not a
+Jev endpoint. Jev does not support text generation or streaming.
 
 ## Features
 

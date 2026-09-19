@@ -155,7 +155,7 @@ defmodule ReqLLM.Providers.AmazonBedrock do
       type: {:in, [:runtime, :mantle]},
       default: :runtime,
       doc:
-        "Bedrock endpoint the request goes to: bedrock-runtime (InvokeModel/Converse), or bedrock-mantle — the OpenAI Chat Completions API for most model families, the Anthropic Messages API for Claude"
+        "Bedrock endpoint the request goes to: bedrock-runtime (InvokeModel/Converse), or bedrock-mantle (Responses for response-shaped models, Chat Completions for other compatible models, Messages for Claude)"
     ],
     project: [
       type: :string,
@@ -165,33 +165,76 @@ defmodule ReqLLM.Providers.AmazonBedrock do
     mantle_base_path: [
       type: {:in, ["/v1", "/openai/v1"]},
       doc:
-        "Base path of the Chat Completions route on bedrock-mantle. Default: `/openai/v1` for GPT-5, Gemma 4 and Grok models, `/v1` for every other family. Ignored for Claude and on bedrock-runtime"
+        "Base path of the OpenAI-compatible routes on bedrock-mantle. Default: `/openai/v1` for GPT-5, Gemma 4 and Grok models, `/v1` for every other family. Ignored for Claude and on bedrock-runtime"
+    ],
+    store: [
+      type: :boolean,
+      default: false,
+      doc:
+        "Store Mantle Responses input and output for later use. Defaults to false. Ignored on other routes"
     ],
     use_converse: [
       type: :boolean,
       doc: "Force use of Bedrock Converse API (default: auto-detect based on tools presence)"
+    ],
+    tool_search: [
+      type: :map,
+      doc: """
+      Claude only. Enable Anthropic's server-side tool search so tools marked
+      `provider_options: [anthropic: [defer_loading: true]]` load on demand:
+      - `variant` - `:bm25` (natural-language queries, default) or `:regex`
+
+      Tool search is served by InvokeModel only, so the request stays on the
+      native API (Converse is not auto-selected).
+      """
     ],
     additional_model_request_fields: [
       type: :map,
       doc:
         "Additional model-specific request fields (e.g., thinking config for Claude extended thinking)"
     ],
-    anthropic_prompt_cache: [
-      type: :boolean,
-      doc: "Enable Anthropic prompt caching for Claude models on Bedrock"
-    ],
-    anthropic_prompt_cache_ttl: [
+    guardrail_identifier: [
       type: :string,
-      doc: "TTL for cache (\"1h\" for one hour; omit for default ~5m)"
+      doc: "Bedrock Guardrail id or ARN applied to the request (bedrock-runtime only)"
     ],
-    anthropic_cache_messages: [
+    guardrail_version: [
+      type: :string,
+      doc:
+        "Guardrail version (\"DRAFT\" or a published number). Required with guardrail_identifier"
+    ],
+    guardrail_trace: [
+      type: {:in, ["enabled", "disabled", "enabled_full"]},
+      doc: "Guardrail trace detail returned in the response"
+    ],
+    prompt_cache: [
+      type: :boolean,
+      doc:
+        "Enable automatic prompt cache checkpoints after tools, system, and the `cache_messages` position"
+    ],
+    prompt_cache_ttl: [
+      type: {:in, ["5m", "1h"]},
+      doc: "TTL for automatic checkpoints. Omitted when unset"
+    ],
+    cache_messages: [
       type: {:or, [:boolean, :integer]},
       doc: """
-      Add cache breakpoint at a message position (requires anthropic_prompt_cache: true).
+      Add a checkpoint at a message position (requires prompt_cache: true).
       - `-1` or `true` - last message
       - `-2` - second-to-last, `-3` - third-to-last, etc.
       - `0` - first message, `1` - second, etc.
       """
+    ],
+    anthropic_prompt_cache: [
+      type: :boolean,
+      doc: "Alias of prompt_cache"
+    ],
+    anthropic_prompt_cache_ttl: [
+      type: :string,
+      doc: "Alias of prompt_cache_ttl"
+    ],
+    anthropic_cache_messages: [
+      type: {:or, [:boolean, :integer]},
+      doc: "Alias of cache_messages"
     ],
     anthropic_beta: [
       type: {:list, :string},
@@ -380,12 +423,10 @@ defmodule ReqLLM.Providers.AmazonBedrock do
     # (e.g., "global.anthropic.claude-opus-4-6-v1") when the original model spec had one.
     model_id = model.provider_model_id || model.id
 
-    # Check if we should use Converse API
-    # Priority: explicit use_converse option > prompt caching optimization > auto-detect from tools presence
     use_converse = determine_use_converse(model_id, opts)
 
     {endpoint_base, formatter, model_family} =
-      route(endpoint, model_id, use_converse, opts[:stream] == true, opts)
+      route(endpoint, model, use_converse, opts[:stream] == true, opts)
 
     operation = opts[:operation] || :chat
     compat_opts = Keyword.put(opts, :use_converse, use_converse)
@@ -410,9 +451,11 @@ defmodule ReqLLM.Providers.AmazonBedrock do
         :model_family,
         :use_converse,
         :operation,
+        :compiled_schema,
         :tools,
         :inference_profile_arn,
-        :endpoint
+        :endpoint,
+        :response_formatter
       ])
       |> Req.Request.merge_options(
         ReqLLM.Provider.Defaults.finch_option(request) ++
@@ -425,11 +468,14 @@ defmodule ReqLLM.Providers.AmazonBedrock do
             context: opts[:context],
             use_converse: use_converse,
             operation: opts[:operation],
-            tools: opts[:tools]
+            compiled_schema: opts[:compiled_schema],
+            tools: opts[:tools],
+            response_formatter: formatter
           ]
       )
 
-    model_body = formatter.format_request(model_id, context, opts)
+    model_body =
+      formatter.format_request(model_id, context, with_family_formatter(opts, model_id))
 
     # Add service_tier if specified (default is already "default")
     model_body =
@@ -545,14 +591,15 @@ defmodule ReqLLM.Providers.AmazonBedrock do
     model_id = model.provider_model_id || model.id
     endpoint = endpoint(translated_opts)
 
-    # Check if we should use Converse API
-    # Priority: explicit use_converse option > prompt caching optimization > auto-detect from tools presence
     use_converse = determine_use_converse(model_id, translated_opts)
 
     {path, formatter, model_family} =
-      route(endpoint, model_id, use_converse, true, translated_opts)
+      route(endpoint, model, use_converse, true, translated_opts)
 
-    translated_opts = Keyword.put(translated_opts, :use_converse, use_converse)
+    translated_opts =
+      translated_opts
+      |> Keyword.put(:use_converse, use_converse)
+      |> maybe_clean_thinking_after_translation(get_model_family(model_id), operation)
 
     context =
       ReqLLM.ToolCallIdCompat.apply_context(
@@ -564,7 +611,12 @@ defmodule ReqLLM.Providers.AmazonBedrock do
       )
 
     # Build request body with translated options
-    body = formatter.format_request(model_id, context, translated_opts)
+    body =
+      formatter.format_request(
+        model_id,
+        context,
+        with_family_formatter(translated_opts, model_id)
+      )
 
     # Add service_tier if specified (default is already "default")
     body =
@@ -656,7 +708,7 @@ defmodule ReqLLM.Providers.AmazonBedrock do
         get_formatter_module(model_family)
       end
 
-    decode_formatter_stream_event(formatter, event)
+    decode_formatter_stream_event(formatter, event) ++ guardrail_stream_chunks(event)
   end
 
   def decode_stream_event(_data, _model) do
@@ -674,12 +726,21 @@ defmodule ReqLLM.Providers.AmazonBedrock do
   end
 
   @impl ReqLLM.Provider
+  def decode_stream_event(%{data: %{"choices" => _}} = event, model, state) do
+    model_id = model.provider_model_id || model.id
+    openai = %{model | id: model_id, provider: :openai}
+    {ReqLLM.Provider.Defaults.default_decode_stream_event(event, openai), state}
+  end
+
   def decode_stream_event(%{data: _} = event, model, state) do
     model_id = model.provider_model_id || model.id
 
-    case mantle_wire(model_id) do
+    case mantle_wire(model) do
       :messages ->
         ReqLLM.Providers.Anthropic.Response.decode_stream_event(event, model, state)
+
+      :responses ->
+        ReqLLM.Providers.AmazonBedrock.Responses.decode_stream_event(event, model, state)
 
       :chat_completions ->
         openai = %{model | id: model_id, provider: :openai}
@@ -690,30 +751,63 @@ defmodule ReqLLM.Providers.AmazonBedrock do
   def decode_stream_event(event, model, state) when is_map(event) do
     model_id = model.provider_model_id || model.id
 
-    cond do
-      converse_event?(event) ->
-        {decode_formatter_stream_event(ReqLLM.Providers.AmazonBedrock.Converse, event), state}
+    {chunks, state} =
+      cond do
+        converse_event?(event) ->
+          state = state || init_stream_state(model) || %{}
 
-      get_model_family(model_id) == "anthropic" ->
-        ReqLLM.Providers.Anthropic.Response.decode_stream_event(%{data: event}, model, state)
+          {chunks, converse_state} =
+            ReqLLM.Providers.AmazonBedrock.Converse.decode_stream_event(event, state[:converse])
 
-      true ->
-        formatter = get_formatter_module(get_model_family(model_id))
-        {decode_formatter_stream_event(formatter, event), state}
-    end
+          {chunks, Map.put(state, :converse, converse_state)}
+
+        get_model_family(model_id) == "anthropic" ->
+          ReqLLM.Providers.Anthropic.Response.decode_stream_event(%{data: event}, model, state)
+
+        true ->
+          formatter = get_formatter_module(get_model_family(model_id))
+          {decode_formatter_stream_event(formatter, event), state}
+      end
+
+    {chunks ++ guardrail_stream_chunks(event), state}
   end
 
   def decode_stream_event(_event, _model, state) do
     {[], state}
   end
 
+  defp guardrail_stream_chunks(%{"amazon-bedrock-guardrailAction" => action} = event) do
+    meta = %{
+      provider_meta: Map.take(event, ["amazon-bedrock-guardrailAction", "amazon-bedrock-trace"])
+    }
+
+    meta =
+      if action == "INTERVENED", do: Map.put(meta, :finish_reason, :content_filter), else: meta
+
+    [ReqLLM.StreamChunk.meta(meta)]
+  end
+
+  defp guardrail_stream_chunks(_event), do: []
+
   @impl ReqLLM.Provider
   def flush_stream_state(model, state) do
     model_id = model.provider_model_id || model.id
 
-    case get_model_family(model_id) do
-      "anthropic" -> ReqLLM.Providers.Anthropic.Response.flush_stream_state(model, state)
-      _ -> {[], state}
+    {chunks, state} =
+      case get_model_family(model_id) do
+        "anthropic" -> ReqLLM.Providers.Anthropic.Response.flush_stream_state(model, state)
+        _ -> {[], state}
+      end
+
+    case state do
+      %{converse: converse_state} ->
+        {converse_chunks, converse_state} =
+          ReqLLM.Providers.AmazonBedrock.Converse.flush_stream_state(converse_state)
+
+        {chunks ++ converse_chunks, Map.put(state, :converse, converse_state)}
+
+      _ ->
+        {chunks, state}
     end
   end
 
@@ -982,10 +1076,16 @@ defmodule ReqLLM.Providers.AmazonBedrock do
   defp stream_accept(:mantle), do: "text/event-stream"
   defp stream_accept(:runtime), do: "application/vnd.amazon.eventstream"
 
-  defp route(:mantle, model_id, _use_converse, _stream?, opts) do
-    case mantle_wire(model_id) do
+  defp route(:mantle, model, _use_converse, _stream?, opts) do
+    model_id = request_model_id(model)
+
+    case mantle_wire(model) do
       :messages ->
         {"/anthropic/v1/messages", ReqLLM.Providers.AmazonBedrock.Anthropic, "anthropic"}
+
+      :responses ->
+        {mantle_base_path(model_id, opts) <> "/responses",
+         ReqLLM.Providers.AmazonBedrock.Responses, "openai"}
 
       :chat_completions ->
         {mantle_base_path(model_id, opts) <> "/chat/completions",
@@ -993,7 +1093,8 @@ defmodule ReqLLM.Providers.AmazonBedrock do
     end
   end
 
-  defp route(:runtime, model_id, true = _use_converse, stream?, opts) do
+  defp route(:runtime, model, true = _use_converse, stream?, opts) do
+    model_id = request_model_id(model)
     path_id = path_model_id(model_id, opts)
 
     path =
@@ -1014,7 +1115,8 @@ defmodule ReqLLM.Providers.AmazonBedrock do
     {path, formatter, :converse}
   end
 
-  defp route(:runtime, model_id, false = _use_converse, stream?, opts) do
+  defp route(:runtime, model, false = _use_converse, stream?, opts) do
+    model_id = request_model_id(model)
     path_id = path_model_id(model_id, opts)
 
     path =
@@ -1026,9 +1128,49 @@ defmodule ReqLLM.Providers.AmazonBedrock do
     {path, get_formatter_module(family), family}
   end
 
-  defp mantle_wire(model_id) do
-    if get_model_family(model_id) == "anthropic", do: :messages, else: :chat_completions
+  @doc false
+  def mantle_wire(model) do
+    model_id = request_model_id(model)
+
+    cond do
+      get_model_family(model_id) == "anthropic" -> :messages
+      mantle_responses_model?(model) -> :responses
+      true -> :chat_completions
+    end
   end
+
+  defp mantle_responses_model?(model) do
+    model_id = request_model_id(model)
+    openai_model_id = openai_model_id(model_id)
+
+    if String.starts_with?(openai_model_id, "gpt-oss") do
+      false
+    else
+      case provider_shape(model) do
+        "responses" -> true
+        "chat_completions" -> false
+        "chat" -> false
+        _ -> ReqLLM.Providers.OpenAI.AdapterHelpers.responses_model?(openai_model_id)
+      end
+    end
+  end
+
+  defp provider_shape(%LLMDB.Model{extra: extra}) when is_map(extra) do
+    case Map.get(extra, :provider) || Map.get(extra, "provider") do
+      provider when is_map(provider) -> Map.get(provider, :shape) || Map.get(provider, "shape")
+      _ -> nil
+    end
+  end
+
+  defp provider_shape(_), do: nil
+
+  defp openai_model_id(model_id) do
+    model_id
+    |> strip_region_prefix()
+    |> String.replace_prefix("openai.", "")
+  end
+
+  defp request_model_id(%LLMDB.Model{} = model), do: model.provider_model_id || model.id
 
   # Each model card states its bedrock-mantle base path:
   # https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html
@@ -1049,7 +1191,28 @@ defmodule ReqLLM.Providers.AmazonBedrock do
   defp route_headers(:mantle, _chat_completions, opts),
     do: project_header("openai-project", opts)
 
-  defp route_headers(:runtime, _model_family, _opts), do: []
+  defp route_headers(:runtime, :converse, _opts), do: []
+  defp route_headers(:runtime, _model_family, opts), do: guardrail_headers(opts)
+
+  defp guardrail_headers(opts) do
+    case provider_option(opts, :guardrail_identifier) do
+      nil ->
+        []
+
+      identifier ->
+        version =
+          provider_option(opts, :guardrail_version) ||
+            raise ArgumentError, "guardrail_version is required when guardrail_identifier is set"
+
+        [
+          {"x-amzn-bedrock-guardrailidentifier", identifier},
+          {"x-amzn-bedrock-guardrailversion", version}
+        ] ++ trace_header(provider_option(opts, :guardrail_trace))
+    end
+  end
+
+  defp trace_header(nil), do: []
+  defp trace_header(trace), do: [{"x-amzn-bedrock-trace", String.upcase(trace)}]
 
   defp project_header(name, opts) do
     case provider_option(opts, :project) do
@@ -1120,8 +1283,8 @@ defmodule ReqLLM.Providers.AmazonBedrock do
     # reasoning effort, etc.) for free
     model_family = get_model_family(model.provider_model_id || model.id)
 
-    case model_family do
-      "anthropic" ->
+    cond do
+      model_family == "anthropic" ->
         # Delegate temperature/top_p translation to Anthropic provider
         {translated_opts, warnings} =
           ReqLLM.Providers.Anthropic.translate_options(operation, model, opts)
@@ -1131,10 +1294,18 @@ defmodule ReqLLM.Providers.AmazonBedrock do
 
         {translated_opts, warnings}
 
-      _ ->
+      endpoint(opts) == :mantle and mantle_responses_model?(model) ->
+        ReqLLM.Providers.OpenAI.translate_options(operation, as_openai_model(model), opts)
+
+      true ->
         # Other model families: no translation needed yet
         {opts, []}
     end
+  end
+
+  defp as_openai_model(%LLMDB.Model{} = model) do
+    model_id = request_model_id(model)
+    %{model | provider: :openai, id: openai_model_id(model_id), provider_model_id: nil}
   end
 
   @impl ReqLLM.Provider
@@ -1228,7 +1399,7 @@ defmodule ReqLLM.Providers.AmazonBedrock do
       if req.options[:use_converse] do
         ReqLLM.Providers.AmazonBedrock.Converse
       else
-        get_formatter_module(req.options[:model_family])
+        req.options[:response_formatter] || get_formatter_module(req.options[:model_family])
       end
 
     parsed_body = ensure_parsed_body(resp.body)
@@ -1236,6 +1407,7 @@ defmodule ReqLLM.Providers.AmazonBedrock do
     # Let the formatter handle model-specific parsing
     case formatter.parse_response(parsed_body, req.options) do
       {:ok, formatted_response} ->
+        formatted_response = apply_guardrail_action(formatted_response, parsed_body)
         {req, %{resp | body: formatted_response}}
 
       {:error, reason} ->
@@ -1258,6 +1430,11 @@ defmodule ReqLLM.Providers.AmazonBedrock do
 
     {req, err}
   end
+
+  defp apply_guardrail_action(response, %{"amazon-bedrock-guardrailAction" => "INTERVENED"}),
+    do: %{response | finish_reason: :content_filter}
+
+  defp apply_guardrail_action(response, _body), do: response
 
   # A native request body is the declared model's; Bedrock validates it against
   # the model the profile serves and says only "schema violations" when they
@@ -1359,11 +1536,14 @@ defmodule ReqLLM.Providers.AmazonBedrock do
     end
   end
 
+  defp with_family_formatter(opts, model_id),
+    do: Keyword.put(opts, :formatter_module, get_formatter_module(get_model_family(model_id)))
+
   defp call_formatter(formatter, function, args) do
     apply(formatter, function, args)
   end
 
-  # Private helper: Determine whether to use Converse API with caching optimization
+  # Private helper: Determine whether to use Converse API
   defp determine_use_converse(model_id, opts) do
     endpoint(opts) == :runtime and runtime_use_converse?(model_id, opts)
   end
@@ -1391,36 +1571,17 @@ defmodule ReqLLM.Providers.AmazonBedrock do
 
       nil ->
         has_tools = opts[:tools] != nil and opts[:tools] != []
-        # After Options.process, anthropic_prompt_cache is in :provider_options
-        has_caching = get_in(opts, [:provider_options, :anthropic_prompt_cache]) == true
+        has_tool_search = is_map(provider_option(opts, :tool_search))
 
         cond do
-          # Formatters that require Converse API (like Mistral wrapper)
-          requires_converse ->
+          requires_converse or is_fallback_to_converse ->
             true
 
-          # Models without dedicated formatters fall back to Converse API
-          is_fallback_to_converse ->
-            true
-
-          # If caching is enabled with tools, force native API for full caching support
-          has_caching and has_tools ->
-            require Logger
-
-            Logger.warning("""
-            Bedrock prompt caching enabled with tools present. Auto-switching to native API
-            (use_converse: false) for full cache control. Converse API only caches system prompts.
-            To silence this warning, explicitly set use_converse: true or use_converse: false.
-            """)
-
+          has_tool_search ->
             false
-
-          # Default: use Converse for tools, native otherwise
-          has_tools ->
-            true
 
           true ->
-            false
+            has_tools
         end
     end
   end

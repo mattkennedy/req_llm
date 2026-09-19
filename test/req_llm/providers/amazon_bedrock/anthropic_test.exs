@@ -173,6 +173,47 @@ defmodule ReqLLM.Providers.AmazonBedrock.AnthropicTest do
     end
   end
 
+  describe "format_request/3 tool search" do
+    test "leads the tools list with the search tool and keeps defer_loading" do
+      context = Context.new([Context.user("Weather?")])
+
+      deferred =
+        ReqLLM.Tool.new!(
+          name: "get_weather",
+          description: "Weather for a city",
+          parameter_schema: [city: [type: :string, required: true]],
+          callback: fn _ -> {:ok, "sunny"} end,
+          provider_options: [anthropic: [defer_loading: true]]
+        )
+
+      body =
+        Anthropic.format_request("us.anthropic.claude-sonnet-4-6", context,
+          tools: [deferred],
+          provider_options: [tool_search: %{}]
+        )
+
+      assert [search, weather] = body[:tools]
+      assert search == %{type: "tool_search_tool_bm25_20251119", name: "tool_search_tool_bm25"}
+      assert weather[:name] == "get_weather"
+      assert weather[:defer_loading] == true
+    end
+
+    test "without the option the tools list is unchanged" do
+      context = Context.new([Context.user("Weather?")])
+
+      tool =
+        ReqLLM.Tool.new!(
+          name: "get_weather",
+          description: "Weather for a city",
+          parameter_schema: [city: [type: :string, required: true]],
+          callback: fn _ -> {:ok, "sunny"} end
+        )
+
+      body = Anthropic.format_request("us.anthropic.claude-sonnet-4-6", context, tools: [tool])
+      assert [%{name: "get_weather"}] = body[:tools]
+    end
+  end
+
   describe "format_request/3 tool_choice normalization" do
     test "normalizes atom :auto to Anthropic map format" do
       tool =
@@ -613,6 +654,56 @@ defmodule ReqLLM.Providers.AmazonBedrock.AnthropicTest do
       assert parsed.finish_reason == :stop
       # Should not have object field for :chat operation
       assert is_nil(parsed.object)
+    end
+  end
+
+  describe "prompt caching bridge" do
+    @model "anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+    test "generic options produce cache_control on system, tools, and message" do
+      context = Context.new([Context.system("Stable system"), Context.user("Hello")])
+
+      tool =
+        ReqLLM.Tool.new!(
+          name: "lookup",
+          description: "Lookup",
+          parameter_schema: [],
+          callback: fn _ -> {:ok, "x"} end
+        )
+
+      body =
+        Anthropic.format_request(@model, context,
+          tools: [tool],
+          prompt_cache: true,
+          prompt_cache_ttl: "1h",
+          cache_messages: true
+        )
+
+      assert [%{cache_control: %{type: "ephemeral", ttl: "1h"}}] = body[:system]
+      assert %{cache_control: %{type: "ephemeral", ttl: "1h"}} = List.last(body[:tools])
+
+      assert %{content: [%{cache_control: %{type: "ephemeral", ttl: "1h"}} | _]} =
+               List.last(body[:messages])
+    end
+
+    test "legacy anthropic_* options still work" do
+      context = Context.new([Context.system("Stable system"), Context.user("Hello")])
+      body = Anthropic.format_request(@model, context, anthropic_prompt_cache: true)
+
+      assert [%{cache_control: %{type: "ephemeral"}}] = body[:system]
+    end
+
+    test "applies on the mantle endpoint too" do
+      context = Context.new([Context.system("Stable system"), Context.user("Hello")])
+
+      body =
+        Anthropic.format_request(@model, context,
+          prompt_cache: true,
+          provider_options: [endpoint: :mantle]
+        )
+
+      assert body[:model] == @model
+      assert [%{cache_control: %{type: "ephemeral"}}] = body[:system]
     end
   end
 end

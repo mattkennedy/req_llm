@@ -147,6 +147,7 @@ defmodule ReqLLM.TupleModelOptionsTest do
       {:transcription, {:openai, "whisper-1", total_timeout: 1_000}},
       {:speech, {:openai, "tts-1", total_timeout: 1_000}},
       {:rerank, {:cohere, "rerank-v3.5", total_timeout: 1_000}},
+      {:evaluate, {:typesafe, "jev-latest", total_timeout: 1_000}},
       {:ocr, {:google_vertex, "mistral-ocr-2505", total_timeout: 1_000}},
       {:video, {:minimax, "MiniMax-H3", total_timeout: 1_000}}
     ]
@@ -155,6 +156,22 @@ defmodule ReqLLM.TupleModelOptionsTest do
       assert ReqLLM.ModelInput.merge_tuple_defaults(model, operation, []) ==
                [total_timeout: 1_000]
     end
+  end
+
+  test "evaluation tuple defaults use the Zoi option schema" do
+    tuple =
+      {:typesafe, "jev-latest",
+       api_key: "tuple-key", max_retries: 2, receive_timeout: 0, temperature: 0.5}
+
+    warning =
+      capture_io(:stderr, fn ->
+        merged = ReqLLM.ModelInput.merge_tuple_defaults(tuple, :evaluate, max_retries: 1)
+        send(self(), {:evaluation_options, merged})
+      end)
+
+    assert_receive {:evaluation_options, [api_key: "tuple-key", max_retries: 1]}
+    assert warning =~ ":receive_timeout has an invalid value"
+    assert warning =~ ":temperature is not accepted"
   end
 
   test "on_unsupported ignore suppresses tuple-default warnings" do
@@ -268,7 +285,7 @@ defmodule ReqLLM.TupleModelOptionsTest do
   end
 
   test "embedding tuple defaults change only the corresponding request key" do
-    stub_json(EmbeddingHTTP, embedding_response())
+    stub_embedding_json(EmbeddingHTTP)
     opts = openai_opts(EmbeddingHTTP)
 
     assert {:ok, _embedding} =
@@ -421,7 +438,7 @@ defmodule ReqLLM.TupleModelOptionsTest do
   end
 
   test "unsupported tuple defaults do not alter an applicable operation request" do
-    stub_json(EmbeddingHTTP, embedding_response())
+    stub_embedding_json(EmbeddingHTTP)
     opts = openai_opts(EmbeddingHTTP)
 
     assert {:ok, _embedding} =
@@ -453,6 +470,16 @@ defmodule ReqLLM.TupleModelOptionsTest do
     Req.Test.stub(owner, fn conn ->
       send(test_pid, {:request_body, owner, conn.body_params})
       Req.Test.json(conn, response)
+    end)
+  end
+
+  defp stub_embedding_json(owner) do
+    test_pid = self()
+
+    Req.Test.stub(owner, fn conn ->
+      dimensions = conn.body_params["dimensions"] || 2
+      send(test_pid, {:request_body, owner, conn.body_params})
+      Req.Test.json(conn, embedding_response(dimensions))
     end)
   end
 
@@ -520,9 +547,15 @@ defmodule ReqLLM.TupleModelOptionsTest do
     }
   end
 
-  defp embedding_response do
+  defp embedding_response(dimensions) do
     %{
-      "data" => [%{"embedding" => [0.1, 0.2], "index" => 0, "object" => "embedding"}],
+      "data" => [
+        %{
+          "embedding" => List.duplicate(0.1, dimensions),
+          "index" => 0,
+          "object" => "embedding"
+        }
+      ],
       "model" => "text-embedding-3-small",
       "object" => "list",
       "usage" => %{"prompt_tokens" => 1, "total_tokens" => 1}

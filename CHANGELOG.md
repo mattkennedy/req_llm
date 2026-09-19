@@ -9,6 +9,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- changelog -->
 
+## [v1.24.0](https://github.com/agentjido/req_llm/compare/v1.23.0...v1.24.0) (2026-09-17)
+
+
+
+
+### Features:
+
+* evaluation: add TypeSafe Jev evaluation API (#1022) by mikehostetler
+
+* lmstudio: add LM Studio provider (#1020) by Michael Mazurczak
+
+### Bug Fixes:
+
+* openai: keep replayed reasoning items at their own turn in Responses input (#1016) by Michael Mazurczak
+
+## [v1.23.0](https://github.com/agentjido/req_llm/compare/v1.22.0...v1.23.0) (2026-09-15)
+
+
+
+
+### Features:
+
+* add tool search for Anthropic, Bedrock, and OpenAI Responses (#1013) by mikehostetler
+
+* bedrock: support prompt caching on the Converse API (#1006) by adriencohen
+
+* bedrock: return document citations on the Converse API (#1005) by adriencohen
+
+* bedrock: send documents and video on the Converse API (#1004) by adriencohen
+
+* codex: support caller-owned turn attribution (#1003) by Danila Poyarkov
+
+* bedrock: guard selected content parts on the Converse API (#1002) by adriencohen
+
+* google: support validated function calling mode (#1001) by Javier Cuevas
+
+* bedrock: round-trip reasoning on the Converse API (#997) by adriencohen
+
+* bedrock: support guardrails (#995) by adriencohen
+
+* openai: keep a builtin tool call's status and mark failed calls as error spans (#991) by Vasilis Spilka
+
+### Bug Fixes:
+
+* bedrock: route Mantle models through the correct API (#1014) by mikehostetler
+
+* model: resolve prefixes consistently across spec formats (#1012) by mikehostetler
+
+* normalize numeric-string usage counters (#1009) by mikehostetler
+
+* codex: preserve session and prompt cache identity across transports (#996) by Danila Poyarkov
+
+* deps: update ex_doc and vulnerable igniter (#994) by dependabot[bot]
+
+* azure: accept include in provider_options for Responses API models (#990) by Vasilis Spilka
+
+## [v1.22.0](https://github.com/agentjido/req_llm/compare/v1.21.1...v1.22.0) (2026-09-04)
+
+
+
+
+### Features:
+
+* openai: add experimental GPT-6 Astra Responses support (#987) by mikehostetler
+
+* bedrock: serve requests through the bedrock-mantle endpoint (#979) by adriencohen
+
+* bedrock: support application inference profiles (#978) by adriencohen
+
+### Bug Fixes:
+
+* deps: update vulnerable example dependencies by mikehostetler
+
+* deps: allow monthly llm_db catalog updates (#988) by BlueHotDog
+
+* embedding: forward dimensions to compatible providers (#986) by mikehostetler
+
+* zai: include tool_call_id and name in tool result messages (#985) by Bill Huang
+
 ## [v1.21.1](https://github.com/agentjido/req_llm/compare/v1.21.0...v1.21.1) (2026-08-26)
 
 

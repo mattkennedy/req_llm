@@ -46,10 +46,12 @@ defmodule ReqLLM.Compatibility.ScenarioCatalog do
   ]
 
   @capabilities [
+    %{id: "astra", operation: :text},
     %{id: "core", operation: :text},
     %{id: "conversation", operation: :text},
     %{id: "streaming", operation: :text},
     %{id: "tools", operation: :text},
+    %{id: "prompt_cache", operation: :text},
     %{id: "objects", operation: :text},
     %{id: "reasoning", operation: :text},
     %{id: "embedding", operation: :embedding},
@@ -83,6 +85,41 @@ defmodule ReqLLM.Compatibility.ScenarioCatalog do
 
   @scenario_specs Enum.map(
                     [
+                      {"astra_async_tools", "astra",
+                       applicability: :focused,
+                       providers: [:openai],
+                       input_modalities: [:text, :tool_result],
+                       output_modalities: [:text, :tool_call],
+                       requirements: [:tool_calling],
+                       fixtures: [
+                         "astra_async_tools_1",
+                         "astra_async_tools_2",
+                         "astra_async_tools_3"
+                       ]},
+                      {"astra_async_streaming", "astra",
+                       applicability: :focused,
+                       providers: [:openai],
+                       output_modalities: [:text, :tool_call],
+                       requirements: [:tool_calling],
+                       transports: [:server_sent_events]},
+                      {"astra_reasoning_update", "astra",
+                       applicability: :focused,
+                       providers: [:openai],
+                       requirements: [:reasoning],
+                       fixtures: [
+                         "astra_reasoning_update_1",
+                         "astra_reasoning_update_2",
+                         "astra_reasoning_update_3"
+                       ]},
+                      {"astra_steering", "astra",
+                       applicability: :focused, providers: [:openai], transports: [:websocket]},
+                      {"astra_steering_pending", "astra",
+                       applicability: :focused,
+                       providers: [:openai],
+                       input_modalities: [:text, :tool_result],
+                       output_modalities: [:text, :tool_call],
+                       requirements: [:tool_calling],
+                       transports: [:websocket]},
                       {"basic", "core", []},
                       {"usage", "core", []},
                       {"token_limit", "core", []},
@@ -104,6 +141,18 @@ defmodule ReqLLM.Compatibility.ScenarioCatalog do
                        requirements: [:tool_calling],
                        applicability: :model_features,
                        fixtures: ["tool_round_trip_1", "tool_round_trip_2"]},
+                      {"sequential_tool_cache", "prompt_cache",
+                       input_modalities: [:text, :tool_result],
+                       output_modalities: [:text, :tool_call],
+                       requirements: [:tool_calling],
+                       applicability: :focused,
+                       providers: [:anthropic, :openai, :zai_coding_plan, :amazon_bedrock],
+                       fixtures: [
+                         "sequential_tool_cache_1",
+                         "sequential_tool_cache_2",
+                         "sequential_tool_cache_3",
+                         "sequential_tool_cache_4"
+                       ]},
                       {"object_basic", "objects",
                        output_modalities: [:structured_object],
                        requirements: [:object_generation],
@@ -275,8 +324,38 @@ defmodule ReqLLM.Compatibility.ScenarioCatalog do
   @routes [
     %{
       provider: :openai,
+      scenario: "astra_async_tools",
+      test_file: "test/coverage/openai/astra_test.exs"
+    },
+    %{
+      provider: :openai,
+      scenario: "astra_async_streaming",
+      test_file: "test/coverage/openai/astra_test.exs"
+    },
+    %{
+      provider: :openai,
+      scenario: "astra_reasoning_update",
+      test_file: "test/coverage/openai/astra_test.exs"
+    },
+    %{
+      provider: :openai,
+      scenario: "astra_steering",
+      test_file: "test/coverage/openai/astra_test.exs"
+    },
+    %{
+      provider: :openai,
+      scenario: "astra_steering_pending",
+      test_file: "test/coverage/openai/astra_test.exs"
+    },
+    %{
+      provider: :openai,
       scenario: "logprobs_non_streaming",
       test_file: "test/coverage/openai/logprobs_test.exs"
+    },
+    %{
+      provider: :openai,
+      scenario: "sequential_tool_cache",
+      test_file: "test/coverage/openai/sequential_tool_cache_test.exs"
     },
     %{
       provider: :openai,
@@ -292,6 +371,11 @@ defmodule ReqLLM.Compatibility.ScenarioCatalog do
       provider: :anthropic,
       scenario: "web_fetch_basic",
       test_file: "test/coverage/anthropic/web_fetch_test.exs"
+    },
+    %{
+      provider: :anthropic,
+      scenario: "sequential_tool_cache",
+      test_file: "test/coverage/anthropic/sequential_tool_cache_test.exs"
     },
     %{
       provider: :anthropic,
@@ -387,6 +471,16 @@ defmodule ReqLLM.Compatibility.ScenarioCatalog do
       provider: :xai,
       scenario: "x_search_streaming",
       test_file: "test/coverage/xai/web_search_test.exs"
+    },
+    %{
+      provider: :zai_coding_plan,
+      scenario: "sequential_tool_cache",
+      test_file: "test/coverage/zai_coding_plan/sequential_tool_cache_test.exs"
+    },
+    %{
+      provider: :amazon_bedrock,
+      scenario: "sequential_tool_cache",
+      test_file: "test/coverage/amazon_bedrock/sequential_tool_cache_test.exs"
     },
     %{
       provider: :xai,

@@ -1,7 +1,7 @@
 defmodule ReqLLM.MixProject do
   use Mix.Project
 
-  @version "1.21.1"
+  @version "1.24.0"
   @source_url "https://github.com/agentjido/req_llm"
 
   def project do
@@ -69,6 +69,7 @@ defmodule ReqLLM.MixProject do
           "guides/groq.md",
           "guides/openrouter.md",
           "guides/ollama.md",
+          "guides/lmstudio.md",
           "guides/amazon_bedrock.md",
           "guides/cerebras.md",
           "guides/deepseek.md",
@@ -123,6 +124,7 @@ defmodule ReqLLM.MixProject do
             "guides/groq.md",
             "guides/openrouter.md",
             "guides/ollama.md",
+            "guides/lmstudio.md",
             "guides/amazon_bedrock.md",
             "guides/cerebras.md",
             "guides/deepseek.md",
@@ -234,7 +236,7 @@ defmodule ReqLLM.MixProject do
       {:websockex, "~> 0.5.1"},
       {:zoi, "~> 0.14"},
       {:jsv, "~> 0.11"},
-      {:llm_db, "~> 2026.8.4"},
+      {:llm_db, ">= 2026.9.4 and < 2027.0.0"},
 
       # Dev/test dependencies
       {:bandit, "~> 1.8", only: [:dev, :test], runtime: false},

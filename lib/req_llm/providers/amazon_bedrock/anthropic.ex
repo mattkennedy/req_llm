@@ -10,16 +10,14 @@ defmodule ReqLLM.Providers.AmazonBedrock.Anthropic do
 
   ## Prompt Caching Support
 
-  Full Anthropic prompt caching is supported when using the native Bedrock API.
-  Enable with `anthropic_prompt_cache: true` option.
-
-  **Note**: Bedrock auto-switches to Converse API when tools are present (including
-  `:object` operations which use a synthetic tool). Converse API has limited caching
-  (only entire system prompts, no granular cache control). For full caching support,
-  set `use_converse: false` to force native API with tools/structured output.
+  Enable with `prompt_cache: true`. The Bedrock caching options are bridged to
+  Anthropic `cache_control` on both the native InvokeModel API and the
+  bedrock-mantle Messages API. With tools present the request routes through the
+  Converse API by default.
   """
 
   alias ReqLLM.Providers.AmazonBedrock
+  alias ReqLLM.Providers.AmazonBedrock.PromptCache
   alias ReqLLM.Providers.Anthropic
   alias ReqLLM.Providers.Anthropic.AdapterHelpers
 
@@ -100,7 +98,7 @@ defmodule ReqLLM.Providers.AmazonBedrock.Anthropic do
     |> AdapterHelpers.maybe_add_param(:stop_sequences, opts[:stop_sequences])
     |> AdapterHelpers.maybe_add_thinking(opts)
     |> maybe_add_tools(opts)
-    |> Anthropic.maybe_apply_prompt_caching(opts)
+    |> Anthropic.maybe_apply_prompt_caching(PromptCache.to_anthropic_opts(opts))
   end
 
   defp maybe_add_anthropic_beta(body, opts) do
@@ -138,12 +136,21 @@ defmodule ReqLLM.Providers.AmazonBedrock.Anthropic do
 
       tools when is_list(tools) ->
         anthropic_tools = Enum.map(tools, &tool_to_anthropic_format/1)
-        body = Map.put(body, :tools, anthropic_tools)
+        body = Map.put(body, :tools, search_tools(opts) ++ anthropic_tools)
 
         case Keyword.get(opts, :tool_choice) do
           nil -> body
           choice -> Map.put(body, :tool_choice, Anthropic.normalize_tool_choice(choice))
         end
+    end
+  end
+
+  # The server-side tool search tool leads the list, as on the native provider,
+  # when `provider_options: [tool_search: %{}]` is set.
+  defp search_tools(opts) do
+    case get_in(opts, [:provider_options, :tool_search]) do
+      config when is_map(config) -> [Anthropic.build_tool_search_tool(config)]
+      _none -> []
     end
   end
 

@@ -187,7 +187,15 @@ defmodule ReqLLM.Provider.Defaults.ResponseBuilder do
     |> put_tool_call_metadata(other, profile)
   end
 
-  defp put_tool_call_metadata(%ToolCall{} = call, _source, :buffered), do: call
+  # Buffered responses keep only the markers the caller acts on: the
+  # async flag, and the provider status of a builtin call (so a failed
+  # `web_search_call` reaches the OTel tool span as an error).
+  defp put_tool_call_metadata(%ToolCall{} = call, source, :buffered) do
+    ToolCall.put_metadata(
+      call,
+      Map.take(ToolCall.metadata(source), [:async, "async", :status, "status"])
+    )
+  end
 
   defp put_tool_call_metadata(%ToolCall{} = call, source, _profile) do
     ToolCall.put_metadata(call, ToolCall.metadata(source))
