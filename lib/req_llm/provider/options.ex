@@ -215,7 +215,7 @@ defmodule ReqLLM.Provider.Options do
 
                                # Internal streaming orchestration options
                                stream_transport: [
-                                 type: {:in, [:http, :websocket]},
+                                 type: {:in, [:http, :websocket, :in_process]},
                                  doc: "Internal streaming transport selected by ReqLLM.Streaming"
                                ],
                                defer_http_events_until_telemetry?: [
@@ -278,6 +278,7 @@ defmodule ReqLLM.Provider.Options do
 
   # Internal keys that bypass validation (framework concerns)
   @internal_keys [
+    :pricing_context,
     :api_key,
     :access_token,
     :on_finch_request,
@@ -380,7 +381,7 @@ defmodule ReqLLM.Provider.Options do
     check_provider_key_collisions!(provider_mod, user_opts)
 
     # Auto-hoist provider-specific top-level options into :provider_options
-    user_opts = auto_hoist_provider_options(provider_mod, user_opts)
+    user_opts = auto_hoist_provider_options(provider_mod, operation, user_opts)
 
     reasoning_advisory_options = flatten_options_for_advisories(user_opts)
 
@@ -641,9 +642,10 @@ defmodule ReqLLM.Provider.Options do
 
   The base URL is determined by the following precedence order (highest to lowest):
   1. `opts[:base_url]` - Explicitly passed in options
-  2. Application config - `Application.get_env(:req_llm, model.provider)[:base_url]`
-  3. Provider registry metadata - Loaded from provider's JSON metadata file
-  4. Provider default - `provider_mod.default_base_url()`
+  2. Model URL - `model.base_url`
+  3. Application config - `Application.get_env(:req_llm, model.provider)[:base_url]`
+  4. Provider registry metadata - Loaded from provider's JSON metadata file
+  5. Provider default - `provider_mod.default_base_url()`
 
   ## Parameters
 
@@ -663,19 +665,8 @@ defmodule ReqLLM.Provider.Options do
   """
   @spec effective_base_url(module(), LLMDB.Model.t(), keyword()) :: String.t()
   def effective_base_url(provider_mod, %LLMDB.Model{} = model, opts) do
-    from_model_opts =
-      if is_bitstring(model.base_url) do
-        model.base_url
-      end
-
-    from_opts = opts[:base_url]
-    from_config = base_url_from_application_config(model.provider)
-    from_metadata = base_url_from_provider_metadata(model.provider)
-    from_provider_default = provider_mod.default_base_url()
-
-    result = from_model_opts || from_opts || from_config || from_metadata || from_provider_default
-
-    result
+    opts[:base_url] || model.base_url || base_url_from_application_config(model.provider) ||
+      base_url_from_provider_metadata(model.provider) || provider_mod.default_base_url()
   end
 
   @doc """
@@ -762,13 +753,13 @@ defmodule ReqLLM.Provider.Options do
 
           :error ->
             raise ReqLLM.Error.Invalid.Parameter.exception(
-                    parameter: "unknown string provider option #{inspect(key)}"
+                    parameter: "unknown string provider option name"
                   )
         end
 
-      {key, _value} ->
+      {_key, _value} ->
         raise ReqLLM.Error.Invalid.Parameter.exception(
-                parameter: "invalid provider option key #{inspect(key)}"
+                parameter: "invalid provider option key; expected an atom or string"
               )
     end)
     |> reject_normalized_map_collisions!()
@@ -788,7 +779,6 @@ defmodule ReqLLM.Provider.Options do
 
   defp extract_model_options(%LLMDB.Model{} = model, opts) do
     maybe_extract_max_tokens(model, opts)
-    |> maybe_extract_model_base_url(model)
   end
 
   defp maybe_extract_model_options(:image, _model, opts), do: opts
@@ -839,14 +829,6 @@ defmodule ReqLLM.Provider.Options do
 
   defp model_output_limit(%LLMDB.Model{}), do: nil
 
-  defp maybe_extract_model_base_url(opts, %LLMDB.Model{} = model) do
-    if is_bitstring(model.base_url) do
-      Keyword.put(opts, :base_url, model.base_url)
-    else
-      opts
-    end
-  end
-
   defp normalize_stop_sequences(opts) do
     case Keyword.pop(opts, :stop_sequences) do
       {nil, rest} -> rest
@@ -881,10 +863,10 @@ defmodule ReqLLM.Provider.Options do
     end
   end
 
-  defp auto_hoist_provider_options(provider_mod, opts) do
+  defp auto_hoist_provider_options(provider_mod, operation, opts) do
     if function_exported?(provider_mod, :provider_schema, 0) do
       provider_schema = provider_mod.provider_schema()
-      provider_keys = Keyword.keys(provider_schema.schema)
+      provider_keys = Keyword.keys(provider_schema.schema) -- hoist_protected_keys(operation)
 
       {provider_specific, rest} = Keyword.split(opts, provider_keys)
 
@@ -899,6 +881,12 @@ defmodule ReqLLM.Provider.Options do
       opts
     end
   end
+
+  # Image options such as :response_format share a name with chat-only provider
+  # options; on the image path they must stay top-level and validate against
+  # the image schema instead of being hoisted into :provider_options.
+  defp hoist_protected_keys(:image), do: Keyword.keys(ReqLLM.Images.schema().schema)
+  defp hoist_protected_keys(_operation), do: []
 
   defp compose_schema_internal(base_schema, provider_mod) do
     if function_exported?(provider_mod, :provider_schema, 0) do
@@ -1145,11 +1133,7 @@ defmodule ReqLLM.Provider.Options do
   end
 
   defp inject_base_url_from_registry(opts, model, provider_mod) do
-    Keyword.put_new_lazy(opts, :base_url, fn ->
-      base_url_from_application_config(model.provider) ||
-        base_url_from_provider_metadata(model.provider) ||
-        provider_mod.default_base_url()
-    end)
+    Keyword.put(opts, :base_url, effective_base_url(provider_mod, model, opts))
   end
 
   defp base_url_from_provider_metadata(provider) do

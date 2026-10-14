@@ -134,6 +134,7 @@ defmodule ReqLLM.EvaluationTest do
       assert conn.body_params == %{
                "model" => "typesafe/jev-1.13",
                "state" => %{"ticket" => "Please refund me today"},
+               "provider" => %{"zdr" => true},
                "questions" => %{
                  "department" => %{
                    "type" => "choice",
@@ -182,6 +183,7 @@ defmodule ReqLLM.EvaluationTest do
                %{ticket: "Please refund me today"},
                @questions,
                api_key: "openrouter-test-key",
+               provider_options: [openrouter_provider: %{zdr: true}],
                req_http_options: [plug: {Req.Test, __MODULE__.OpenRouterSuccess}]
              )
 
@@ -204,6 +206,7 @@ defmodule ReqLLM.EvaluationTest do
     Req.Test.stub(__MODULE__.OpenRouterMoving, fn conn ->
       assert conn.request_path == "/api/alpha/decisions"
       assert conn.body_params["model"] == "~typesafe/jev-latest"
+      refute Map.has_key?(conn.body_params, "provider")
 
       Req.Test.json(conn, %{
         "model" => "typesafe/jev-1.13",
@@ -225,8 +228,100 @@ defmodule ReqLLM.EvaluationTest do
     assert result.object["urgent"]["probability"] == 0.75
   end
 
+  test "calls OpenAI Decisions through the public evaluation API" do
+    Req.Test.stub(__MODULE__.OpenAIDecisions, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/v1/decisions"
+      assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer openai-test-key"]
+
+      assert conn.body_params == %{
+               "model" => "gpt-6-luna",
+               "input" => ~s({"ticket":"Please refund me today"}),
+               "safety_identifier" => "tenant-123",
+               "questions" => [
+                 %{
+                   "name" => "department",
+                   "type" => "choice",
+                   "instructions" => "Which team should handle this?",
+                   "choices" => [
+                     %{"description" => "Billing and refunds", "value" => "billing"},
+                     %{"description" => "Other requests", "value" => "support"}
+                   ]
+                 },
+                 %{
+                   "name" => "severity",
+                   "type" => "score",
+                   "instructions" => "How severe is this?",
+                   "levels" => [
+                     %{"label" => "low"},
+                     %{"label" => "medium"},
+                     %{"label" => "high"}
+                   ]
+                 },
+                 %{
+                   "name" => "urgent",
+                   "type" => "predicate",
+                   "instructions" => "Is this urgent?"
+                 }
+               ]
+             }
+
+      Req.Test.json(conn, openai_decisions_body())
+    end)
+
+    assert {:ok, result} =
+             ReqLLM.evaluate(
+               "openai:gpt-6-luna",
+               %{ticket: "Please refund me today"},
+               @questions,
+               api_key: "openai-test-key",
+               provider_options: [openai: [safety_identifier: "tenant-123"]],
+               req_http_options: [plug: {Req.Test, __MODULE__.OpenAIDecisions}]
+             )
+
+    assert result.object["department"]["choice"] == "billing"
+    assert result.object["severity"]["score"] == 1.0
+    assert result.object["urgent"] == %{"type" => "boolean", "probability" => 0.91}
+    assert result.usage.compute_units == 3
+    refute result.usage.billing_usage_complete
+    assert result.provider_meta["api_type"] == "decisions"
+    assert result.provider_meta.raw_response["future_field"] == true
+
+    assert {:ok, decoded} =
+             Response.decode_response(result.provider_meta.raw_response, "openai:gpt-6-luna")
+
+    assert decoded.object == result.object
+  end
+
+  test "rejects invalid OpenAI Decisions input before authentication or HTTP" do
+    no_http = [plug: fn _conn -> flunk("unexpected HTTP request") end]
+
+    assert {:error, %ReqLLM.Error.Invalid.Parameter{parameter: collision}} =
+             ReqLLM.evaluate(
+               "openai:gpt-6-luna",
+               "text",
+               %{"risk" => @questions.urgent, risk: @questions.urgent},
+               req_http_options: no_http
+             )
+
+    assert collision =~ "question name collision"
+
+    assert {:error, %ReqLLM.Error.Invalid.Parameter{parameter: safety}} =
+             ReqLLM.evaluate(
+               "openai:gpt-6-luna",
+               "text",
+               %{urgent: @questions.urgent},
+               provider_options: [safety_identifier: String.duplicate("x", 129)],
+               req_http_options: no_http
+             )
+
+    assert safety =~ "safety_identifier"
+  end
+
   test "lists only evaluation specs with a callable adapter" do
     assert ReqLLM.evaluation_models() == [
+             "azure:microsoft-decision-1",
+             "openai:gpt-6-luna",
              "openrouter:typesafe/jev-1.13",
              "openrouter:~typesafe/jev-latest",
              "typesafe:jev-1.13.0",
@@ -239,6 +334,38 @@ defmodule ReqLLM.EvaluationTest do
       assert model.capabilities.evaluate == true
       assert model.execution.evaluate.supported == true
     end
+  end
+
+  defp openai_decisions_body do
+    %{
+      "model" => "gpt-6-luna",
+      "answers" => [
+        %{
+          "name" => "department",
+          "type" => "choice",
+          "choice" => "billing",
+          "confidence" => 0.8,
+          "probabilities" => [
+            %{"value" => "billing", "probability" => 0.8},
+            %{"value" => "support", "probability" => 0.2}
+          ]
+        },
+        %{
+          "name" => "severity",
+          "type" => "score",
+          "score" => 1.0,
+          "confidence" => 0.7,
+          "probabilities" => [
+            %{"label" => "low", "value" => 0, "probability" => 0.1},
+            %{"label" => "medium", "value" => 1, "probability" => 0.7},
+            %{"label" => "high", "value" => 2, "probability" => 0.2}
+          ]
+        },
+        %{"name" => "urgent", "type" => "predicate", "probability" => 0.91}
+      ],
+      "usage" => %{"input_tokens" => 20, "output_tokens" => 3, "compute_units" => 3},
+      "future_field" => true
+    }
   end
 
   test "rejects unknown models, non-evaluation models, and missing adapters before HTTP" do
@@ -400,12 +527,14 @@ defmodule ReqLLM.EvaluationTest do
                receive_timeout: 1_000,
                total_timeout: :infinity,
                max_retries: 0,
+               provider_options: [openrouter_provider: %{zdr: true}],
                req_http_options: [plug: {Req.Test, __MODULE__.Success}],
                fixture: {:typesafe, "basic"},
                telemetry: %{test: true}
              )
 
     assert opts[:total_timeout] == :infinity
+    assert opts[:provider_options] == [openrouter_provider: %{zdr: true}]
     assert opts[:req_http_options] == [plug: {Req.Test, __MODULE__.Success}]
     assert opts[:telemetry] == %{test: true}
     assert {:ok, [telemetry: [test: true]]} = Zoi.parse(schema, telemetry: [test: true])
@@ -416,6 +545,8 @@ defmodule ReqLLM.EvaluationTest do
       [receive_timeout: 0],
       [total_timeout: 0],
       [max_retries: -1],
+      [provider_options: :invalid],
+      [openrouter_provider: %{zdr: true}],
       [req_http_options: [1]],
       [req_http_options: [{"plug", :invalid}]],
       [fixture: {:typesafe, 123}],
@@ -431,6 +562,15 @@ defmodule ReqLLM.EvaluationTest do
 
     assert {:error, %ReqLLM.Error.Invalid.Parameter{}} =
              ReqLLM.evaluate("typesafe:jev-latest", "text", @questions, [1])
+
+    assert {:error, %ReqLLM.Error.Invalid.Parameter{parameter: provider_error}} =
+             ReqLLM.evaluate("openrouter:typesafe/jev-1.13", "text", @questions,
+               api_key: "openrouter-test-key",
+               provider_options: [openrouter_provider: []],
+               req_http_options: [plug: fn _conn -> flunk("unexpected HTTP request") end]
+             )
+
+    assert provider_error =~ "provider_options[:openrouter_provider] must be a map"
   end
 
   test "reports unsupported operations without a chat request" do

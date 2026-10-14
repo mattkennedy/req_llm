@@ -70,7 +70,15 @@ defmodule ReqLLM.Providers.OpenAI.ChatAPI do
 
   @impl true
   def decode_stream_event(event, model) do
-    ReqLLM.Provider.Defaults.default_decode_stream_event(event, model)
+    chunks = ReqLLM.Provider.Defaults.default_decode_stream_event(event, model)
+
+    case event do
+      %{data: %{"service_tier" => tier}} ->
+        [ReqLLM.StreamChunk.meta(%{provider_meta: %{"service_tier" => tier}}) | chunks]
+
+      _ ->
+        chunks
+    end
   end
 
   defp build_request_headers(model, opts) do
@@ -101,8 +109,9 @@ defmodule ReqLLM.Providers.OpenAI.ChatAPI do
       |> Keyword.delete(:compiled_schema)
       |> Keyword.put(:stream, true)
       |> Keyword.put(:base_url, base_url)
+      |> Keyword.put(:req_llm_model, model)
 
-    body = Request.build_body(context, model.id, cleaned_opts, :chat)
+    body = Request.build_body(context, model.provider_model_id || model.id, cleaned_opts, :chat)
     url = build_request_url(cleaned_opts)
 
     encoded = body |> ReqLLM.Schema.apply_property_ordering() |> Jason.encode!()

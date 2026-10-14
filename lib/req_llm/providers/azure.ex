@@ -24,6 +24,7 @@ defmodule ReqLLM.Providers.Azure do
   - Multi-modal inputs (text and images)
   - Structured output generation
   - Extended thinking (Claude models)
+  - Decision evaluation (Microsoft-Decision models)
 
   ## Key Differences from Direct Provider APIs
 
@@ -213,6 +214,7 @@ defmodule ReqLLM.Providers.Azure do
     default_base_url: "",
     default_env_key: "AZURE_API_KEY"
 
+  alias ReqLLM.Evaluation.Codec
   alias ReqLLM.Providers.Anthropic.PlatformReasoning
   alias ReqLLM.Providers.OpenAI.AdapterHelpers
 
@@ -221,6 +223,11 @@ defmodule ReqLLM.Providers.Azure do
   @default_api_version "2025-04-01-preview"
   @default_foundry_api_version "2024-05-01-preview"
   @anthropic_version "2023-06-01"
+
+  @evaluation_provider_schema Zoi.keyword(
+                                [deployment: Zoi.string() |> Zoi.min(1)],
+                                unrecognized_keys: :error
+                              )
 
   @provider_schema [
     api_version: [
@@ -291,10 +298,48 @@ defmodule ReqLLM.Providers.Azure do
       doc:
         "Responses API include values, such as reasoning.encrypted_content for reasoning signatures or web_search_call.action.sources for the sources a web search consulted (OpenAI Responses API models only)"
     ],
+    reasoning_summary: [
+      type: {:or, [:string, {:in, [:auto, :concise, :detailed]}]},
+      doc:
+        "Controls whether the model returns a human-readable summary of its reasoning (auto, concise, detailed). OpenAI Responses API models only."
+    ],
+    reasoning_context: [
+      type: {:or, [{:in, [:current_turn, :all_turns]}, {:in, ["current_turn", "all_turns"]}]},
+      doc:
+        "Which earlier reasoning items the model renders into context (current_turn or all_turns). OpenAI Responses API models only."
+    ],
+    context_management: [
+      type: {:list, {:or, [{:map, {:or, [:atom, :string]}, :any}, :keyword_list]}},
+      doc:
+        "Responses API context_management entries, such as [%{type: \"compaction\", compact_threshold: 200_000}] for server-side compaction. OpenAI Responses API models only."
+    ],
+    store: [
+      type: :boolean,
+      doc:
+        "Whether to store responses for multi-turn chaining via previous_response_id. Set to false for stateless replay. OpenAI Responses API models only."
+    ],
+    previous_response_id: [
+      type: :string,
+      doc:
+        "Previous response ID to continue from, for chaining or compaction. OpenAI Responses API models only."
+    ],
+    prompt_cache_key: [
+      type: :string,
+      doc: "Stable key for prompt-cache matching. OpenAI Responses API models only."
+    ],
     verbosity: [
       type: {:or, [:atom, :string]},
       doc:
         "Constrains the verbosity of the model's response. Supported values: 'low', 'medium', 'high'. Defaults to 'medium'. (OpenAI models only)"
+    ],
+    openai_logprobs: [
+      type: :boolean,
+      doc: "Whether to return log probabilities of output tokens"
+    ],
+    openai_top_logprobs: [
+      type: {:in, 0..20},
+      doc:
+        "Number of most likely tokens to return at each position (0–20, requires openai_logprobs: true)"
     ]
   ]
 
@@ -362,6 +407,7 @@ defmodule ReqLLM.Providers.Azure do
   - `:object` - Structured output generation (uses tools for OpenAI, native for Claude)
   - `:embedding` - Vector embeddings (OpenAI embedding models only)
   - `:image` - Image generation and editing (gpt-image models only)
+  - `:evaluate` - Decision evaluation via Microsoft's Foundry SystemOne endpoint
   """
   @impl ReqLLM.Provider
   def prepare_request(:chat, model_spec, prompt, opts) do
@@ -419,8 +465,137 @@ defmodule ReqLLM.Providers.Azure do
     do_prepare_image_request(model_spec, prompt, opts)
   end
 
+  def prepare_request(:evaluate, model_spec, input, opts) do
+    do_prepare_evaluation_request(model_spec, input, opts)
+  end
+
+  def prepare_request(:compact, model_spec, context, opts) do
+    with {:ok, model} <- ReqLLM.model(model_spec),
+         :ok <- ensure_responses_model(model),
+         {:ok, context} <- ReqLLM.Context.normalize(context, opts),
+         opts_with_context = compact_request_opts(model, context, opts),
+         {:ok, processed_opts} <-
+           ReqLLM.Provider.Options.process(__MODULE__, :compact, model, opts_with_context) do
+      model_id = effective_model_id(model)
+      http_opts = Keyword.get(opts, :req_http_options, [])
+      {api_version, deployment, base_url} = extract_azure_credentials(model, processed_opts)
+      path = get_compact_endpoint_path(api_version, base_url)
+
+      body =
+        __MODULE__.ResponsesAPI.format_compact_request(model_id, context, processed_opts)
+        |> maybe_add_model_for_foundry(deployment, base_url)
+
+      req_keys = supported_provider_options() ++ @common_req_keys
+      default_timeout = default_timeout_for_model(model_id, processed_opts)
+
+      request =
+        Req.new(
+          [
+            url: path,
+            method: :post,
+            json: body,
+            receive_timeout: Keyword.get(processed_opts, :receive_timeout, default_timeout)
+          ] ++ http_opts
+        )
+        |> Req.Request.register_options(req_keys)
+        |> Req.Request.merge_options(
+          Keyword.take(processed_opts, req_keys) ++ [model: model.id, base_url: base_url]
+        )
+        |> Req.Request.put_private(:model, model)
+        |> Req.Request.put_private(:formatter, __MODULE__.ResponsesAPI)
+        |> attach(model, processed_opts)
+
+      {:ok, request}
+    end
+  end
+
   def prepare_request(operation, model_spec, input, opts) do
     ReqLLM.Provider.Defaults.prepare_request(__MODULE__, operation, model_spec, input, opts)
+  end
+
+  defp do_prepare_evaluation_request(model_spec, %{state: state, questions: questions}, opts) do
+    with {:ok, model} <- ReqLLM.model(model_spec),
+         {:ok, opts} <- ReqLLM.Provider.Options.normalize_flat_provider_options(__MODULE__, opts),
+         :ok <- validate_evaluation_options(opts) do
+      opts = Keyword.put_new(opts, :base_url, model.base_url)
+      base_url = resolve_base_url("microsoft-decision", opts)
+      validate_base_url!(base_url)
+      deployment = get_evaluation_deployment_with_warning(model, opts)
+      {api_key, _option_keys} = resolve_api_key("microsoft-decision", model, opts)
+      {header, value} = build_auth_header(api_key, "microsoft-decision", base_url)
+      timeout = Keyword.get(opts, :receive_timeout, 30_000)
+      http_opts = Keyword.get(opts, :req_http_options, [])
+
+      request =
+        Req.new(
+          [
+            url: "/providers/microsoft/v1/systemone",
+            base_url: base_url,
+            method: :post,
+            receive_timeout: timeout,
+            json: %{
+              model: deployment,
+              state: state,
+              questions: Codec.normalize_questions(questions)
+            }
+          ] ++ ReqLLM.Provider.Defaults.merge_finch_options(http_opts, pool_timeout: timeout)
+        )
+        |> Req.Request.register_options([:operation, :model])
+        |> Req.Request.merge_options(operation: :evaluate, model: model.id)
+        |> Req.Request.put_private(:model, model)
+        |> Req.Request.put_header(header, value)
+        |> ReqLLM.Step.Retry.attach(opts)
+        |> ReqLLM.Step.Error.attach()
+        |> Req.Request.append_response_steps(llm_decode_response: &decode_response/1)
+        |> ReqLLM.Step.Usage.attach(model)
+        |> ReqLLM.Step.Telemetry.attach(model, opts)
+        |> ReqLLM.Step.Fixture.maybe_attach(model, opts)
+
+      {:ok, request}
+    end
+  rescue
+    error in ReqLLM.Error.Invalid.Parameter ->
+      {:error, error}
+
+    error in ArgumentError ->
+      {:error, ReqLLM.Error.Invalid.Parameter.exception(parameter: Exception.message(error))}
+  end
+
+  defp validate_evaluation_options(opts) do
+    provider_options = Keyword.get(opts, :provider_options, [])
+
+    case Zoi.parse(@evaluation_provider_schema, provider_options) do
+      {:ok, _validated} ->
+        :ok
+
+      {:error, _errors} ->
+        {:error,
+         ReqLLM.Error.Invalid.Parameter.exception(
+           parameter:
+             "Azure evaluation provider_options only accepts a non-empty deployment string"
+         )}
+    end
+  end
+
+  defp compact_request_opts(model, context, opts) do
+    model_family = model |> effective_model_id() |> get_model_family()
+
+    opts
+    |> Keyword.put(:context, context)
+    |> Keyword.put(:operation, :compact)
+    |> Keyword.put(:base_url, resolve_base_url(model_family, opts))
+  end
+
+  defp ensure_responses_model(%LLMDB.Model{} = model) do
+    if uses_responses_api?(model) do
+      :ok
+    else
+      {:error,
+       ReqLLM.Error.Invalid.Parameter.exception(
+         parameter:
+           "model: compact_context requires an Azure OpenAI Responses API model (wire protocol openai_responses), got #{effective_model_id(model)}"
+       )}
+    end
   end
 
   defp do_prepare_chat_request(model_spec, prompt, opts) do
@@ -712,6 +887,24 @@ defmodule ReqLLM.Providers.Azure do
   """
   @impl ReqLLM.Provider
   def decode_response(
+        {%Req.Request{options: %{operation: :evaluate}} = request, %{status: status} = response}
+      )
+      when status in 200..299 do
+    decode_evaluation_response(request, response)
+  end
+
+  def decode_response(
+        {%Req.Request{
+           private: %{
+             req_llm_model: %LLMDB.Model{capabilities: %{evaluate: true, chat: false}}
+           }
+         } = request, %{status: status} = response}
+      )
+      when status in 200..299 do
+    decode_evaluation_response(request, response)
+  end
+
+  def decode_response(
         {%Req.Request{options: %{operation: :image}} = request, %{status: status} = response}
       )
       when status in 200..299 do
@@ -768,6 +961,23 @@ defmodule ReqLLM.Providers.Azure do
      )}
   end
 
+  defp decode_evaluation_response(request, response) do
+    body = ReqLLM.Provider.Utils.ensure_parsed_body(response.body)
+
+    case Codec.decode_response(body, :azure) do
+      {:ok, result} ->
+        {request, %{response | body: result}}
+
+      :error ->
+        {request,
+         ReqLLM.Error.API.Response.exception(
+           reason: "Invalid Azure evaluation response",
+           status: response.status,
+           response_body: body
+         )}
+    end
+  end
+
   defp extract_error_message(body) when is_map(body) do
     case body do
       %{"error" => %{"message" => message, "type" => type, "code" => code}} ->
@@ -805,11 +1015,67 @@ defmodule ReqLLM.Providers.Azure do
       raise ReqLLM.Error.Invalid.Provider.exception(provider: model.provider)
     end
 
+    case opts[:operation] || :chat do
+      :image -> attach_image_stream(model, context, opts)
+      operation -> attach_chat_stream(model, context, opts, operation)
+    end
+  rescue
+    error ->
+      Logger.error(
+        "Failed to build Azure stream request: #{Exception.message(error)}\n" <>
+          "Stacktrace: #{Exception.format_stacktrace(__STACKTRACE__)}"
+      )
+
+      {:error,
+       ReqLLM.Error.API.Request.exception(
+         reason: "Failed to build Azure stream request: #{Exception.message(error)}"
+       )}
+  end
+
+  defp attach_image_stream(model, context, opts) do
+    model_id = effective_model_id(model)
+    model_family = get_model_family(model_id)
+
+    with :ok <- validate_image_model(model_id),
+         :ok <- ReqLLM.Images.OpenAICompatible.validate_options(opts),
+         :ok <- ReqLLM.Images.OpenAICompatible.validate_stream_options(opts),
+         {:ok, prompt} <- ReqLLM.Images.OpenAICompatible.prompt_from_context(context),
+         processed_opts = process_image_stream_options(model, model_family, context, opts),
+         :ok <- validate_image_output_format(processed_opts),
+         {api_version, deployment, base_url} = extract_azure_credentials(model, processed_opts),
+         {:ok, path} <- get_image_endpoint_path(:generation, deployment, api_version, base_url) do
+      {api_key, _extra_option_keys} = resolve_api_key(model_family, model, processed_opts)
+
+      headers =
+        ReqLLM.Images.OpenAICompatible.stream_request_headers(
+          [build_auth_header(api_key, model_family, base_url)],
+          processed_opts
+        )
+
+      body =
+        processed_opts
+        |> ReqLLM.Images.OpenAICompatible.stream_generation_body(prompt, model_id)
+        |> Map.delete("model")
+        |> maybe_add_model_for_foundry(deployment, base_url)
+
+      {:ok, Finch.build(:post, join_url(base_url, path), headers, Jason.encode!(body))}
+    end
+  end
+
+  defp process_image_stream_options(model, model_family, context, opts) do
+    ReqLLM.Provider.Options.process_stream!(
+      __MODULE__,
+      :image,
+      model,
+      context,
+      Keyword.put(opts, :base_url, resolve_base_url(model_family, opts))
+    )
+  end
+
+  defp attach_chat_stream(model, context, opts, operation) do
     model_id = effective_model_id(model)
     model_family = get_model_family(model_id)
     resolved_base_url = resolve_base_url(model_family, opts)
-
-    operation = opts[:operation] || :chat
 
     processed_opts =
       ReqLLM.Provider.Options.process_stream!(
@@ -866,17 +1132,6 @@ defmodule ReqLLM.Providers.Azure do
     encoded = body |> ReqLLM.Schema.apply_property_ordering() |> Jason.encode!()
     finch_request = Finch.build(:post, url, headers, encoded)
     {:ok, finch_request}
-  rescue
-    error ->
-      Logger.error(
-        "Failed to build Azure stream request: #{Exception.message(error)}\n" <>
-          "Stacktrace: #{Exception.format_stacktrace(__STACKTRACE__)}"
-      )
-
-      {:error,
-       ReqLLM.Error.API.Request.exception(
-         reason: "Failed to build Azure stream request: #{Exception.message(error)}"
-       )}
   end
 
   @doc """
@@ -903,6 +1158,15 @@ defmodule ReqLLM.Providers.Azure do
   @impl ReqLLM.Provider
   def decode_stream_event(event, model, state) do
     model_id = effective_model_id(model)
+
+    if ReqLLM.Images.OpenAICompatible.gpt_image_model?(model_id) do
+      {ReqLLM.Images.OpenAICompatible.decode_stream_event(event, model), state}
+    else
+      decode_formatter_stream_event(event, model, model_id, state)
+    end
+  end
+
+  defp decode_formatter_stream_event(event, model, model_id, state) do
     formatter = get_formatter(model_id, model)
 
     cond do
@@ -936,6 +1200,20 @@ defmodule ReqLLM.Providers.Azure do
   Delegates to the model-family formatter for provider-specific usage extraction.
   """
   @impl ReqLLM.Provider
+  def extract_usage(
+        %ReqLLM.Response{provider_meta: %{operation: :evaluate}, usage: usage},
+        _model
+      )
+      when is_map(usage),
+      do: {:ok, usage}
+
+  def extract_usage(
+        %{"answers" => _answers, "usage" => usage},
+        %LLMDB.Model{capabilities: %{evaluate: true}}
+      )
+      when is_map(usage),
+      do: {:ok, usage}
+
   def extract_usage(body, model) do
     model_id = effective_model_id(model)
     formatter = get_formatter(model_id, model)
@@ -1006,22 +1284,69 @@ defmodule ReqLLM.Providers.Azure do
   Delegates to the model-specific formatter (Azure.OpenAI or Azure.Anthropic).
   This handles model-specific requirements like reasoning parameter translation.
 
+  `openai_logprobs` and `openai_top_logprobs` are only sent on Azure OpenAI Chat
+  Completions. Other Azure paths (Responses API, Claude, embeddings, images)
+  emit a warning and drop the options instead of rejecting the request.
+
   Note: This is not yet a formal Provider callback but is called by
   Options.process/4 if the provider exports it.
   """
   def pre_validate_options(operation, model, opts) do
     model_id = effective_model_id(model)
     formatter = get_formatter(model_id, model)
+    {opts, logprobs_warnings} = unsupported_logprobs(operation, formatter, opts)
 
-    if function_exported?(formatter, :pre_validate_options, 3) do
-      call_formatter(formatter, :pre_validate_options, [operation, model, opts])
+    {opts, formatter_warnings} =
+      if function_exported?(formatter, :pre_validate_options, 3) do
+        call_formatter(formatter, :pre_validate_options, [operation, model, opts])
+      else
+        {opts, []}
+      end
+
+    {opts, logprobs_warnings ++ formatter_warnings}
+  end
+
+  @logprobs_option_keys [:openai_logprobs, :openai_top_logprobs]
+  @unsupported_logprobs_warning "openai_logprobs and openai_top_logprobs apply only to Azure OpenAI Chat Completions. This request uses a different Azure path, so logprobs will be ignored."
+
+  defp call_formatter(formatter, function, args) do
+    apply(formatter, function, args)
+  end
+
+  defp unsupported_logprobs(operation, formatter, opts) do
+    if logprobs_requested?(opts) and not azure_openai_chat_completions?(operation, formatter) do
+      {drop_logprobs_options(opts), [@unsupported_logprobs_warning]}
     else
       {opts, []}
     end
   end
 
-  defp call_formatter(formatter, function, args) do
-    apply(formatter, function, args)
+  defp azure_openai_chat_completions?(operation, formatter)
+       when operation in [:chat, :object] do
+    formatter == __MODULE__.OpenAI
+  end
+
+  defp azure_openai_chat_completions?(_operation, _formatter), do: false
+
+  defp logprobs_requested?(opts) do
+    provider_opts = Keyword.get(opts, :provider_options, [])
+
+    Keyword.get(opts, :openai_logprobs) == true or
+      Keyword.get(provider_opts, :openai_logprobs) == true or
+      Keyword.has_key?(opts, :openai_top_logprobs) or
+      Keyword.has_key?(provider_opts, :openai_top_logprobs)
+  end
+
+  defp drop_logprobs_options(opts) do
+    opts = Keyword.drop(opts, @logprobs_option_keys)
+
+    case Keyword.get(opts, :provider_options) do
+      provider_opts when is_list(provider_opts) ->
+        Keyword.put(opts, :provider_options, Keyword.drop(provider_opts, @logprobs_option_keys))
+
+      _ ->
+        opts
+    end
   end
 
   @doc """
@@ -1184,6 +1509,8 @@ defmodule ReqLLM.Providers.Azure do
     end
   end
 
+  defp build_auth_header(api_key, "microsoft-decision", _base_url), do: {"api-key", api_key}
+
   defp build_auth_header(api_key, "claude", _base_url) do
     {"x-api-key", api_key}
   end
@@ -1210,6 +1537,23 @@ defmodule ReqLLM.Providers.Azure do
       )
 
       model.id
+    end
+  end
+
+  defp get_evaluation_deployment_with_warning(model, opts) do
+    case get_in(opts, [:provider_options, :deployment]) do
+      deployment when is_binary(deployment) ->
+        deployment
+
+      _ ->
+        Logger.warning(
+          "No deployment specified for Azure evaluation model '#{model.id}'. " <>
+            "Defaulting to '#{model.id}' as deployment name. " <>
+            "Set provider_options: [azure: [deployment: \"your-deployment-name\"]] " <>
+            "to avoid this warning."
+        )
+
+        model.id
     end
   end
 
@@ -1329,7 +1673,7 @@ defmodule ReqLLM.Providers.Azure do
         {:error,
          ReqLLM.Error.Invalid.Parameter.exception(
            parameter:
-             "output_format: #{inspect(format)} is not supported for Azure image models; use :png or :jpeg"
+             "output_format: #{inspect(format)} is not supported for Azure image models; use :png or :jpeg (:webp is OpenAI only)"
          )}
     end
   end
@@ -1364,6 +1708,14 @@ defmodule ReqLLM.Providers.Azure do
 
       true ->
         get_chat_endpoint_path_by_family(model_id, deployment, api_version, base_url)
+    end
+  end
+
+  defp get_compact_endpoint_path(api_version, base_url) do
+    if uses_v1_ga_format?(base_url) do
+      "/responses/compact"
+    else
+      "/responses/compact?api-version=#{api_version}"
     end
   end
 

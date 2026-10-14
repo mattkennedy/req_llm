@@ -58,6 +58,36 @@ mix mc --sample
 mix mc --sample anthropic
 ```
 
+### Catalog community providers
+
+The shared coverage suite can test a provider without a registered provider
+module. The model must have an LLMDB execution contract. The provider must have
+a base URL and bearer authentication metadata. Registered modules take priority.
+
+LLM API uses this path with `llm_db` 2026.10.2 or later. Set `LLMAPI_API_KEY`
+or `LLM_API_KEY` in the local `.env` file. The development catalog filter includes
+`llmapi`. Use one exact model to keep a live run small:
+
+```bash
+mix mc "llmapi:gpt-4o-mini" --scenario basic --record --max-concurrency 1
+mix mc "llmapi:gpt-4o-mini" \
+  --scenario basic,streaming,usage,token_limit,context_append,tool_multi,tool_none,tool_round_trip,object_basic \
+  --max-concurrency 1
+```
+
+The second command replays the committed fixtures. To record those scenarios,
+add `--record`. Do not use `llmapi:* --record` for a small validation run.
+Catalog entries can describe an API contract before the provider accepts the
+model. On 2026-10-09, all nine listed GPT-4o mini scenarios passed live. The
+published ID `qwen/qwen3.8-flash` returned `404 model_not_found`; its unprefixed
+ID also failed. The adapter keeps the declared wire ID and reports the error.
+It does not infer another model ID from an upstream route.
+
+The tests in `test/req_llm/llmapi_catalog_billing_test.exs` run without API calls.
+They compare buffered and streamed usage, provider identity in telemetry,
+independent decimal rates, and the provider's cost fields. Text streaming needs
+a streaming contract. Object tests need a separate object execution contract.
+
 ### GPT-6 Astra Launch Fixtures
 
 Use `llm_db` 2026.9.1 or later to resolve `openai:gpt-6-astra`. Run the standard
@@ -568,3 +598,18 @@ The fixture-based testing system provides:
 - **Easy provider addition** with minimal boilerplate
 
 This system is how ReqLLM backs up the claim of "135+ supported models" - each one has fixture evidence of passing comprehensive capability tests.
+
+## Billing evidence recording
+
+Use `mix req_llm.billing record` for bounded billing-specific live work.
+It runs ExUnit cases, writes JSONL evidence to a new run directory, and retains
+failures for review. `mix req_llm.billing audit --run ...` checks saved data
+offline. `promote` is a separate action after manual review. See the
+[Usage and Billing guide](usage-and-billing.md#billing-validation-suite) for
+commands, artifact fields, and reference calculations.
+
+`REQ_LLM_FIXTURE_REPLAY_ROOT` is an explicit test-only override for buffered
+and streamed fixture lookup. It permits review of a staged run without copying
+it into the committed fixture tree. Missing staged files fail; they do not
+start a provider request. Existing replay requests still have to match their
+recorded method, URL, and canonical JSON.

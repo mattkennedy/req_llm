@@ -53,6 +53,9 @@ That breadth extends well beyond chat: ReqLLM tracks **92 non-text operation mod
 | [Z.AI Coding Plan](https://llmcatalog.dev/?providers=zai_coding_plan) | `zai_coding_plan` | 5 | text | 4 | — |
 | [Zenmux](https://llmcatalog.dev/?providers=zenmux) | `zenmux` | 149 | text, image 2 | 107 | [Guide](guides/zenmux.md) |
 
+StepFun chat, speech, and transcription use the `stepfun_ai` (Global) and
+`stepfun` (China) providers. See the [StepFun guide](guides/stepfun.md).
+
 Local inference is also supported through [Ollama](guides/ollama.md) and
 [LM Studio](guides/lmstudio.md), using model identifiers from your local server
 without requiring LLMDB catalog entries.
@@ -136,6 +139,10 @@ result.repairs      # visible legacy or callback repair attempts
 {:ok, image_response} = ReqLLM.generate_image("openai:gpt-image-1.5", "A simple red square")
 image_bytes = ReqLLM.Response.image_data(image_response)
 File.write!("red_square.png", image_bytes)
+
+# Stream preview frames while the final image renders (OpenAI and Azure gpt-image models)
+{:ok, image_stream} = ReqLLM.stream_image("openai:gpt-image-1.5", "A simple red square", partial_images: 2)
+image_stream |> ReqLLM.StreamResponse.images() |> Enum.each(&IO.inspect(&1.metadata))
 ```
 
 Note: Google image models gemini-2.5-flash-image and gemini-3-pro-image-preview reject :n; specify the image count in the prompt.
@@ -216,7 +223,7 @@ usage = ReqLLM.StreamResponse.usage(response)
 
 Evaluation models answer named questions about one text or JSON state. They do
 not need to support chat. `ReqLLM.evaluation_models/0` lists specs that
-ReqLLM can call. Set `TYPESAFE_API_KEY` or `OPENROUTER_API_KEY` in `.env`:
+ReqLLM can call. Set `TYPESAFE_API_KEY`, `OPENROUTER_API_KEY`, or `OPENAI_API_KEY` in `.env`:
 
 ```elixir
 questions = %{
@@ -231,6 +238,10 @@ questions = %{
 {:ok, result} = ReqLLM.evaluate("typesafe:jev-latest", %{message: "Refund me today"}, questions)
 {:ok, routed} = ReqLLM.evaluate("openrouter:typesafe/jev-1.13", "Refund me today", questions)
 {:ok, moving} = ReqLLM.evaluate("openrouter:~typesafe/jev-latest", "Refund me today", questions)
+{:ok, decision} =
+  ReqLLM.evaluate("openai:gpt-6-luna", %{message: "Refund me today"}, questions,
+    provider_options: [openai: [safety_identifier: "tenant-123"]]
+  )
 result.object["department"]["choice"]
 result.object["department"]["probabilities"]
 result.object["urgent"]["probability"]
@@ -244,10 +255,59 @@ the common ReqLLM name for that question. The moving OpenRouter ID keeps its
 leading `~` in the request. An unknown model ID requires a full inline model
 spec with evaluation capability and execution metadata. Catalog models without
 evaluation support and gateways without an adapter return an error before HTTP.
-See [OpenRouter](guides/openrouter.md) for the gateway contract and an inline
-model example.
+OpenAI Decisions accepts string, map, and list state with boolean, choice, and score questions.
+It returns refusals as `%{"type" => "refusal"}`. If OpenAI reports positive compute units without a
+known tariff, ReqLLM keeps the count and leaves the cost unknown.
+See [OpenRouter](guides/openrouter.md) for the gateway contract and an inline model example. See
+[OpenAI](guides/openai.md) for the Decisions contract.
 Use `generate_object/4` for text models that generate JSON objects; it is not a
 Jev endpoint. Jev does not support text generation or streaming.
+
+## Model routers
+
+`ReqLLM.Router` is a behaviour for application-defined model routers. The
+application router is a struct that implements one callback. ReqLLM gives it a
+normalized request, and the callback returns a concrete `%LLMDB.Model{}`.
+
+```elixir
+defmodule MyApp.ModelRouter do
+  @behaviour ReqLLM.Router
+
+  defstruct fast_model: "openai:gpt-4o-mini",
+            deep_model: "anthropic:claude-sonnet-4-5"
+
+  @impl true
+  def resolve(router, %ReqLLM.Router.Request{} = request) do
+    model_spec =
+      case request.routing_context do
+        %{mode: :deep} -> router.deep_model
+        _other -> router.fast_model
+      end
+
+    ReqLLM.model(model_spec)
+  end
+end
+
+router = %MyApp.ModelRouter{}
+
+ReqLLM.generate_text(router, "Hello",
+  reasoning_effort: :medium,
+  routing_context: %{mode: :fast}
+)
+```
+
+The request has only two fields:
+
+- `context` contains the normalized conversation and tools.
+- `routing_context` contains opaque application data for model selection.
+
+ReqLLM passes `routing_context` unchanged. It does not add the generation
+operation, streaming state, output schema, provider credentials, generation
+options, or transport options. If model selection needs one of these values,
+the application must include it explicitly in `routing_context`.
+
+The callback can use local rules, Jev, or another service. ReqLLM does not
+include a built-in model-selection policy.
 
 ## Features
 
@@ -275,6 +335,7 @@ Jev endpoint. Jev does not support text generation or streaming.
 - **Provider-specific capabilities**
   - Anthropic web search for real-time content access (via `provider_options: [web_search: %{max_uses: 5}]`)
   - Extended thinking/reasoning for supported models
+  - OpenAI Responses reasoning summaries, `reasoning.context` and context compaction (`ReqLLM.compact_context/3`) on OpenAI and Azure
   - Prompt caching for cost optimization
   - All provider-specific options documented in provider guides
 
@@ -411,13 +472,14 @@ response.usage
 #     input_tokens: 8,
 #     output_tokens: 12,
 #     total_tokens: 20,
+#     pricing: %{status: :priced, currency: "USD", total: 0.0006},
 #     input_cost: 0.00024,
 #     output_cost: 0.00036,
 #     total_cost: 0.0006
 #   }
 ```
 
-ReqLLM treats pricing as an observability and estimation feature, not an invoice guarantee. When provider billing accuracy matters, compare these values against your own provider-side reporting. See the [Pricing Policy](guides/pricing-policy.md) guide for the full contract and known limitations.
+ReqLLM treats pricing as an observability and estimation feature, not an invoice guarantee. Conditional tariffs need caller-confirmed facts in `pricing_context`. If usage or tariff selection is incomplete, `pricing.status` is `:unknown` and numeric cost fields are absent; when the provider returns no usage, `response.usage` may be `nil`. When provider billing accuracy matters, compare these values against your own provider-side reporting. See the [Usage & Billing](guides/usage-and-billing.md) and [Pricing Policy](guides/pricing-policy.md) guides.
 
 ### Tool & Image Usage
 
@@ -630,9 +692,11 @@ mix test
 # Run quality checks
 mix quality  # format, compile, credo --strict, dialyzer
 
-# Generate documentation
+# Generate HTML and Markdown documentation
 mix docs
 ```
+
+Documentation is generated in `doc/`, including Markdown pages and `llms.txt`.
 
 ### Testing with Fixtures
 

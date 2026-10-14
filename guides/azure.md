@@ -1,6 +1,6 @@
 # Azure
 
-Access AI models through Microsoft Azure's enterprise cloud platform. Supports OpenAI models (GPT-4, GPT-4o, o1, o3 series) and Anthropic Claude models with full tool calling and streaming support.
+Access AI models through Microsoft Azure's enterprise cloud platform. Supports OpenAI models (GPT-4, GPT-4o, o1, o3 series), Anthropic Claude models with tool calling and streaming support, and Microsoft Decision models for evaluation.
 
 ## Configuration
 
@@ -77,7 +77,90 @@ Passed via `:provider_options` keyword or as top-level options:
 - **Fallback**: `AZURE_OPENAI_API_KEY` env var
 - **Example**: `api_key: "your-api-key"`
 
+### `openai_logprobs`
+
+- **Type**: Boolean
+- **Purpose**: Return output-token log probabilities from Azure OpenAI Chat Completions
+- **Scope**: Chat Completions only. Catalog specs such as `"azure:gpt-4o"` currently
+  route to the Responses API, which does not send these fields. Use an explicit
+  Chat Completions model spec (`%{provider: :azure, id: "gpt-4o"}`) so the request
+  hits `/chat/completions`. Other Azure paths (Responses, Claude, embeddings,
+  images) continue without logprobs after a warning.
+- **Example**: `provider_options: [openai_logprobs: true]`
+
+### `openai_top_logprobs`
+
+- **Type**: Integer from 0 to 20
+- **Purpose**: Return the most likely tokens at each output position
+- **Requires**: `openai_logprobs: true`
+- **Scope**: Same Chat Completions limitation as `openai_logprobs`
+- **Example**: `provider_options: [openai_logprobs: true, openai_top_logprobs: 3]`
+
 ## Examples
+
+### Microsoft-Decision-1 evaluation
+
+Microsoft-Decision-1 scores a state against named boolean, choice, and score
+questions. Call `ReqLLM.evaluate/4` with your Foundry **resource root** as
+`base_url` and your deployment name in `provider_options`:
+
+```elixir
+model = ReqLLM.model!(%{
+  provider: :azure,
+  id: "microsoft-decision-1",
+  provider_model_id: "Microsoft-Decision-1",
+  capabilities: %{chat: false, evaluate: true},
+  execution: %{
+    evaluate: %{
+      supported: true,
+      family: "typesafe_systemone",
+      wire_protocol: "typesafe_systemone",
+      path: "/providers/microsoft/v1/systemone",
+      provider_model_id: "Microsoft-Decision-1"
+    }
+  }
+})
+
+{:ok, response} = ReqLLM.evaluate(
+  model,
+  %{ticket: "Checkout fails for every customer"},
+  %{
+    urgent: %{type: :boolean, instructions: "Does this require immediate attention?"},
+    team: %{
+      type: :choice,
+      instructions: "Which team should handle this?",
+      criteria: %{engineering: "Software defects", billing: "Payments and refunds"}
+    }
+  },
+  base_url: "https://my-resource.services.ai.azure.com",
+  api_key: System.fetch_env!("AZURE_API_KEY"),
+  provider_options: [azure: [deployment: "my-decision-deployment"]]
+)
+
+response.object["urgent"]["probability"]
+response.object["team"]["choice"]
+response.usage
+```
+
+LLMDB 2026.10.3 includes this model. You can replace the explicit `model` with
+`"azure:microsoft-decision-1"`. `ReqLLM.evaluation_models/0` lists available
+catalog entries that have an evaluation adapter.
+
+The endpoint is `/providers/microsoft/v1/systemone`, with the deployment name
+in the request body. Use a resource root without `/openai`, `/models`, or a
+project path. This API does not use an `api-version` query parameter. API keys
+use the `api-key` header; pass `api_key: "Bearer #{token}"` for an Entra ID
+token. `AZURE_BASE_URL`, `AZURE_API_KEY`, and the usual Azure application
+configuration are also supported.
+
+The adapter maps boolean questions to the API's `noul` format and returns their
+scores as `probability`. Choice and score answers retain their probabilities,
+confidence, and score legends. The original data is available in
+`response.provider_meta.raw_response`. This model supports evaluation rather
+than chat generation or streaming.
+
+See [Microsoft's deployment and API guide](https://learn.microsoft.com/en-us/azure/foundry/foundry-models/how-to/use-foundry-models-microsoft-decision)
+for question definitions and deployment instructions.
 
 ### Basic Usage (OpenAI)
 
@@ -88,6 +171,24 @@ Passed via `:provider_options` keyword or as top-level options:
   base_url: "https://my-resource.openai.azure.com/openai",
   deployment: "my-gpt4-deployment"
 )
+```
+
+### Chat Completions logprobs
+
+Catalog specs such as `"azure:gpt-4o"` may route to the Responses API. Pass an
+explicit Chat Completions model spec so `openai_logprobs` reaches
+`/chat/completions`:
+
+```elixir
+{:ok, response} = ReqLLM.generate_text(
+  %{provider: :azure, id: "gpt-4o"},
+  "Reply with one word.",
+  base_url: "https://my-resource.openai.azure.com/openai",
+  deployment: "my-gpt4-deployment",
+  provider_options: [openai_logprobs: true, openai_top_logprobs: 3]
+)
+
+response.provider_meta[:logprobs]
 ```
 
 ### Basic Usage (Anthropic Claude)
@@ -191,6 +292,7 @@ Notes:
 - Cost is billed per token for these models. `response.usage` carries the `input_tokens`/`output_tokens` reported by the Images API alongside `image_usage`.
 - `aspect_ratio` resolves to the nearest size the model offers (`"16:9"` → `1536x1024`); an explicit `size` wins. `seed` and `negative_prompt` are rejected up front, since the Images API has no such fields.
 - Azure supports `:png` and `:jpeg` output. ReqLLM rejects `output_format: :webp` before it sends the request.
+- The GPT Image options work as on OpenAI: `background: :transparent` (PNG output), `output_compression` with `output_format: :jpeg`, `input_fidelity` on edits, and `quality: :auto | :low | :medium | :high` (plus `:xhigh | :max` where the deployed model offers them). `moderation` is forwarded unchanged; Azure does not document it, so a rejection surfaces as an API error.
 - Non-image models are rejected before the request is sent — `azure:gpt-4o` and `azure:claude-*` both return `ReqLLM.Error.Invalid.Parameter` rather than failing at the API.
 - Image responses expose provider metadata under `response.provider_meta["azure"]`.
 
@@ -224,6 +326,62 @@ schema = [
   reasoning_effort: :medium
 )
 ```
+
+### Responses API (reasoning summaries, reasoning context, compaction)
+
+GPT-5 family and codex models are routed to the Responses API: `/responses` on
+the v1 GA base URL, or `/responses?api-version=...` on the legacy base URL. The
+request body is built by the same encoder as the OpenAI provider, so the
+Responses-only options work under the `azure:` namespace too:
+
+```elixir
+{:ok, response} =
+  ReqLLM.generate_text(
+    "azure:gpt-5.4",
+    "Solve this carefully",
+    base_url: "https://my-resource.openai.azure.com/openai",
+    deployment: "gpt-5.4",
+    reasoning_effort: :medium,
+    provider_options: [
+      reasoning_summary: :auto,
+      reasoning_context: :current_turn,
+      store: false
+    ]
+  )
+```
+
+- `reasoning_summary` (`:auto | :concise | :detailed`): summaries are decoded into
+  `message.reasoning_details`; streaming emits `:thinking` chunks with
+  `summary_index` metadata and `reasoning_summary_part` meta chunks at part
+  boundaries.
+- `reasoning_context` (`:current_turn | :all_turns`): which earlier reasoning items
+  the model renders (GPT-5.4 and later; GPT-5.6 defaults to `:all_turns`).
+- `store`, `previous_response_id`, `prompt_cache_key`: stateless replay and
+  response chaining.
+- `context_management`: server-side compaction, e.g.
+  `[%{type: "compaction", compact_threshold: 200_000}]`.
+
+Manual compaction uses `ReqLLM.compact_context/3`, which posts to
+`/responses/compact` on the v1 GA base URL (`https://<resource>.openai.azure.com/openai/v1`).
+The legacy `api-version` surface answers `/responses/compact?api-version=...`
+with a server error at the time of writing, so use the v1 GA base URL for
+compaction:
+
+```elixir
+{:ok, compacted} =
+  ReqLLM.compact_context("azure:gpt-5.4", first.context,
+    base_url: "https://my-resource.openai.azure.com/openai",
+    deployment: "gpt-5.4"
+  )
+
+next = ReqLLM.Context.append(compacted.context, ReqLLM.Context.user("Add a booking form."))
+```
+
+The compacted context preserves the complete returned API window, including retained messages and tool items, in its original order. Do not remove items from this window before the next request.
+
+Compaction items come back as `:provider_block` content parts and are replayed
+automatically on later requests. See the [OpenAI guide](openai.md#context-compaction-responses-api)
+for the full flow.
 
 ## Supported Models
 
@@ -269,6 +427,7 @@ schema = [
 ### OpenAI Models
 - **Endpoint**: `/deployments/{deployment}/chat/completions`
 - **API**: OpenAI Chat Completions format (model field omitted)
+- **Responses API models**: `/responses` and `/responses/compact` (deployment sent as the body `model` on v1 GA and Foundry URLs)
 
 ### Anthropic Models
 - **Endpoint**: `/v1/messages` (model specified in request body)

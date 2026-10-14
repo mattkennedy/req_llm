@@ -316,7 +316,8 @@ defmodule ReqLLM.Providers.Minimax do
   end
 
   @impl ReqLLM.Provider
-  def translate_options(:image, _model, opts), do: {opts, []}
+  def translate_options(:image, _model, opts),
+    do: ReqLLM.Images.drop_openai_only_options(opts, "MiniMax")
 
   def translate_options(:video, _model, opts), do: {opts, []}
 
@@ -418,29 +419,6 @@ defmodule ReqLLM.Providers.Minimax do
       _ ->
         ReqLLM.Provider.Defaults.default_decode_response(args)
     end
-  end
-
-  @impl ReqLLM.Provider
-  def attach_stream(model, context, opts, finch_name) do
-    processed_opts =
-      ReqLLM.Provider.Options.process_stream!(
-        __MODULE__,
-        opts[:operation] || :chat,
-        model,
-        context,
-        opts
-      )
-
-    base_url = ReqLLM.Provider.Options.effective_base_url(__MODULE__, model, processed_opts)
-    opts_with_base_url = Keyword.put(processed_opts, :base_url, base_url)
-
-    ReqLLM.Provider.Defaults.default_attach_stream(
-      __MODULE__,
-      model,
-      context,
-      opts_with_base_url,
-      finch_name
-    )
   end
 
   @impl ReqLLM.Provider

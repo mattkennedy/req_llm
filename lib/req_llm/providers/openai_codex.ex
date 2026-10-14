@@ -292,10 +292,11 @@ defmodule ReqLLM.Providers.OpenAICodex do
 
   @impl ReqLLM.Provider
   def decode_stream_event(event, model, state) do
-    normalized_event = normalize_stream_event!(event)
+    normalized_event = normalize_stream_event(event)
     ResponsesAPI.decode_stream_event(normalized_event, model, state)
   end
 
+  @impl ReqLLM.Provider
   def stream_transport(_model, opts) do
     provider_opts = Keyword.get(opts, :provider_options, [])
     session = Keyword.get(provider_opts, :openai_websocket_session)
@@ -452,8 +453,22 @@ defmodule ReqLLM.Providers.OpenAICodex do
 
   defp build_codex_body(context, %LLMDB.Model{} = model, opts, request) do
     opts = opts |> ensure_provider_options() |> force_store_false()
-    body = ResponsesAPI.build_request_body(context, effective_model_id(model), opts, request)
     provider_opts = provider_options(opts)
+
+    body_opts =
+      if tool_resume_context?(context, provider_opts),
+        do: opts |> Map.new() |> Map.delete(:responses_transport),
+        else: opts
+
+    body =
+      ResponsesAPI.build_request_body(
+        context,
+        effective_model_id(model),
+        body_opts,
+        request,
+        model.provider
+      )
+
     instructions = extract_instructions(context) || ""
 
     body =
@@ -532,6 +547,15 @@ defmodule ReqLLM.Providers.OpenAICodex do
 
   defp provider_options_store_false(_provider_opts), do: [store: false]
 
+  defp tool_resume_context?(context, provider_opts) do
+    tool_outputs = provider_opts[:tool_outputs]
+
+    Enum.any?(context.messages, fn
+      %{role: :tool, tool_call_id: id} when is_binary(id) -> true
+      _ -> false
+    end) or (is_list(tool_outputs) and tool_outputs != [])
+  end
+
   defp tool_resume_body?(%{"input" => input}) when is_list(input) do
     Enum.any?(input, fn
       %{"type" => "function_call_output", "call_id" => id} when is_binary(id) -> true
@@ -541,17 +565,10 @@ defmodule ReqLLM.Providers.OpenAICodex do
 
   defp tool_resume_body?(_), do: false
 
-  defp normalize_stream_event!(%{data: "[DONE]"} = event), do: event
+  defp normalize_stream_event(%{data: "[DONE]"} = event), do: event
 
-  defp normalize_stream_event!(%{data: data} = event) when is_map(data) do
+  defp normalize_stream_event(%{data: data} = event) when is_map(data) do
     case stream_event_type(event, data) do
-      "error" ->
-        raise RuntimeError, codex_error_message(data)
-
-      "response.failed" ->
-        message = get_in(data, ["response", "error", "message"]) || "Codex response failed"
-        raise RuntimeError, message
-
       "response.done" ->
         put_event_type(event, data, "response.completed")
 
@@ -566,7 +583,7 @@ defmodule ReqLLM.Providers.OpenAICodex do
     end
   end
 
-  defp normalize_stream_event!(event), do: event
+  defp normalize_stream_event(event), do: event
 
   defp stream_event_type(event, data) do
     event[:event] || data["event"] || data["type"]
@@ -608,14 +625,6 @@ defmodule ReqLLM.Providers.OpenAICodex do
         other
     end)
   end
-
-  defp codex_error_message(%{"message" => message}) when is_binary(message) and message != "",
-    do: "Codex error: " <> message
-
-  defp codex_error_message(%{"code" => code}) when is_binary(code) and code != "",
-    do: "Codex error: " <> code
-
-  defp codex_error_message(data), do: "Codex error: " <> Jason.encode!(data)
 
   defp extract_instructions(%ReqLLM.Context{messages: messages}) do
     messages

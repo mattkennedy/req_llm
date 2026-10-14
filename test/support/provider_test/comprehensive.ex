@@ -39,6 +39,13 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
     end
   end
 
+  def supports_text_streaming?(model_spec) do
+    case ReqLLM.model(model_spec) do
+      {:ok, model} -> match?({:ok, _}, ReqLLM.ProviderDispatch.get(model, :chat, stream: true))
+      {:error, _} -> false
+    end
+  end
+
   def supports_streaming_object_generation?(model_spec) do
     case ReqLLM.model(model_spec) do
       {:ok, model} ->
@@ -48,7 +55,8 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
         supports_object = supports_object_generation?(model_spec)
         supports_streaming = get_in(caps, [:streaming, :tool_calls]) != false
 
-        supports_object && supports_streaming
+        (supports_object && supports_streaming) and
+          match?({:ok, _}, ReqLLM.ProviderDispatch.get(model, :object, stream: true))
 
       {:error, _} ->
         false
@@ -77,7 +85,8 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
   end
 
   defp object_generation_supported?(%LLMDB.Model{} = model) do
-    structured_outputs_supported?(model) and
+    match?({:ok, _}, ReqLLM.ProviderDispatch.get(model, :object)) and
+      structured_outputs_supported?(model) and
       (execution_object_supported?(model) or
          json_output_supported?(model) or
          strict_tool_output_supported?(model) or
@@ -208,59 +217,61 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
             |> assert_basic_response()
           end
 
-          @tag ReqLLM.Test.CompatibilityScenario.tag!(:streaming)
-          test "stream_text with system context and creative params" do
-            require Logger
+          if ReqLLM.ProviderTest.Comprehensive.supports_text_streaming?(model_spec) do
+            @tag ReqLLM.Test.CompatibilityScenario.tag!(:streaming)
+            test "stream_text with system context and creative params" do
+              require Logger
 
-            dbug(
-              fn -> "\n[Comprehensive] model_spec=#{@model_spec}, test=streaming" end,
-              component: :test
-            )
-
-            context =
-              ReqLLM.Context.new([
-                system("You are a helpful, creative assistant."),
-                user("Say hello in one short, imaginative sentence.")
-              ])
-
-            opts =
-              reasoning_overlay(@model_spec, @provider, param_bundles(@provider).creative, 2000)
-
-            {:ok, stream_response} =
-              ReqLLM.stream_text(
-                @model_spec,
-                context,
-                fixture_opts(
-                  @provider,
-                  ReqLLM.Test.CompatibilityScenario.fixture!(:streaming),
-                  opts
-                )
+              dbug(
+                fn -> "\n[Comprehensive] model_spec=#{@model_spec}, test=streaming" end,
+                component: :test
               )
 
-            assert %ReqLLM.StreamResponse{} = stream_response
-            assert stream_response.stream
-            assert stream_response.metadata_handle
+              context =
+                ReqLLM.Context.new([
+                  system("You are a helpful, creative assistant."),
+                  user("Say hello in one short, imaginative sentence.")
+                ])
 
-            {:ok, response} = ReqLLM.StreamResponse.to_response(stream_response)
+              opts =
+                reasoning_overlay(@model_spec, @provider, param_bundles(@provider).creative, 2000)
 
-            finish_reason = response.finish_reason
+              {:ok, stream_response} =
+                ReqLLM.stream_text(
+                  @model_spec,
+                  context,
+                  fixture_opts(
+                    @provider,
+                    ReqLLM.Test.CompatibilityScenario.fixture!(:streaming),
+                    opts
+                  )
+                )
 
-            # Assert response structure without context advancement check
-            # (streaming doesn't auto-append to context)
-            assert %ReqLLM.Response{} = response
+              assert %ReqLLM.StreamResponse{} = stream_response
+              assert stream_response.stream
+              assert stream_response.metadata_handle
 
-            text = ReqLLM.Response.text(response) || ""
-            thinking = ReqLLM.Response.thinking(response) || ""
-            combined = text <> thinking
+              {:ok, response} = ReqLLM.StreamResponse.to_response(stream_response)
 
-            assert combined != "",
-                   "Expected text or thinking content, got empty (text: #{inspect(text)}, thinking: #{inspect(thinking)})"
+              finish_reason = response.finish_reason
 
-            assert response.message.role == :assistant
+              # Assert response structure without context advancement check
+              # (streaming doesn't auto-append to context)
+              assert %ReqLLM.Response{} = response
 
-            refute is_nil(finish_reason)
+              text = ReqLLM.Response.text(response) || ""
+              thinking = ReqLLM.Response.thinking(response) || ""
+              combined = text <> thinking
 
-            assert_streaming_usage(response.usage)
+              assert combined != "",
+                     "Expected text or thinking content, got empty (text: #{inspect(text)}, thinking: #{inspect(thinking)})"
+
+              assert response.message.role == :assistant
+
+              refute is_nil(finish_reason)
+
+              assert_streaming_usage(response.usage)
+            end
           end
 
           @tag ReqLLM.Test.CompatibilityScenario.tag!(:token_limit)
@@ -348,13 +359,7 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
             assert is_number(response.usage.reasoning_tokens) and
                      response.usage.reasoning_tokens >= 0
 
-            case ReqLLM.model(@model_spec) do
-              {:ok, %LLMDB.Model{cost: cost_map}} when is_map(cost_map) ->
-                assert_usage_cost_fields(response.usage, true)
-
-              _ ->
-                assert_usage_cost_fields(response.usage, false)
-            end
+            assert_usage_cost_fields(response.usage)
           end
 
           @tag ReqLLM.Test.CompatibilityScenario.tag!(:context_append)
@@ -485,12 +490,16 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
                 param_bundles().deterministic
                 |> Keyword.put(:max_tokens, tool_budget_for(@model_spec))
 
-              # Use forced tool choice if supported, otherwise fall back to "required"
               tool_choice =
-                if ReqLLM.ProviderTest.Comprehensive.supports_forced_tool_choice?(@model_spec) do
-                  %{type: "tool", name: "add"}
-                else
-                  "required"
+                cond do
+                  @provider == :meta ->
+                    :auto
+
+                  ReqLLM.ProviderTest.Comprehensive.supports_forced_tool_choice?(@model_spec) ->
+                    %{type: "tool", name: "add"}
+
+                  true ->
+                    "required"
                 end
 
               {:ok, resp1} =
@@ -745,93 +754,96 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
 
               assert_reasoning_details_if_present(response.message)
 
-              context =
-                ReqLLM.Context.new([
-                  system(provider_config.reasoning_prompts.streaming_system),
-                  user(provider_config.reasoning_prompts.streaming_user)
-                ])
+              if ReqLLM.ProviderTest.Comprehensive.supports_text_streaming?(@model_spec) do
+                context =
+                  ReqLLM.Context.new([
+                    system(provider_config.reasoning_prompts.streaming_system),
+                    user(provider_config.reasoning_prompts.streaming_user)
+                  ])
 
-              stream_opts =
-                provider_config.creative
-                |> Keyword.delete(:temperature)
-                |> Keyword.merge(
-                  max_tokens: 5000,
-                  temperature: 1.0,
-                  reasoning_effort: provider_config.reasoning[:reasoning_effort]
-                )
-
-              {:ok, stream_response} =
-                ReqLLM.stream_text(
-                  @model_spec,
-                  context,
-                  fixture_opts(
-                    @provider,
-                    ReqLLM.Test.CompatibilityScenario.fixture!(:reasoning, 1),
-                    stream_opts
+                stream_opts =
+                  provider_config.creative
+                  |> Keyword.delete(:temperature)
+                  |> Keyword.merge(
+                    max_tokens: 5000,
+                    temperature: 1.0,
+                    reasoning_effort: provider_config.reasoning[:reasoning_effort]
                   )
-                )
 
-              assert %ReqLLM.StreamResponse{} = stream_response
-              assert stream_response.stream
-              assert stream_response.metadata_handle
+                {:ok, stream_response} =
+                  ReqLLM.stream_text(
+                    @model_spec,
+                    context,
+                    fixture_opts(
+                      @provider,
+                      ReqLLM.Test.CompatibilityScenario.fixture!(:reasoning, 1),
+                      stream_opts
+                    )
+                  )
 
-              # Collect stream chunks once (streams are single-use)
-              stream_chunks = Enum.to_list(stream_response.stream)
+                assert %ReqLLM.StreamResponse{} = stream_response
+                assert stream_response.stream
+                assert stream_response.metadata_handle
 
-              {thinking_count, reasoning_tokens_stream} =
-                stream_chunks
-                |> Enum.reduce({0, 0}, fn chunk, {tc, rt} ->
-                  case chunk.type do
-                    :thinking ->
-                      {tc + 1, rt}
+                # Collect stream chunks once (streams are single-use)
+                stream_chunks = Enum.to_list(stream_response.stream)
 
-                    :meta ->
-                      usage = chunk.metadata[:usage] || %{}
-                      rt2 = Map.get(usage, :reasoning_tokens, 0)
-                      {tc, max(rt, (is_number(rt2) && rt2) || 0)}
+                {thinking_count, reasoning_tokens_stream} =
+                  stream_chunks
+                  |> Enum.reduce({0, 0}, fn chunk, {tc, rt} ->
+                    case chunk.type do
+                      :thinking ->
+                        {tc + 1, rt}
 
-                    _ ->
-                      {tc, rt}
-                  end
-                end)
+                      :meta ->
+                        usage = chunk.metadata[:usage] || %{}
+                        rt2 = Map.get(usage, :reasoning_tokens, 0)
+                        {tc, max(rt, (is_number(rt2) && rt2) || 0)}
 
-              # Build response from collected chunks
-              stream_with_chunks = %{stream_response | stream: stream_chunks}
-              {:ok, response} = ReqLLM.StreamResponse.to_response(stream_with_chunks)
-              rt_final = ReqLLM.Response.reasoning_tokens(response)
+                      _ ->
+                        {tc, rt}
+                    end
+                  end)
 
-              # Adaptive reasoning models (like gpt-5-chat) may choose not to reason
-              # for simple prompts, so also accept text output like non-streaming does
-              streaming_text = ReqLLM.Response.text(response) || ""
-              has_streaming_output = streaming_text != ""
+                # Build response from collected chunks
+                stream_with_chunks = %{stream_response | stream: stream_chunks}
+                {:ok, response} = ReqLLM.StreamResponse.to_response(stream_with_chunks)
+                rt_final = ReqLLM.Response.reasoning_tokens(response)
 
-              assert thinking_count > 0 or reasoning_tokens_stream > 0 or rt_final > 0 or
-                       has_streaming_output,
-                     "Expected at least one :thinking chunk, positive reasoning_tokens, or text output; got tc=#{thinking_count} rt_stream=#{reasoning_tokens_stream} rt_final=#{rt_final} text_len=#{String.length(streaming_text)}"
+                # Adaptive reasoning models (like gpt-5-chat) may choose not to reason
+                # for simple prompts, so also accept text output like non-streaming does
+                streaming_text = ReqLLM.Response.text(response) || ""
+                has_streaming_output = streaming_text != ""
 
-              assert %ReqLLM.Response{} = response
-              assert response.message.role == :assistant
+                assert thinking_count > 0 or reasoning_tokens_stream > 0 or rt_final > 0 or
+                         has_streaming_output,
+                       "Expected at least one :thinking chunk, positive reasoning_tokens, or text output; got tc=#{thinking_count} rt_stream=#{reasoning_tokens_stream} rt_final=#{rt_final} text_len=#{String.length(streaming_text)}"
 
-              assert_reasoning_details_if_present(response.message)
+                assert %ReqLLM.Response{} = response
+                assert response.message.role == :assistant
+
+                assert_reasoning_details_if_present(response.message)
+              end
             end
           end
         end
       end
 
-      defp assert_usage_cost_fields(usage, required?) do
-        present? =
-          Enum.any?([:input_cost, :output_cost, :total_cost], &Map.has_key?(usage, &1))
+      defp assert_usage_cost_fields(usage) do
+        case usage.pricing do
+          %{status: :priced, currency: "USD", total: total} ->
+            assert is_number(usage.input_cost) and usage.input_cost >= 0
+            assert is_number(usage.output_cost) and usage.output_cost >= 0
+            assert is_number(usage.total_cost) and usage.total_cost >= 0
+            assert usage.total_cost == total
 
-        if required? or present? do
-          assert is_number(usage.input_cost) and usage.input_cost >= 0
+          %{status: status} when status in [:priced, :unknown] ->
+            refute Map.has_key?(usage, :input_cost)
+            refute Map.has_key?(usage, :output_cost)
+            refute Map.has_key?(usage, :total_cost)
 
-          assert is_number(usage.output_cost) and
-                   usage.output_cost >= 0
-
-          assert is_number(usage.total_cost) and usage.total_cost >= 0
-
-          expected = usage.input_cost + usage.output_cost
-          assert abs(usage.total_cost - expected) < 0.00001
+          other ->
+            flunk("Expected known or unknown pricing, got: #{inspect(other)}")
         end
       end
 

@@ -540,7 +540,7 @@ defmodule ReqLLM.Provider.Defaults do
         |> maybe_put(:speed, speed)
         |> maybe_put_speech_provider_options(provider_options)
 
-      api_key = ReqLLM.Keys.get!(model, opts)
+      credential = ReqLLM.Auth.resolve!(model, opts)
 
       request =
         Req.new(
@@ -550,13 +550,15 @@ defmodule ReqLLM.Provider.Defaults do
             base_url: Keyword.get(opts, :base_url, provider_mod.default_base_url()),
             receive_timeout: timeout,
             body: Jason.encode!(body),
-            auth: {:bearer, api_key},
             # Disable Req's automatic JSON decoding — response is raw audio binary
             decode_body: false
-          ] ++ merge_finch_options(http_opts, pool_timeout: timeout)
+          ] ++
+            speech_auth_options(credential) ++
+            merge_finch_options(http_opts, pool_timeout: timeout)
         )
+        |> ReqLLM.Auth.validate_request!(credential)
         |> Req.Request.put_header("content-type", "application/json")
-        |> Req.Request.put_header("authorization", "Bearer #{api_key}")
+        |> put_speech_authorization_header(credential)
         |> ReqLLM.Step.Retry.attach(opts)
         |> ReqLLM.Step.Error.attach()
         |> ReqLLM.Step.Telemetry.attach(
@@ -571,6 +573,15 @@ defmodule ReqLLM.Provider.Defaults do
 
       {:ok, request}
     end
+  end
+
+  defp speech_auth_options(:none), do: []
+  defp speech_auth_options(credential), do: [auth: {:bearer, credential.token}]
+
+  defp put_speech_authorization_header(request, :none), do: request
+
+  defp put_speech_authorization_header(request, credential) do
+    Req.Request.put_header(request, "authorization", "Bearer #{credential.token}")
   end
 
   defp maybe_put_speech_provider_options(body, opts) when is_list(opts) do
@@ -608,6 +619,7 @@ defmodule ReqLLM.Provider.Defaults do
       :cache_key,
       :cache_ttl,
       :cache_options,
+      :pricing_context,
       :req_http_options,
       :telemetry
     ]
@@ -626,6 +638,15 @@ defmodule ReqLLM.Provider.Defaults do
     {api_key, extra_option_keys} =
       fetch_api_key_and_extra_options(provider_mod, model_input, user_opts)
 
+    attach_with_api_key(provider_mod, request, model, user_opts, api_key, extra_option_keys)
+  end
+
+  @doc false
+  @spec attach_with_api_key(module(), Req.Request.t(), LLMDB.Model.t(), keyword(), binary(), [
+          atom()
+        ]) ::
+          Req.Request.t()
+  def attach_with_api_key(provider_mod, request, model, user_opts, api_key, extra_option_keys) do
     request
     |> Req.Request.put_header("content-type", "application/json")
     |> Req.Request.put_header("authorization", "Bearer #{api_key}")
@@ -1055,11 +1076,13 @@ defmodule ReqLLM.Provider.Defaults do
        }) do
     base64 = Base.encode64(data)
 
+    image_url =
+      %{url: "data:#{media_type};base64,#{base64}"}
+      |> maybe_put_image_detail(metadata)
+
     %{
       type: "image_url",
-      image_url: %{
-        url: "data:#{media_type};base64,#{base64}"
-      }
+      image_url: image_url
     }
     |> merge_content_metadata(metadata)
   end
@@ -1272,6 +1295,15 @@ defmodule ReqLLM.Provider.Defaults do
   end
 
   def default_decode_stream_event(%{data: data}, model) when is_map(data) do
+    # 0. Carry the provider response id on the finish and usage metadata so the
+    #    streamed response keeps it instead of a generated one. Content deltas
+    #    stay unchanged; the stream server merges metadata across chunks.
+    response_id_meta =
+      case Map.get(data, "id") do
+        id when is_binary(id) and id != "" -> %{response_id: id}
+        _ -> %{}
+      end
+
     # 1. Handle choices (content + finish_reason + reasoning_details)
     choices_chunks =
       case Map.get(data, "choices") do
@@ -1310,7 +1342,11 @@ defmodule ReqLLM.Provider.Defaults do
 
             if finish_reason do
               normalized_reason = parse_openai_finish_reason(finish_reason)
-              meta_chunk = ReqLLM.StreamChunk.meta(%{finish_reason: normalized_reason})
+
+              meta_chunk =
+                ReqLLM.StreamChunk.meta(
+                  Map.put(response_id_meta, :finish_reason, normalized_reason)
+                )
 
               content_chunks ++
                 reasoning_details_chunks ++ logprobs_chunks ++ annotation_chunks ++ [meta_chunk]
@@ -1330,7 +1366,7 @@ defmodule ReqLLM.Provider.Defaults do
           # Check if this is a final usage chunk (empty choices) to mark terminal
           is_final = match?(%{"choices" => []}, data)
           normalized_usage = parse_openai_usage(usage)
-          meta = %{usage: normalized_usage, model: model.id}
+          meta = Map.merge(response_id_meta, %{usage: normalized_usage, model: model.id})
           meta = if is_final, do: Map.put(meta, :terminal?, true), else: meta
 
           [ReqLLM.StreamChunk.meta(meta)]
@@ -1692,25 +1728,26 @@ defmodule ReqLLM.Provider.Defaults do
 
   defp parse_openai_usage(usage, choices \\ [])
 
-  defp parse_openai_usage(
-         %{"prompt_tokens" => input, "completion_tokens" => output, "total_tokens" => total} =
-           usage,
-         choices
-       ) do
-    reasoning_from_details =
-      get_in(usage, ["completion_tokens_details", "reasoning_tokens"]) || 0
+  defp parse_openai_usage(usage, choices) when is_map(usage) do
+    input = openai_usage_counter(usage, "prompt_tokens")
+    output = openai_usage_counter(usage, "completion_tokens")
+    total = openai_usage_counter(usage, "total_tokens", openai_total_tokens(input, output))
 
-    # For DeepSeek R1 models, Azure returns reasoning_content in message
-    # but doesn't provide reasoning_tokens in usage details
+    reasoning_from_details =
+      openai_usage_detail(usage, "completion_tokens_details", "reasoning_tokens")
+
     reasoning_tokens =
-      if reasoning_from_details > 0 do
-        reasoning_from_details
-      else
-        infer_reasoning_from_choices(choices, output)
+      case ReqLLM.Usage.Normalize.normalize_counter(reasoning_from_details) do
+        value when value in [nil, 0] -> infer_reasoning_from_choices(choices, output)
+        value -> value
       end
 
-    cached_tokens = get_in(usage, ["prompt_tokens_details", "cached_tokens"]) || 0
-    cache_creation_tokens = get_in(usage, ["prompt_tokens_details", "cache_write_tokens"])
+    cached_tokens =
+      openai_usage_detail(usage, "prompt_tokens_details", "cached_tokens")
+      |> openai_usage_default(0)
+
+    cache_creation_tokens =
+      openai_usage_detail(usage, "prompt_tokens_details", "cache_write_tokens")
 
     base = %{
       input_tokens: input,
@@ -1720,16 +1757,23 @@ defmodule ReqLLM.Provider.Defaults do
       reasoning_tokens: reasoning_tokens
     }
 
-    base = maybe_put_cache_creation_tokens(base, cache_creation_tokens)
+    base =
+      base
+      |> maybe_put_cache_creation_tokens(cache_creation_tokens)
+      |> maybe_put_openai_usage_reported(usage)
+      |> maybe_mark_invalid_openai_details(usage)
 
     extra =
-      Map.drop(usage, [
-        "prompt_tokens",
-        "completion_tokens",
-        "total_tokens",
-        "prompt_tokens_details",
-        "completion_tokens_details"
-      ])
+      Map.drop(
+        usage,
+        [
+          "prompt_tokens",
+          "completion_tokens",
+          "total_tokens",
+          "prompt_tokens_details",
+          "completion_tokens_details"
+        ] ++ openai_internal_usage_keys()
+      )
 
     Map.merge(base, extra)
   end
@@ -1740,8 +1784,77 @@ defmodule ReqLLM.Provider.Defaults do
       output_tokens: 0,
       total_tokens: 0,
       cached_tokens: 0,
-      reasoning_tokens: 0
+      reasoning_tokens: 0,
+      usage_reported: %{input: false, output: false}
     }
+
+  defp openai_usage_counter(usage, key, default \\ 0) do
+    usage
+    |> Map.get(key)
+    |> openai_usage_default(default)
+    |> ReqLLM.Usage.Normalize.normalize_counter()
+  end
+
+  defp openai_usage_default(nil, default), do: default
+  defp openai_usage_default(value, _default), do: value
+
+  defp openai_usage_detail(usage, key, field) do
+    case Map.get(usage, key) do
+      details when is_map(details) -> Map.get(details, field)
+      _ -> nil
+    end
+  end
+
+  defp openai_total_tokens(input, output) when is_number(input) and is_number(output),
+    do: input + output
+
+  defp openai_total_tokens(_input, _output), do: nil
+
+  defp maybe_mark_invalid_openai_details(base, usage) do
+    valid? =
+      Enum.all?(["prompt_tokens_details", "completion_tokens_details"], fn key ->
+        value = Map.get(usage, key)
+        is_nil(value) or is_map(value)
+      end)
+
+    if valid?, do: base, else: Map.put(base, :billing_usage_complete, false)
+  end
+
+  defp maybe_put_openai_usage_reported(base, usage) do
+    reported = %{
+      input: not is_nil(Map.get(usage, "prompt_tokens")),
+      output: not is_nil(Map.get(usage, "completion_tokens"))
+    }
+
+    if reported.input and reported.output,
+      do: base,
+      else: Map.put(base, :usage_reported, reported)
+  end
+
+  defp openai_internal_usage_keys do
+    keys = [
+      :input,
+      :output,
+      :reasoning,
+      :cached_input,
+      :cache_creation,
+      :input_tokens,
+      :output_tokens,
+      :total_tokens,
+      :cache_read_tokens,
+      :cache_write_tokens,
+      :cached_tokens,
+      :cache_creation_tokens,
+      :reasoning_tokens,
+      :cache_write_tokens_by_ttl,
+      :usage_reported,
+      :billing_usage_complete,
+      :input_includes_cached,
+      :add_reasoning_to_cost
+    ]
+
+    keys ++ Enum.map(keys, &Atom.to_string/1)
+  end
 
   defp maybe_put_cache_creation_tokens(usage, nil), do: usage
 
@@ -1933,9 +2046,15 @@ defmodule ReqLLM.Provider.Defaults do
           {model_struct.provider, model_struct, model_struct.model}
 
         model_name when is_binary(model_name) ->
-          provider_id = provider_id_from_model_name(model_name)
-          model = %LLMDB.Model{id: model_name, provider: provider_id}
-          {provider_id, model, model_name}
+          case req.private[:req_llm_model] do
+            %LLMDB.Model{} = stored_model ->
+              {stored_model.provider, stored_model, model_name}
+
+            _ ->
+              provider_id = provider_id_from_model_name(model_name)
+              model = %LLMDB.Model{id: model_name, provider: provider_id}
+              {provider_id, model, model_name}
+          end
       end
 
     is_streaming = req.options[:stream] == true
@@ -2066,73 +2185,23 @@ defmodule ReqLLM.Provider.Defaults do
   # Helper functions for default stream request building
 
   defp build_streaming_body(provider_mod, model, context, opts) do
-    # Create a temporary Req request to use existing encode_body logic
     req_opts =
-      [
-        model: model.id,
-        context: context,
-        stream: true
-      ] ++ Keyword.delete(opts, :finch_name)
+      [model: model.provider_model_id || model.id, context: context, stream: true] ++
+        Keyword.delete(opts, :finch_name)
 
-    # Create minimal request struct with required fields
     temp_request = %Req.Request{
       method: :post,
       url: URI.parse("https://example.com/temp"),
       headers: %{},
       body: nil,
-      options: Map.new(req_opts)
+      options: Map.new(req_opts),
+      private: %{req_llm_model: model}
     }
 
-    # Use provider's encode_body to build the JSON
-    encoded_request =
-      temp_request
-      |> provider_mod.encode_body()
-      |> Req.Steps.encode_body()
-
-    # Return the encoded body (should be JSON string)
-    encoded_request.body
-  rescue
-    _error ->
-      # Fallback to basic OpenAI-compatible streaming body structure
-      build_fallback_streaming_body(model, context, opts)
-  end
-
-  defp build_fallback_streaming_body(model, context, opts) do
-    # Convert context to basic OpenAI-compatible format
-    messages =
-      context.messages
-      |> Enum.map(fn message ->
-        # Extract text content from ContentPart list
-        text_content =
-          message.content
-          |> Enum.filter(&(&1.type == :text))
-          |> Enum.map_join("", & &1.text)
-
-        %{
-          role: message.role,
-          content: text_content
-        }
-      end)
-
-    body = %{
-      model: model.id,
-      messages: messages,
-      stream: true
-    }
-
-    # Add optional parameters
-    body
-    |> maybe_add_streaming_param(:temperature, opts)
-    |> maybe_add_streaming_param(:max_tokens, opts)
-    |> maybe_add_streaming_param(:top_p, opts)
-    |> Jason.encode!()
-  end
-
-  defp maybe_add_streaming_param(body, key, opts) do
-    case Keyword.get(opts, key) do
-      nil -> body
-      value -> Map.put(body, key, value)
-    end
+    temp_request
+    |> provider_mod.encode_body()
+    |> Req.Steps.encode_body()
+    |> Map.fetch!(:body)
   end
 
   # Helper function to get provider display name using display_name/0 callback

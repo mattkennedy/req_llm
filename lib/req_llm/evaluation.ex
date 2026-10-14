@@ -1,6 +1,6 @@
 defmodule ReqLLM.Evaluation do
   @moduledoc """
-  Evaluates one text or JSON state against named questions.
+  Evaluates one text or JSON-compatible state against named questions.
 
   This is a model call, not a test run. Providers handle their own request and
   answer formats. An evaluation model does not need to support chat generation.
@@ -18,6 +18,8 @@ defmodule ReqLLM.Evaluation do
                       total_timeout:
                         Zoi.union([Zoi.integer() |> Zoi.positive(), Zoi.literal(:infinity)]),
                       max_retries: Zoi.integer() |> Zoi.min(0),
+                      provider_options:
+                        Zoi.union([Zoi.map(Zoi.any(), Zoi.any()), @keyword_options]),
                       req_http_options: @keyword_options,
                       fixture: Zoi.union([Zoi.string(), Zoi.tuple({Zoi.atom(), Zoi.string()})]),
                       telemetry: Zoi.union([Zoi.map(Zoi.any(), Zoi.any()), @keyword_options])
@@ -42,8 +44,16 @@ defmodule ReqLLM.Evaluation do
       result.object["urgent"]["probability"]
 
   Choice and score answers may include probabilities and confidence. Providers
-  may support more question types. The response stores named answers in `object`
-  with string keys. `provider_meta.raw_response` keeps the original provider data.
+  may support more question types. OpenRouter evaluations accept routing preferences
+  such as `provider_options: [openrouter_provider: %{zdr: true}]`. Eligible OpenAI
+  models use the Decisions API. They support boolean, choice, and score questions;
+  `provider_options: [openai: [safety_identifier: "tenant-123"]]` adds the optional
+  safety identifier. OpenAI refusals stay in the result as `%{"type" => "refusal"}`.
+  Azure Microsoft Decision models use a Foundry resource root as `base_url` and
+  `provider_options: [azure: [deployment: "my-decision-deployment"]]` to select
+  the deployment. They support boolean, choice, and score questions.
+  The response stores named answers in `object` with string keys.
+  `provider_meta.raw_response` keeps the original provider data.
   """
   @spec evaluate(ReqLLM.model_input(), String.t() | map() | list(), map(), keyword()) ::
           {:ok, Response.t()} | {:error, term()}
@@ -59,6 +69,13 @@ defmodule ReqLLM.Evaluation do
          {:ok, model} <- resolve_model(model_spec),
          :ok <- validate_support(model),
          {:ok, provider} <- ReqLLM.provider(model.provider),
+         {:ok, opts} <-
+           ReqLLM.Provider.Options.normalize_namespaced_provider_options(
+             provider,
+             :evaluate,
+             model,
+             opts
+           ),
          {:ok, request} <-
            provider.prepare_request(:evaluate, model, %{state: state, questions: questions}, opts),
          {:ok, response} <-
@@ -181,7 +198,7 @@ defmodule ReqLLM.Evaluation do
   end
 
   defp unavailable_catalog_error(model) do
-    if model.catalog_only == true do
+    if model.catalog_only == true and not callable?(model) do
       invalid_parameter(
         "Catalog-only evaluation model #{LLMDB.Model.spec(model)} has no ReqLLM evaluation adapter"
       )
@@ -240,6 +257,12 @@ defmodule ReqLLM.Evaluation do
 
       :openrouter ->
         contract?(execution, "openrouter_decisions", "/api/alpha/decisions")
+
+      :openai ->
+        contract?(execution, "openai_decisions", "/decisions")
+
+      :azure ->
+        contract?(execution, "typesafe_systemone", "/providers/microsoft/v1/systemone")
 
       _ ->
         false

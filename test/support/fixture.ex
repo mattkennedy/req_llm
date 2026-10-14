@@ -36,6 +36,10 @@ defmodule ReqLLM.Step.Fixture.Backend do
     end
   end
 
+  def observe_stream_event(path, context, request, event) do
+    ReqLLM.Test.Billing.Capture.observe_stream(path, context, request, event)
+  end
+
   # ---------------------------------------------------------------------------
   # Main entry point – returns a Req request step (arity-1 function)
   # ---------------------------------------------------------------------------
@@ -89,6 +93,8 @@ defmodule ReqLLM.Step.Fixture.Backend do
         |> maybe_put_fixture_canonical_json()
 
       if live?() do
+        ReqLLM.Test.Billing.Capture.buffered_started(path, request)
+
         dbug(
           fn -> "[Fixture] RECORD mode - will save to #{Path.relative_to_cwd(path)}" end,
           component: :fixtures
@@ -140,13 +146,31 @@ defmodule ReqLLM.Step.Fixture.Backend do
     content_type_streaming or body_streaming
   end
 
+  defp buffered_response?(%Req.Request{options: %{decode_body: false}}, %Req.Response{body: body})
+       when is_binary(body),
+       do: true
+
+  defp buffered_response?(_req, _resp), do: false
+
   defp insert_save_step(%Req.Request{} = req) do
     steps = req.response_steps
-    save = {:llm_fixture_save, &save_fixture_response/1}
+    billing? = System.get_env("REQ_LLM_BILLING_RUN") not in [nil, ""]
 
-    if Enum.any?(steps, fn {name, _} -> name == :llm_decode_response end) do
+    callback =
+      if billing?,
+        do: &ReqLLM.Test.Billing.Capture.buffered_response/1,
+        else: &save_fixture_response/1
+
+    save = {:llm_fixture_save, callback}
+
+    anchors =
+      if billing?,
+        do: [:retry, :handle_http_errors, :llm_decode_response],
+        else: [:llm_decode_response]
+
+    if Enum.any?(steps, fn {name, _} -> name in anchors end) do
       {before_steps, after_steps} =
-        Enum.split_while(steps, fn {name, _} -> name != :llm_decode_response end)
+        Enum.split_while(steps, fn {name, _} -> name not in anchors end)
 
       %{req | response_steps: before_steps ++ [save] ++ after_steps}
     else
@@ -179,7 +203,7 @@ defmodule ReqLLM.Step.Fixture.Backend do
 
         body =
           if ReqLLM.Test.VCR.streaming?(transcript) do
-            provider_mod = provider_module(model.provider)
+            provider_mod = provider_module(model, request)
             ReqLLM.Test.VCR.replay_as_stream(transcript, provider_mod, model)
           else
             ReqLLM.Test.VCR.replay_response_body(transcript)
@@ -314,7 +338,12 @@ defmodule ReqLLM.Step.Fixture.Backend do
     |> String.slice(0, 300)
   end
 
-  defp provider_module(provider), do: ReqLLM.Providers.get!(provider)
+  defp provider_module(model, request) do
+    {:ok, provider_module} =
+      ReqLLM.ProviderDispatch.get(model, request.options[:operation] || :chat)
+
+    provider_module
+  end
 
   defp req_response_headers(headers) do
     Map.new(headers, fn {key, value} ->
@@ -444,7 +473,8 @@ defmodule ReqLLM.Step.Fixture.Backend do
     dbug(fn -> "[Fixture] Model: #{model_spec}" end, component: :fixtures)
     Logger.debug("Fixture model_spec: #{model_spec}")
 
-    if streaming_response?(resp) and req.private[:real_time_stream] == nil do
+    if streaming_response?(resp) and req.private[:real_time_stream] == nil and
+         not buffered_response?(req, resp) do
       raise """
       Legacy streaming path detected in RECORD mode for #{path}
       This should not happen - all streaming should use :real_time_stream/StreamServer.
@@ -631,7 +661,7 @@ defmodule ReqLLM.Step.Fixture.Backend do
   end
 
   defp fixture_path_for_mode(model, fixture_name, _mode) do
-    ReqLLM.Test.FixturePath.file(model, fixture_name)
+    ReqLLM.Test.Fixtures.replay_file(model, fixture_name)
   end
 
   defp maybe_insert_credential_fallback_handler(request, fixture_path, model) do
@@ -658,7 +688,7 @@ defmodule ReqLLM.Step.Fixture.Backend do
   defp handle_credential_error(request, exception, fixture_path, model) do
     # Get provider module to check if this is a credential error
     provider_id = model.provider
-    {:ok, provider_module} = ReqLLM.Providers.get(provider_id)
+    provider_module = provider_module(model, request)
 
     is_credential_error =
       function_exported?(provider_module, :credential_missing?, 1) and

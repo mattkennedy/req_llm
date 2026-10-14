@@ -22,6 +22,7 @@ defmodule ReqLLM.Providers.OpenRouter do
   - `openrouter_usage` - Usage options (e.g., `%{include: true}`)
   - `openrouter_plugins` - Array of plugins (e.g., `[%{id: "web"}]`)
   - `openrouter_session_id` - Session ID for grouping related requests in OpenRouter
+  - `openrouter_prompt_cache_key` - Prompt cache key, sent as `prompt_cache_key` for cache-aware routing
   - `openrouter_safety_settings` - Google safety filter settings, forwarded to Gemini models
   - `app_referer` - HTTP-Referer header for app identification
   - `app_title` - X-Title header for app title in rankings
@@ -118,6 +119,11 @@ defmodule ReqLLM.Providers.OpenRouter do
     openrouter_session_id: [
       type: :string,
       doc: "OpenRouter session ID for grouping related LLM calls"
+    ],
+    openrouter_prompt_cache_key: [
+      type: :string,
+      doc:
+        "Prompt cache key, sent as the top-level `prompt_cache_key` body field. Requests sharing a key are routed to keep their cached prefix warm"
     ],
     openrouter_safety_settings: [
       type: {:list, :map},
@@ -219,10 +225,19 @@ defmodule ReqLLM.Providers.OpenRouter do
 
   def prepare_request(:evaluate, model_spec, %{state: state, questions: questions}, opts) do
     with {:ok, model} <- ReqLLM.model(model_spec),
-         {:ok, api_key, _source} <- ReqLLM.Keys.get(model, opts) do
+         {:ok, api_key, _source} <- ReqLLM.Keys.get(model, opts),
+         {:ok, provider_preferences} <- evaluation_provider_preferences(opts) do
       timeout = Keyword.get(opts, :receive_timeout, 30_000)
       http_opts = Keyword.get(opts, :req_http_options, [])
       execution = model.execution.evaluate
+
+      body =
+        %{
+          model: execution.provider_model_id,
+          state: state,
+          questions: EvaluationCodec.normalize_questions(questions)
+        }
+        |> maybe_put(:provider, provider_preferences)
 
       request =
         Req.new(
@@ -232,11 +247,7 @@ defmodule ReqLLM.Providers.OpenRouter do
             base_url:
               Keyword.get(opts, :base_url, execution[:base_url] || "https://openrouter.ai"),
             receive_timeout: timeout,
-            json: %{
-              model: execution.provider_model_id,
-              state: state,
-              questions: EvaluationCodec.normalize_questions(questions)
-            }
+            json: body
           ] ++ ReqLLM.Provider.Defaults.merge_finch_options(http_opts, pool_timeout: timeout)
         )
         |> Req.Request.register_options([:operation])
@@ -450,6 +461,7 @@ defmodule ReqLLM.Providers.OpenRouter do
     |> maybe_put(:usage, request.options[:openrouter_usage])
     |> maybe_put(:plugins, request.options[:openrouter_plugins])
     |> maybe_put(:session_id, request.options[:openrouter_session_id])
+    |> maybe_put(:prompt_cache_key, request.options[:openrouter_prompt_cache_key])
     |> maybe_put(:safety_settings, request.options[:openrouter_safety_settings])
     |> add_openrouter_specific_options(request.options)
     |> add_stream_options(request.options)
@@ -815,6 +827,28 @@ defmodule ReqLLM.Providers.OpenRouter do
   end
 
   defp option_value(_opts, _key), do: nil
+
+  defp evaluation_provider_preferences(opts) do
+    provider_preferences =
+      opts
+      |> Keyword.get(:provider_options, [])
+      |> option_value(:openrouter_provider)
+
+    case provider_preferences do
+      nil ->
+        {:ok, nil}
+
+      preferences when is_map(preferences) ->
+        {:ok, preferences}
+
+      preferences ->
+        {:error,
+         ReqLLM.Error.Invalid.Parameter.exception(
+           parameter:
+             "provider_options[:openrouter_provider] must be a map, got: #{inspect(preferences)}"
+         )}
+    end
+  end
 
   # Helper function for adding OpenRouter-specific body options not covered by defaults
   defp add_openrouter_specific_options(body, request_options) do

@@ -347,6 +347,7 @@ config :req_llm, :sample_text_models, ~w(
     anthropic:claude-3-5-haiku-20241022
     anthropic:claude-haiku-4-5
     openai:gpt-4o-mini
+    llmapi:gpt-4o-mini
     google:gemini-2.0-flash
   )
 config :req_llm, :test_sample_per_provider, 1
@@ -356,6 +357,6 @@ config :req_llm,
   stream_receive_timeout: 300_000,
   stream_pool_timeout: 300_000,
   stream_pool_protocols: [:http1],
-  stream_pool_size: 1,
-  stream_pool_count: 8,
+  stream_pool_size: 8,
+  stream_pool_count: 1,
   stream_pool_strategy: nil

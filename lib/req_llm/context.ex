@@ -69,15 +69,22 @@ defmodule ReqLLM.Context do
   @spec to_list(t()) :: [Message.t()]
   def to_list(%__MODULE__{messages: msgs}), do: msgs
 
-  @doc "Append a message to the context."
-  @spec append(t(), Message.t()) :: t()
-  def append(%__MODULE__{messages: msgs} = ctx, %Message{} = msg) do
-    %{ctx | messages: msgs ++ [msg]}
-  end
+  @doc """
+  Append one message or a list of messages to the context.
 
-  @spec append(t(), [Message.t()]) :: t()
-  def append(%__MODULE__{} = ctx, msgs) when is_list(msgs) do
-    %{ctx | messages: ctx.messages ++ msgs}
+  The public `messages` field is a chronological Elixir list. Appending one
+  message therefore copies the existing list. When several messages are ready
+  at the same time, pass them as one list so the existing history is copied
+  only once. `Enum.into(messages, context)` provides the same batching for an
+  enumerable source.
+  """
+  @spec append(t(), Message.t() | [Message.t()]) :: t()
+  def append(%__MODULE__{} = ctx, %Message{} = msg), do: append(ctx, [msg])
+  def append(%__MODULE__{} = ctx, []), do: ctx
+
+  def append(%__MODULE__{messages: messages} = ctx, new_messages)
+      when is_list(new_messages) do
+    %{ctx | messages: messages ++ new_messages}
   end
 
   @doc "Prepend a message to the context."
@@ -89,7 +96,7 @@ defmodule ReqLLM.Context do
   @doc "Concatenate two contexts."
   @spec concat(t(), t()) :: t()
   def concat(%__MODULE__{} = ctx, %__MODULE__{} = other) do
-    %{ctx | messages: ctx.messages ++ other.messages}
+    append(ctx, other.messages)
   end
 
   @doc """
@@ -196,9 +203,8 @@ defmodule ReqLLM.Context do
   def merge_response(context, response, opts \\ []) do
     case {context, response.message} do
       {%__MODULE__{} = ctx, %Message{} = msg} ->
-        updated_messages = ctx.messages ++ [msg]
         tools = persist_tools(ctx.tools, Keyword.get(opts, :tools))
-        updated_context = %__MODULE__{messages: updated_messages, tools: tools}
+        updated_context = ctx |> append(msg) |> Map.put(:tools, tools)
         %{response | context: updated_context}
 
       _ ->
@@ -529,32 +535,41 @@ defmodule ReqLLM.Context do
   """
   @spec execute_and_append_tools(t(), [map()], [ReqLLM.Tool.t()]) :: t()
   def execute_and_append_tools(context, tool_calls, available_tools) do
-    Enum.reduce(tool_calls, context, fn tool_call, ctx ->
-      {name, id} = extract_tool_call_info(tool_call)
+    result_messages =
+      Enum.map(tool_calls, &execute_tool_call(&1, available_tools))
 
-      case find_and_execute_tool(tool_call, available_tools) do
-        {:ok, result} ->
-          tool_result_msg = tool_result_message(name, id, result)
-          append(ctx, tool_result_msg)
-
-        {:error, %ToolResult{} = result} ->
-          tool_result_msg = tool_result_message(name, id, result)
-
-          tool_result_msg = %{
-            tool_result_msg
-            | metadata: Map.put(tool_result_msg.metadata, :is_error, true)
-          }
-
-          append(ctx, tool_result_msg)
-
-        {:error, error} ->
-          error_result = %{error: tool_error_message(error)}
-
-          tool_result_msg = tool_result_message(name, id, error_result, %{is_error: true})
-          append(ctx, tool_result_msg)
-      end
-    end)
+    append(context, result_messages)
   end
+
+  defp execute_tool_call(tool_call, available_tools) do
+    {name, id} = extract_tool_call_info(tool_call)
+
+    case find_and_execute_tool(tool_call, available_tools) do
+      {:ok, result} ->
+        tool_result_message(name, id, result)
+
+      {:error, %ToolResult{} = result} ->
+        result_message = tool_result_message(name, id, result)
+
+        %{
+          result_message
+          | metadata: Map.put(result_message.metadata, :is_error, true)
+        }
+
+      {:error, error} ->
+        error_result = %{error: tool_error_message(error)}
+        tool_result_message(name, id, error_result, %{is_error: true})
+    end
+  end
+
+  defp tool_error_message(%{state: :unknown, name: name}), do: "Tool #{name} not found"
+
+  defp tool_error_message(%{state: state, error: nil})
+       when state in [:provider_executed, :provider_native],
+       do: "Tool call is #{state} and cannot be executed locally"
+
+  defp tool_error_message(%{state: state, error: error}) when state in [:invalid, :unknown],
+    do: tool_error_message(error)
 
   defp tool_error_message(error) when is_exception(error), do: Exception.message(error)
 
@@ -569,11 +584,10 @@ defmodule ReqLLM.Context do
   defp extract_tool_call_info(%{name: name, id: id}), do: {name, id}
 
   defp find_and_execute_tool(
-         %ReqLLM.ToolCall{function: %{name: name, arguments: args_json}},
+         %ReqLLM.ToolCall{} = tool_call,
          available_tools
        ) do
-    args = Jason.decode!(args_json)
-    execute_tool_by_name(name, args, available_tools)
+    ReqLLM.ToolCall.execute(tool_call, available_tools)
   end
 
   defp find_and_execute_tool(%{name: name, arguments: args}, available_tools) do
@@ -700,10 +714,10 @@ defmodule ReqLLM.Context do
   end
 
   defimpl Collectable do
-    def into(%ReqLLM.Context{messages: messages}) do
+    def into(%ReqLLM.Context{} = context) do
       collector = fn
         list, {:cont, message} -> [message | list]
-        list, :done -> %ReqLLM.Context{messages: messages ++ Enum.reverse(list)}
+        list, :done -> ReqLLM.Context.append(context, Enum.reverse(list))
         _list, :halt -> :ok
       end
 
@@ -870,23 +884,10 @@ defmodule ReqLLM.Context do
   end
 
   defp to_context(list, convert_loose?) when is_list(list) do
-    list
-    |> Enum.with_index()
-    |> Enum.reduce_while({:ok, []}, fn {item, _idx}, {:ok, acc} ->
-      case convert_item(item, convert_loose?) do
-        {:ok, msg} when is_struct(msg, Message) ->
-          {:cont, {:ok, acc ++ [msg]}}
-
-        {:ok, msgs} when is_list(msgs) ->
-          {:cont, {:ok, acc ++ msgs}}
-
-        {:error, _} = err ->
-          {:halt, err}
-      end
-    end)
-    |> case do
-      {:ok, msgs} -> {:ok, new(msgs)}
-      error -> error
+    if Enum.all?(list, &is_struct(&1, Message)) do
+      {:ok, new(list)}
+    else
+      convert_items(list, convert_loose?, [])
     end
   end
 
@@ -898,6 +899,37 @@ defmodule ReqLLM.Context do
   end
 
   defp to_context(_prompt, _convert_loose?), do: {:error, :invalid_prompt}
+
+  defp convert_items([], _convert_loose?, reversed_messages) do
+    {:ok, new(Enum.reverse(reversed_messages))}
+  end
+
+  defp convert_items([item], convert_loose?, reversed_messages) do
+    case convert_item(item, convert_loose?) do
+      {:ok, msg} when is_struct(msg, Message) ->
+        {:ok, new(Enum.reverse(reversed_messages, [msg]))}
+
+      {:ok, msgs} when is_list(msgs) ->
+        _ = length(msgs)
+        {:ok, new(Enum.reverse(reversed_messages, msgs))}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp convert_items([item | rest], convert_loose?, reversed_messages) do
+    case convert_item(item, convert_loose?) do
+      {:ok, msg} when is_struct(msg, Message) ->
+        convert_items(rest, convert_loose?, [msg | reversed_messages])
+
+      {:ok, msgs} when is_list(msgs) ->
+        convert_items(rest, convert_loose?, Enum.reverse(msgs, reversed_messages))
+
+      {:error, _} = error ->
+        error
+    end
+  end
 
   defp convert_item(%__MODULE__{} = context, _convert_loose?) do
     case to_list(context) do
@@ -1334,7 +1366,7 @@ defmodule ReqLLM.Context do
     if has_system? do
       context
     else
-      %__MODULE__{messages: [system(system_prompt) | messages]}
+      %{context | messages: [system(system_prompt) | messages]}
     end
   end
 

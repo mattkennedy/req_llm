@@ -1,6 +1,7 @@
 defmodule ReqLLM.Providers.OpenAI do
   @moduledoc """
-  OpenAI provider implementation with multi-driver architecture for Chat, Responses, and Images APIs.
+  OpenAI provider implementation with multi-driver architecture for Chat, Responses, Decisions,
+  and Images APIs.
 
   ## Architecture
 
@@ -12,6 +13,9 @@ defmodule ReqLLM.Providers.OpenAI do
 
   - **ResponsesAPI** (`ReqLLM.Providers.OpenAI.ResponsesAPI`) - Handles `/v1/responses` endpoint
     for models such as GPT-4.1, GPT-4o, o-series, and GPT-5.
+
+  - **DecisionsAPI** (`ReqLLM.Providers.OpenAI.DecisionsAPI`) - Handles `/v1/decisions` for
+    provider-neutral evaluation calls.
 
   - **ImagesAPI** (`ReqLLM.Providers.OpenAI.ImagesAPI`) - Handles `/v1/images/generations` endpoint
     for image generation models (DALL-E 2, DALL-E 3, gpt-image-*). A thin adapter over
@@ -45,9 +49,13 @@ defmodule ReqLLM.Providers.OpenAI do
   - Image generation and edit with gpt-image-* models
   - Multiple output formats: PNG, JPEG, WebP (gpt-image-* only)
   - Size and aspect ratio control
-  - Quality and style options (DALL-E 3)
+  - gpt-image quality tiers (`:auto`, `:low`, `:medium`, `:high`), `:background`
+    (`:transparent` needs PNG or WebP output), `:moderation`, `:output_compression`
+    (JPEG/WebP), and `:input_fidelity` on edits
+  - Quality and style options (DALL-E 3); `response_format: :url` is DALL-E only
   - Returns images as `ReqLLM.Message.ContentPart` with `:image` or `:image_url` type
-  - Streaming not supported
+  - Streaming generation via `ReqLLM.stream_image/3` (gpt-image-* only): preview
+    frames with `:partial_images`, then the final image; edits do not stream
 
   ## Explicit Prompt Caching
 
@@ -144,9 +152,9 @@ defmodule ReqLLM.Providers.OpenAI do
       doc: "OAuth access token used as Authorization Bearer credential"
     ],
     auth_mode: [
-      type: {:in, [:api_key, :oauth]},
+      type: {:in, [:api_key, :oauth, :none, "none"]},
       default: :api_key,
-      doc: "Authentication mode: :api_key (default) or :oauth"
+      doc: "Authentication mode: :api_key (default), :oauth, or :none"
     ],
     oauth_file: [
       type: :string,
@@ -182,6 +190,20 @@ defmodule ReqLLM.Providers.OpenAI do
       type: {:or, [:string, {:in, [:auto, :concise, :detailed]}]},
       doc:
         "Controls whether the model returns a human-readable summary of its reasoning (auto, concise, detailed)"
+    ],
+    reasoning_context: [
+      type: {:or, [{:in, [:current_turn, :all_turns]}, {:in, ["current_turn", "all_turns"]}]},
+      doc:
+        "Which earlier reasoning items the model renders into context (current_turn or all_turns). Responses API, GPT-5.4 and later."
+    ],
+    multi_agent: [
+      type: {:or, [:map, :keyword_list]},
+      doc: "Responses beta configuration: %{enabled: true, max_concurrent_subagents: 3}."
+    ],
+    context_management: [
+      type: {:list, {:or, [{:map, {:or, [:atom, :string]}, :any}, :keyword_list]}},
+      doc:
+        "Responses API context_management entries, such as [%{type: \"compaction\", compact_threshold: 200_000}] for server-side compaction"
     ],
     openai_structured_output_mode: [
       type: {:in, [:auto, :json_schema, :tool_strict]},
@@ -262,7 +284,12 @@ defmodule ReqLLM.Providers.OpenAI do
     ],
     service_tier: [
       type: {:or, [:atom, :string]},
-      doc: "Service tier for request prioritization ('auto', 'default', 'flex' or 'priority')"
+      doc:
+        "Service tier for request prioritization ('auto', 'default', 'flex', 'fast', 'priority', or 'ultrafast')"
+    ],
+    openai_max_tool_calls: [
+      type: :pos_integer,
+      doc: "Maximum total built-in tool calls in a Responses API request"
     ],
     verbosity: [
       type: {:or, [:atom, :string]},
@@ -294,6 +321,10 @@ defmodule ReqLLM.Providers.OpenAI do
         "Chat Completions web search configuration, forwarded as the `web_search_options` body field. " <>
           "Required to enable web search on `*-search-preview` models; pass `%{}` for defaults. " <>
           "The Responses API takes web search as a tool instead (`tools: [%{\"type\" => \"web_search\"}]`)."
+    ],
+    safety_identifier: [
+      type: :string,
+      doc: "Stable safety identifier for OpenAI Decisions requests, with at most 128 characters"
     ]
   ]
 
@@ -303,6 +334,18 @@ defmodule ReqLLM.Providers.OpenAI do
     case ReqLLM.RequestPlan.openai_surface(model) do
       {:ok, surface, _api_module, _warnings} -> surface == :openai_responses
       {:error, error} -> raise error
+    end
+  end
+
+  defp ensure_responses_model(model) do
+    if responses_api?(model) do
+      :ok
+    else
+      {:error,
+       ReqLLM.Error.Invalid.Parameter.exception(
+         parameter:
+           "model: compact_context requires an OpenAI Responses API model, got #{model.provider}:#{model.id}"
+       )}
     end
   end
 
@@ -350,9 +393,16 @@ defmodule ReqLLM.Providers.OpenAI do
   end
 
   @doc false
-  def pre_validate_options(_operation, model, opts) do
+  def pre_validate_options(operation, model, opts) do
     opts = ReqLLM.Provider.Reasoning.normalize_effort_option(opts)
     ReqLLM.Providers.OpenAI.Astra.validate_options!(model, opts)
+
+    ReqLLM.Providers.OpenAI.MultiAgent.configuration(
+      Keyword.put(opts, :operation, operation),
+      model.provider_model_id || model.id
+    )
+
+    opts
   end
 
   @impl ReqLLM.Provider
@@ -503,6 +553,58 @@ defmodule ReqLLM.Providers.OpenAI do
     end
   end
 
+  def prepare_request(:evaluate, model_spec, %{state: state, questions: questions}, opts) do
+    with {:ok, model} <- ReqLLM.model(model_spec),
+         execution = model.execution.evaluate,
+         safety_identifier = decisions_safety_identifier(opts),
+         {:ok, body, contract} <-
+           ReqLLM.Providers.OpenAI.DecisionsAPI.compile_request(
+             execution.provider_model_id,
+             state,
+             questions,
+             safety_identifier
+           ) do
+      api_mod = ReqLLM.Providers.OpenAI.DecisionsAPI
+      timeout = get_timeout_for_operation(:evaluate, opts)
+      http_opts = Keyword.get(opts, :req_http_options, [])
+
+      req_keys =
+        supported_provider_options() ++
+          [
+            :operation,
+            :model,
+            :provider_options,
+            :api_mod,
+            :decisions_body,
+            :base_url
+          ]
+
+      request =
+        Req.new(
+          [
+            url: api_mod.path(),
+            method: :post,
+            receive_timeout: timeout
+          ] ++ ReqLLM.Provider.Defaults.merge_finch_options(http_opts, pool_timeout: timeout)
+        )
+        |> Req.Request.register_options(req_keys)
+        |> Req.Request.merge_options(
+          Keyword.take(opts, req_keys) ++
+            [
+              operation: :evaluate,
+              model: execution.provider_model_id,
+              base_url: Keyword.get(opts, :base_url, base_url()),
+              api_mod: api_mod,
+              decisions_body: body
+            ]
+        )
+        |> Req.Request.put_private(api_mod.request_private_key(), contract)
+        |> attach(model, opts)
+
+      {:ok, request}
+    end
+  end
+
   def prepare_request(:transcription, model_spec, audio_data, opts) do
     with {:ok, model} <- ReqLLM.model(model_spec) do
       http_opts = Keyword.get(opts, :req_http_options, [])
@@ -550,6 +652,45 @@ defmodule ReqLLM.Providers.OpenAI do
           |> Keyword.put(:media_type, media_type)
         )
         |> ReqLLM.Step.Fixture.maybe_attach(model, opts)
+
+      {:ok, request}
+    end
+  end
+
+  def prepare_request(:compact, model_spec, context, opts) do
+    with {:ok, model} <- ReqLLM.model(model_spec),
+         :ok <- ensure_responses_model(model),
+         {:ok, context} <- ReqLLM.Context.normalize(context, opts),
+         opts_with_context =
+           opts |> Keyword.put(:context, context) |> Keyword.put(:operation, :compact),
+         http_opts = Keyword.get(opts, :req_http_options, []),
+         {:ok, processed_opts} <-
+           ReqLLM.Provider.Options.process(__MODULE__, :compact, model, opts_with_context) do
+      req_keys =
+        supported_provider_options() ++
+          [:context, :operation, :model, :provider_options, :api_mod, :receive_timeout]
+
+      timeout = get_timeout_for_model(ReqLLM.Providers.OpenAI.ResponsesAPI, processed_opts)
+
+      request =
+        Req.new(
+          [
+            url: ReqLLM.Providers.OpenAI.ResponsesAPI.compact_path(),
+            method: :post,
+            receive_timeout: timeout
+          ] ++ ReqLLM.Provider.Defaults.merge_finch_options(http_opts, pool_timeout: timeout)
+        )
+        |> Req.Request.register_options(req_keys)
+        |> Req.Request.merge_options(
+          Keyword.take(processed_opts, req_keys) ++
+            [
+              model: model.id,
+              base_url: Keyword.get(processed_opts, :base_url, base_url()),
+              api_mod: ReqLLM.Providers.OpenAI.ResponsesAPI,
+              operation: :compact
+            ]
+        )
+        |> attach(model, processed_opts)
 
       {:ok, request}
     end
@@ -658,7 +799,7 @@ defmodule ReqLLM.Providers.OpenAI do
   end
 
   def translate_options(op, %LLMDB.Model{} = model, opts) do
-    steps = ReqLLM.Providers.OpenAI.ParamProfiles.steps_for(op, model)
+    steps = ReqLLM.Providers.OpenAI.ParamProfiles.steps_for(op, model, opts)
     {opts1, warns} = ReqLLM.ParamTransform.apply(opts, steps)
 
     if responses_api?(model) do
@@ -722,8 +863,23 @@ defmodule ReqLLM.Providers.OpenAI do
   """
   @impl ReqLLM.Provider
   def attach_stream(model, context, opts, finch_name) do
-    operation = opts[:operation] || :chat
+    case opts[:operation] || :chat do
+      :image -> attach_image_stream(model, context, opts, finch_name)
+      operation -> attach_planned_stream(model, context, opts, finch_name, operation)
+    end
+  end
 
+  defp attach_image_stream(model, context, opts, finch_name) do
+    with :ok <- ReqLLM.Images.OpenAICompatible.validate_options(opts),
+         :ok <- ReqLLM.Images.OpenAICompatible.validate_stream_options(opts) do
+      processed_opts =
+        ReqLLM.Provider.Options.process_stream!(__MODULE__, :image, model, context, opts)
+
+      ReqLLM.Providers.OpenAI.ImagesAPI.attach_stream(model, context, processed_opts, finch_name)
+    end
+  end
+
+  defp attach_planned_stream(model, context, opts, finch_name, operation) do
     with {:ok, plan} <-
            ReqLLM.RequestPlan.build(model, operation, Keyword.put(opts, :stream, true)) do
       processed_opts =
@@ -799,6 +955,7 @@ defmodule ReqLLM.Providers.OpenAI do
     ReqLLM.Providers.OpenAI.WebSocket.start_responses_session(model, opts)
   end
 
+  @impl ReqLLM.Provider
   def stream_transport(_model, opts) do
     provider_opts = Keyword.get(opts, :provider_options, [])
     session = Keyword.get(provider_opts, :openai_websocket_session)
@@ -877,6 +1034,7 @@ defmodule ReqLLM.Providers.OpenAI do
     case body do
       %{"object" => "response"} -> ReqLLM.Providers.OpenAI.ResponsesAPI
       %{"object" => "chat.completion"} -> ReqLLM.Providers.OpenAI.ChatAPI
+      %{"answers" => _answers} -> ReqLLM.Providers.OpenAI.DecisionsAPI
       %ReqLLM.Response{} -> ReqLLM.Providers.OpenAI.ChatAPI
       _ -> ReqLLM.Providers.OpenAI.ChatAPI
     end
@@ -889,7 +1047,22 @@ defmodule ReqLLM.Providers.OpenAI do
   # at the dispatcher is cheap and avoids brittle URL-path inference.
   defp api_type_for_mod(ReqLLM.Providers.OpenAI.ResponsesAPI), do: "responses"
   defp api_type_for_mod(ReqLLM.Providers.OpenAI.ChatAPI), do: "chat_completions"
+  defp api_type_for_mod(ReqLLM.Providers.OpenAI.DecisionsAPI), do: "decisions"
   defp api_type_for_mod(_), do: nil
+
+  defp decisions_safety_identifier(opts) do
+    case Keyword.get(opts, :provider_options, []) do
+      provider_options when is_list(provider_options) ->
+        Keyword.get(provider_options, :safety_identifier)
+
+      provider_options when is_map(provider_options) ->
+        Map.get(provider_options, :safety_identifier) ||
+          Map.get(provider_options, "safety_identifier")
+
+      _provider_options ->
+        nil
+    end
+  end
 
   defp stamp_api_type_on_response(resp, nil), do: resp
 
@@ -921,11 +1094,16 @@ defmodule ReqLLM.Providers.OpenAI do
 
   @impl ReqLLM.Provider
   def decode_stream_event(event, model, state) do
-    if responses_api?(model) do
-      ReqLLM.Providers.OpenAI.ResponsesAPI.decode_stream_event(event, model, state)
-    else
-      chunks = ReqLLM.Providers.OpenAI.ChatAPI.decode_stream_event(event, model)
-      {chunks, state}
+    cond do
+      ReqLLM.Images.OpenAICompatible.gpt_image_model?(model) ->
+        {ReqLLM.Images.OpenAICompatible.decode_stream_event(event, model), state}
+
+      responses_api?(model) ->
+        ReqLLM.Providers.OpenAI.ResponsesAPI.decode_stream_event(event, model, state)
+
+      true ->
+        chunks = ReqLLM.Providers.OpenAI.ChatAPI.decode_stream_event(event, model)
+        {chunks, state}
     end
   end
 
@@ -1017,7 +1195,8 @@ defmodule ReqLLM.Providers.OpenAI do
   defp maybe_add_transcription_part(parts, _key, nil), do: parts
   defp maybe_add_transcription_part(parts, key, value), do: parts ++ [{key, to_string(value)}]
 
-  defp maybe_put_authorization_header(request, :none), do: request
+  defp maybe_put_authorization_header(request, :none),
+    do: ReqLLM.Auth.validate_request!(request, :none)
 
   defp maybe_put_authorization_header(request, credential) do
     Req.Request.put_header(request, "authorization", "Bearer #{credential.token}")
@@ -1029,9 +1208,9 @@ defmodule ReqLLM.Providers.OpenAI do
 
   defp auth_mode(opts) do
     case option_value(opts, :auth_mode) || provider_option_value(opts, :auth_mode) || :api_key do
-      :oauth -> :oauth
-      "oauth" -> :oauth
-      _ -> :api_key
+      mode when mode in [:none, "none"] -> :none
+      mode when mode in [:oauth, "oauth"] -> :oauth
+      _mode -> :api_key
     end
   end
 

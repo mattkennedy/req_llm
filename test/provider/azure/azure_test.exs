@@ -31,6 +31,8 @@ defmodule ReqLLM.Providers.AzureTest do
   end
 
   describe "prepare_request/4" do
+    import ExUnit.CaptureLog
+
     test "constructs URL with deployment from options" do
       model = traditional_openai_model()
 
@@ -77,6 +79,30 @@ defmodule ReqLLM.Providers.AzureTest do
 
       url_string = URI.to_string(request.url)
       assert url_string =~ "api-version=2023-05-15"
+    end
+
+    test "passes logprobs options to Azure Chat Completions" do
+      {{:ok, request}, log} =
+        with_log(fn -> prepare_chat_with_logprobs(traditional_openai_model()) end)
+
+      refute log =~ "logprobs will be ignored"
+      assert request.options[:json][:logprobs] == true
+      assert request.options[:json][:top_logprobs] == 3
+    end
+
+    test "warns and ignores logprobs options on Responses API requests" do
+      {:ok, model} = ReqLLM.model("azure:gpt-4o")
+      {{:ok, request}, log} = with_log(fn -> prepare_chat_with_logprobs(model) end)
+
+      assert log =~ "openai_logprobs"
+      assert log =~ "Chat Completions"
+      assert log =~ "logprobs will be ignored"
+
+      for key <- [:logprobs, "logprobs", :top_logprobs, "top_logprobs"] do
+        refute Map.has_key?(request.options[:json], key)
+      end
+
+      assert URI.to_string(request.url) =~ "/responses"
     end
 
     test "preserves custom finch from req_http_options" do
@@ -537,6 +563,54 @@ defmodule ReqLLM.Providers.AzureTest do
 
       assert schema.schema[:include][:type] == {:list, :string}
     end
+
+    test "Responses API reasoning and chaining options are accepted" do
+      {:ok, model} = ReqLLM.model("azure:gpt-5.4")
+
+      opts = [
+        base_url: "https://my-resource.openai.azure.com/openai",
+        deployment: "gpt-5-4",
+        context: ReqLLM.Context.new([ReqLLM.Context.user("Hello")]),
+        provider_options: [
+          reasoning_summary: :auto,
+          reasoning_context: :current_turn,
+          context_management: [%{type: "compaction", compact_threshold: 1000}],
+          store: false,
+          previous_response_id: "resp_1",
+          prompt_cache_key: "cache-1"
+        ]
+      ]
+
+      assert {:ok, processed} = ReqLLM.Provider.Options.process(Azure, :chat, model, opts)
+      assert processed[:provider_options][:reasoning_summary] == :auto
+      assert processed[:provider_options][:reasoning_context] == :current_turn
+      assert processed[:provider_options][:previous_response_id] == "resp_1"
+    end
+
+    test "top-level reasoning_summary is hoisted into provider_options" do
+      {:ok, model} = ReqLLM.model("azure:gpt-5.4")
+
+      opts = [
+        base_url: "https://my-resource.openai.azure.com/openai",
+        context: ReqLLM.Context.new([ReqLLM.Context.user("Hello")]),
+        reasoning_summary: "detailed"
+      ]
+
+      assert {:ok, processed} = ReqLLM.Provider.Options.process(Azure, :chat, model, opts)
+      assert processed[:provider_options][:reasoning_summary] == "detailed"
+    end
+
+    test "rejects invalid reasoning_context values" do
+      {:ok, model} = ReqLLM.model("azure:gpt-5.4")
+
+      opts = [
+        base_url: "https://my-resource.openai.azure.com/openai",
+        context: ReqLLM.Context.new([ReqLLM.Context.user("Hello")]),
+        provider_options: [reasoning_context: :sometimes]
+      ]
+
+      assert {:error, _} = ReqLLM.Provider.Options.process(Azure, :chat, model, opts)
+    end
   end
 
   describe "translate_options/3" do
@@ -867,6 +941,80 @@ defmodule ReqLLM.Providers.AzureTest do
       refute Map.has_key?(body, "reasoning")
     end
 
+    test "Responses API models forward reasoning summary, context and context_management" do
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+
+      opts = [
+        stream: false,
+        reasoning_effort: :medium,
+        provider_options: [
+          reasoning_summary: :auto,
+          reasoning_context: :all_turns,
+          context_management: [%{type: "compaction", compact_threshold: 1000}],
+          store: false,
+          prompt_cache_key: "cache-1"
+        ]
+      ]
+
+      body = Azure.ResponsesAPI.format_request("gpt-5.4", context, opts)
+
+      assert body["reasoning"] == %{
+               "effort" => "medium",
+               "summary" => "auto",
+               "context" => "all_turns"
+             }
+
+      assert body["context_management"] == [
+               %{"type" => "compaction", "compact_threshold" => 1000}
+             ]
+
+      assert body["store"] == false
+      assert body["prompt_cache_key"] == "cache-1"
+    end
+
+    test "Responses API models replay Azure reasoning details" do
+      detail = %ReqLLM.Message.ReasoningDetails{
+        text: "Plan",
+        signature: "enc",
+        encrypted?: true,
+        provider: :azure,
+        format: "openai-responses-v1",
+        index: 0,
+        provider_data: %{"id" => "rs_1", "type" => "reasoning"}
+      }
+
+      context =
+        ReqLLM.Context.new([
+          %ReqLLM.Message{
+            role: :assistant,
+            content: [%ReqLLM.Message.ContentPart{type: :text, text: "Answer"}],
+            reasoning_details: [detail]
+          },
+          ReqLLM.Context.user("Next")
+        ])
+
+      body =
+        Azure.ResponsesAPI.format_request("gpt-5.4", context,
+          stream: false,
+          provider_options: [store: false]
+        )
+
+      assert [%{"type" => "reasoning", "encrypted_content" => "enc"} | _] = body["input"]
+    end
+
+    test "format_compact_request/3 encodes the compaction body" do
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+
+      body = Azure.ResponsesAPI.format_compact_request("gpt-5.4", context, provider_options: [])
+
+      assert body["model"] == "gpt-5.4"
+      assert [%{"role" => "user"}] = body["input"]
+
+      assert Azure.ResponsesAPI.format_compact_request("gpt-5.4", context,
+               provider_options: [previous_response_id: "resp_1"]
+             ) == %{"model" => "gpt-5.4", "previous_response_id" => "resp_1"}
+    end
+
     test "Responses API models forward openai_parallel_tool_calls from provider_options" do
       context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
       opts = [stream: false, provider_options: [openai_parallel_tool_calls: false]]
@@ -937,6 +1085,101 @@ defmodule ReqLLM.Providers.AzureTest do
 
       assert %Finch.Request{} = finch_request
       assert Jason.decode!(finch_request.body)["include"] == ["web_search_call.action.sources"]
+    end
+
+    test "attach_stream accepts reasoning_summary for Responses API models" do
+      model = %LLMDB.Model{
+        id: "gpt-5",
+        provider: :azure,
+        capabilities: %{chat: true},
+        extra: %{wire: %{protocol: "openai_responses"}}
+      }
+
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+
+      {:ok, finch_request} =
+        Azure.attach_stream(
+          model,
+          context,
+          [
+            api_key: "test-api-key",
+            deployment: "gpt-5",
+            base_url: "https://my-resource.openai.azure.com/openai",
+            reasoning_effort: :high,
+            provider_options: [reasoning_summary: :auto]
+          ],
+          :req_llm_finch
+        )
+
+      assert Jason.decode!(finch_request.body)["reasoning"] == %{
+               "effort" => "high",
+               "summary" => "auto"
+             }
+    end
+
+    test "prepare_request(:compact) targets the v1 GA compaction endpoint" do
+      {:ok, model} = ReqLLM.model("azure:gpt-5.4")
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+
+      {:ok, request} =
+        Azure.prepare_request(:compact, model, context,
+          api_key: "test-api-key",
+          deployment: "my-gpt-5-4",
+          base_url: "https://my-resource.openai.azure.com/openai/v1"
+        )
+
+      assert URI.to_string(request.url) == "/responses/compact"
+      assert request.options[:base_url] == "https://my-resource.openai.azure.com/openai/v1"
+      assert request.options[:json]["model"] == "my-gpt-5-4"
+      assert [%{"role" => "user"}] = request.options[:json]["input"]
+      assert Req.Request.get_private(request, :formatter) == Azure.ResponsesAPI
+      assert Req.Request.get_header(request, "api-key") == ["test-api-key"]
+    end
+
+    test "prepare_request(:compact) appends api-version on the legacy base URL" do
+      {:ok, model} = ReqLLM.model("azure:gpt-5.4")
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+
+      {:ok, request} =
+        Azure.prepare_request(:compact, model, context,
+          api_key: "test-api-key",
+          deployment: "gpt-5.4",
+          base_url: "https://my-resource.openai.azure.com/openai",
+          provider_options: [api_version: "2025-04-01-preview", previous_response_id: "resp_1"]
+        )
+
+      assert URI.to_string(request.url) == "/responses/compact?api-version=2025-04-01-preview"
+
+      assert request.options[:json] == %{
+               "model" => "gpt-5.4",
+               "previous_response_id" => "resp_1"
+             }
+    end
+
+    test "prepare_request(:compact) rejects Chat Completions and Claude models" do
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+      opts = [api_key: "k", base_url: "https://my-resource.openai.azure.com/openai"]
+
+      chat_model = %LLMDB.Model{
+        id: "gpt-4o",
+        provider: :azure,
+        capabilities: %{chat: true},
+        extra: %{wire: %{protocol: "openai_chat"}}
+      }
+
+      assert {:error, %ReqLLM.Error.Invalid.Parameter{parameter: message}} =
+               Azure.prepare_request(:compact, chat_model, context, opts)
+
+      assert message =~ "openai_responses"
+
+      claude = %LLMDB.Model{
+        id: "claude-sonnet-4-5",
+        provider: :azure,
+        capabilities: %{chat: true}
+      }
+
+      assert {:error, %ReqLLM.Error.Invalid.Parameter{}} =
+               Azure.prepare_request(:compact, claude, context, opts)
     end
 
     test "Claude reasoning models override temperature to 1.0" do
@@ -1019,8 +1262,9 @@ defmodule ReqLLM.Providers.AzureTest do
 
       body = request.options[:json]
       assert body[:thinking] == %{type: "adaptive", display: "summarized"}
-      assert body[:temperature] == 1.0
-      assert body[:max_tokens] == 4297
+      refute Map.has_key?(body, :temperature)
+      assert body[:output_config][:effort] == "high"
+      assert body[:max_tokens] == 2000
     end
 
     test "Claude adaptive-only platform models do not auto-enable thinking" do
@@ -2148,5 +2392,15 @@ defmodule ReqLLM.Providers.AzureTest do
       capabilities: %{chat: true},
       extra: %{}
     }
+  end
+
+  defp prepare_chat_with_logprobs(model) do
+    Azure.prepare_request(
+      :chat,
+      model,
+      "Hello",
+      base_url: "https://my-resource.openai.azure.com/openai",
+      provider_options: [openai_logprobs: true, openai_top_logprobs: 3]
+    )
   end
 end

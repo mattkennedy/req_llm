@@ -275,23 +275,7 @@ defmodule ReqLLM.OpenTelemetry.OTelAdapter do
   end
 
   defp ensure_instrument_table do
-    case :ets.whereis(@instrument_table) do
-      :undefined ->
-        :ets.new(@instrument_table, [
-          :named_table,
-          :public,
-          :set,
-          {:read_concurrency, true},
-          {:write_concurrency, true}
-        ])
-
-      _ ->
-        @instrument_table
-    end
-
-    :ok
-  rescue
-    ArgumentError -> :ok
+    ReqLLM.OpenTelemetry.Storage.ensure_tables()
   end
 
   defp instrument_config(record) do
@@ -475,8 +459,9 @@ defmodule ReqLLM.OpenTelemetry do
   @spec detach(term()) :: :ok
   def detach(handler_id \\ @default_handler_id) do
     ensure_span_table()
-    :ets.match_delete(@span_table, {{handler_id, :_}, :_, :_})
     :telemetry.detach(handler_id)
+    delete_spans(handler_id)
+    :ok
   end
 
   @doc """
@@ -486,6 +471,10 @@ defmodule ReqLLM.OpenTelemetry do
   (e.g. an `:erlang.send_after/3` loop or a periodic GenServer tick) to
   contain the ETS table when requests start without a matching stop or
   exception event.
+
+  A supervised storage process owns the table for the application.
+  If that owner restarts, active span records and cached instruments are cleared.
+  Terminal events for cleared spans are ignored. New requests start new spans.
   """
   @spec prune_stale_spans(term(), non_neg_integer()) :: non_neg_integer()
   def prune_stale_spans(handler_id \\ @default_handler_id, ttl_ms)
@@ -493,16 +482,7 @@ defmodule ReqLLM.OpenTelemetry do
     ensure_span_table()
     cutoff_ms = System.monotonic_time(:millisecond) - ttl_ms
 
-    @span_table
-    |> :ets.match_object({{handler_id, :_}, :_, :_})
-    |> Enum.reduce(0, fn {key, _span, inserted_at_ms}, acc ->
-      if inserted_at_ms <= cutoff_ms do
-        :ets.delete(@span_table, key)
-        acc + 1
-      else
-        acc
-      end
-    end)
+    delete_spans(handler_id, cutoff_ms)
   end
 
   @doc """
@@ -588,23 +568,7 @@ defmodule ReqLLM.OpenTelemetry do
   end
 
   defp ensure_span_table do
-    case :ets.whereis(@span_table) do
-      :undefined ->
-        :ets.new(@span_table, [
-          :named_table,
-          :public,
-          :set,
-          {:read_concurrency, true},
-          {:write_concurrency, true}
-        ])
-
-      _ ->
-        @span_table
-    end
-
-    :ok
-  rescue
-    ArgumentError -> :ok
+    ReqLLM.OpenTelemetry.Storage.ensure_tables()
   end
 
   defp span_key(config, request_id) do
@@ -612,15 +576,21 @@ defmodule ReqLLM.OpenTelemetry do
   end
 
   defp take_span(config, request_id) do
+    ensure_span_table()
     key = span_key(config, request_id)
 
-    case :ets.lookup(@span_table, key) do
+    case :ets.take(@span_table, key) do
       [{^key, span, _inserted_at}] ->
-        :ets.delete(@span_table, key)
         {:ok, span}
 
       [] ->
         :error
     end
+  end
+
+  defp delete_spans(handler_id, cutoff_ms \\ nil) do
+    guards = [{:"=:=", :"$1", {:const, handler_id}}]
+    guards = if is_nil(cutoff_ms), do: guards, else: guards ++ [{:"=<", :"$2", cutoff_ms}]
+    :ets.select_delete(@span_table, [{{{:"$1", :_}, :_, :"$2"}, guards, [true]}])
   end
 end

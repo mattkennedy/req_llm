@@ -141,6 +141,41 @@ defmodule ReqLLM.StreamResponse do
   end
 
   @doc """
+  Extract generated images from the stream response.
+
+  Returns a lazy stream of `ReqLLM.Message.ContentPart` structs of type `:image`
+  or `:image_url`, in arrival order. For `ReqLLM.stream_image/3` that is every
+  preview frame (`metadata.partial?` true, with `partial_image_index`) followed by
+  the final image (`metadata.partial?` false). Only the final image reaches
+  `to_response/1`.
+
+  Consumes the underlying chunk stream like `tokens/1`, so use one or the other.
+
+  ## Examples
+
+      {:ok, stream_response} = ReqLLM.stream_image("openai:gpt-image-1.5", "A red fox", partial_images: 2)
+
+      stream_response
+      |> ReqLLM.StreamResponse.images()
+      |> Enum.each(fn part -> render_preview(part.data, part.metadata) end)
+
+  """
+  @spec images(t()) :: Enumerable.t()
+  def images(%__MODULE__{stream: stream}) do
+    stream
+    |> Stream.filter(&image_chunk?/1)
+    |> Stream.map(& &1.content_part)
+  end
+
+  defp image_chunk?(%ReqLLM.StreamChunk{
+         type: :content_part,
+         content_part: %ReqLLM.Message.ContentPart{type: type}
+       }),
+       do: type in [:image, :image_url]
+
+  defp image_chunk?(_chunk), do: false
+
+  @doc """
   Project the one consumable chunk stream into canonical tagged events.
 
   This is a lazy view over `stream_response.stream`; it does not create or
@@ -434,11 +469,19 @@ defmodule ReqLLM.StreamResponse do
     callbacks = extract_callbacks(opts)
 
     chunks = process_stream_with_callbacks(stream_response.stream, callbacks)
-    materialize_chunks(stream_response, chunks)
+
+    stream_response
+    |> materialize_chunks(chunks)
+    |> finish_conversion(stream_response)
   rescue
-    error -> {:error, error}
+    error -> finish_conversion({:error, error}, stream_response)
   catch
-    :exit, reason -> {:error, reason}
+    :exit, reason ->
+      finish_conversion({:error, reason}, stream_response)
+
+    kind, reason ->
+      finish_conversion({:error, reason}, stream_response)
+      :erlang.raise(kind, reason, __STACKTRACE__)
   after
     MetadataHandle.stop(stream_response.metadata_handle)
   end
@@ -487,9 +530,11 @@ defmodule ReqLLM.StreamResponse do
   Blocks until the metadata collection task completes and returns the usage map
   containing token counts and cost information.
 
-  Provider-native cache reads surface as non-zero `cached_tokens`. When the
-  result came from ReqLLM's application-layer response cache instead, this
-  function returns a zeroed usage map and the materialized response includes
+  Provider-native cache reads and writes surface separately as
+  `cache_read_tokens` and `cache_write_tokens`. The `cached_tokens` and
+  `cache_creation_tokens` fields are compatibility aliases. When the result
+  came from ReqLLM's application-layer response cache instead, this function
+  returns a zeroed usage map and the materialized response includes
   `provider_meta.response_cache_hit == true`.
 
   ## Parameters
@@ -650,14 +695,36 @@ defmodule ReqLLM.StreamResponse do
   @spec to_response(t()) :: {:ok, Response.t()} | {:error, term()}
   def to_response(%__MODULE__{} = stream_response) do
     chunks = Enum.to_list(stream_response.stream)
-    materialize_chunks(stream_response, chunks)
+
+    stream_response
+    |> materialize_chunks(chunks)
+    |> finish_conversion(stream_response)
   rescue
-    error -> {:error, error}
+    error -> finish_conversion({:error, error}, stream_response)
   catch
-    :exit, reason -> {:error, reason}
+    :exit, reason ->
+      finish_conversion({:error, reason}, stream_response)
+
+    kind, reason ->
+      finish_conversion({:error, reason}, stream_response)
+      :erlang.raise(kind, reason, __STACKTRACE__)
   after
     MetadataHandle.stop(stream_response.metadata_handle)
   end
+
+  defp finish_conversion({:error, _reason} = result, stream_response) do
+    try do
+      close(stream_response)
+    rescue
+      _error -> :ok
+    catch
+      _kind, _reason -> :ok
+    end
+
+    result
+  end
+
+  defp finish_conversion(result, _stream_response), do: result
 
   defp materialize_chunks(stream_response, chunks) do
     metadata = MetadataHandle.await(stream_response.metadata_handle)

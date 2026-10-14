@@ -94,7 +94,11 @@ defmodule ReqLLM.UsageHelpersTest do
                output_tokens: 0,
                total_tokens: 0,
                input: 0,
-               output: 0
+               output: 0,
+               cache_read_tokens: 0,
+               cache_write_tokens: 0,
+               cached_tokens: 0,
+               cache_creation_tokens: 0
              }
     end
 
@@ -134,6 +138,36 @@ defmodule ReqLLM.UsageHelpersTest do
       assert merged.input_tokens == 1500
       assert merged.output_tokens == 393
       assert merged.total_tokens == 1893
+    end
+
+    test "merge keeps cache durations across missing, empty and partial updates" do
+      initial =
+        ReqLLM.Usage.normalize(%{
+          input_tokens: 100,
+          output_tokens: 0,
+          cache_creation_tokens: 30,
+          cache_write_tokens_by_ttl: %{"5m" => "10", "1h" => "20"},
+          input_includes_cached: false
+        })
+
+      merged =
+        Enum.reduce(
+          [
+            %{output_tokens: 1},
+            %{output_tokens: 2, cache_write_tokens_by_ttl: %{}},
+            %{output_tokens: 3, cache_write_tokens_by_ttl: %{"5m" => "9"}}
+          ],
+          initial,
+          fn update, usage ->
+            normalized = ReqLLM.Usage.normalize(Map.put(update, :input_includes_cached, false))
+            ReqLLM.Usage.merge(usage, normalized)
+          end
+        )
+
+      assert merged.cache_write_tokens_by_ttl == %{"5m" => 10, "1h" => 20}
+      assert merged.cache_write_tokens == 30
+      assert merged.output_tokens == 3
+      assert merged.billing_usage_complete
     end
 
     test "merge handles cumulative usage from later events" do
@@ -224,6 +258,17 @@ defmodule ReqLLM.UsageHelpersTest do
       assert merged.input_tokens == 8
       assert merged.output_tokens == 4
       assert merged.total_tokens == 12
+    end
+
+    test "merge keeps the largest numeric compute unit count" do
+      merged =
+        ReqLLM.Usage.merge(
+          %{compute_units: "2", billing_usage_complete: false},
+          %{compute_units: 5, billing_usage_complete: false}
+        )
+
+      assert merged.compute_units == 5
+      refute merged.billing_usage_complete
     end
 
     test "callers can add usage from separate model calls" do

@@ -14,39 +14,55 @@ defmodule ReqLLM.Usage.Normalize do
   @spec normalize(map()) :: map()
   def normalize(usage) when is_map(usage) do
     input_includes_cached = detect_input_includes_cached(usage)
+    compute_units = MapAccess.get_raw(usage, :compute_units)
 
     input =
-      (first_present(usage, [
-         :input,
-         "input",
-         :prompt_tokens,
-         "prompt_tokens",
-         :input_tokens,
-         "input_tokens"
-       ]) || 0)
-      |> normalize_counter()
+      first_present(usage, [
+        :input,
+        "input",
+        :prompt_tokens,
+        "prompt_tokens",
+        :input_tokens,
+        "input_tokens"
+      ])
+      |> normalize_token_counter()
 
     output =
-      (first_present(usage, [
-         :output,
-         "output",
-         :completion_tokens,
-         "completion_tokens",
-         :output_tokens,
-         "output_tokens"
-       ]) || 0)
-      |> normalize_counter()
+      first_present(usage, [
+        :output,
+        "output",
+        :completion_tokens,
+        "completion_tokens",
+        :output_tokens,
+        "output_tokens"
+      ])
+      |> normalize_token_counter()
 
     reasoning =
-      (first_present(usage, [:reasoning, "reasoning", :reasoning_tokens, "reasoning_tokens"]) ||
-         get_reasoning_tokens(usage))
-      |> normalize_counter()
+      case first_present(usage, [:reasoning, "reasoning", :reasoning_tokens, "reasoning_tokens"]) do
+        nil -> get_reasoning_tokens(usage)
+        value -> normalize_counter(value)
+      end
 
     cached_input = get_cached_input_tokens(usage, input, input_includes_cached)
     cache_creation = get_cache_creation_tokens(usage, input, input_includes_cached)
+    cache_write_tokens_by_ttl = cache_write_groups(usage)
     total_tokens = total_tokens_from_usage(usage, input, output)
 
-    %{
+    canonical = %{
+      billing_usage_complete:
+        MapAccess.get_raw(usage, :billing_usage_complete) in [nil, true] and
+          valid_token_count?(input) and valid_token_count?(output) and
+          valid_token_count?(reasoning) and
+          compute_units_billable?(compute_units) and
+          usage_reported_valid?(MapAccess.get_raw(usage, :usage_reported)) and
+          boolean_fact_valid?(MapAccess.get_raw(usage, :input_includes_cached)) and
+          boolean_fact_valid?(MapAccess.get_raw(usage, :add_reasoning_to_cost)) and
+          cache_write_groups_valid?(cache_write_tokens_by_ttl, usage) and
+          cache_counts_consistent?(usage, input, input_includes_cached) and
+          Tool.valid_usage?(MapAccess.get_raw(usage, :tool_usage)) and
+          Image.valid_usage?(MapAccess.get_raw(usage, :image_usage)),
+      usage_reported: normalize_usage_reported(usage),
       input: input,
       output: output,
       reasoning: reasoning,
@@ -59,14 +75,130 @@ defmodule ReqLLM.Usage.Normalize do
       input_tokens: input,
       output_tokens: output,
       total_tokens: total_tokens,
+      cache_read_tokens: cached_input,
+      cache_write_tokens: cache_creation,
       cached_tokens: cached_input,
       cache_creation_tokens: cache_creation,
+      cache_write_tokens_by_ttl: cache_write_tokens_by_ttl,
       reasoning_tokens: reasoning
     }
+
+    retained =
+      usage
+      |> Map.take([
+        :cache_storage_token_hours,
+        "cache_storage_token_hours",
+        :input_tokens_details,
+        "input_tokens_details",
+        :output_tokens_details,
+        "output_tokens_details"
+      ])
+      |> Map.merge(canonical)
+
+    if is_nil(compute_units) do
+      retained
+    else
+      Map.put(retained, :compute_units, normalize_counter(compute_units))
+    end
+  end
+
+  defp compute_units_billable?(nil), do: true
+
+  defp compute_units_billable?(value) do
+    normalize_counter(value) === 0
+  end
+
+  defp detail_count(usage, field, key) do
+    case MapAccess.get(usage, field) do
+      details when is_map(details) -> Map.get(details, key, Map.get(details, Atom.to_string(key)))
+      _ -> nil
+    end
   end
 
   defp first_present(usage, keys) do
-    Enum.find_value(keys, fn key -> MapAccess.get(usage, key) end)
+    keys
+    |> Enum.map(&MapAccess.get_raw(usage, &1))
+    |> Enum.find(&(not is_nil(&1)))
+  end
+
+  defp normalize_token_counter(nil), do: 0
+  defp normalize_token_counter(value), do: normalize_counter(value)
+
+  defp reported?(usage, keys) do
+    Enum.any?(keys, &(not is_nil(MapAccess.get_raw(usage, &1))))
+  end
+
+  defp normalize_usage_reported(usage) do
+    reported = MapAccess.get_raw(usage, :usage_reported)
+
+    if usage_reported_valid?(reported) do
+      %{
+        input:
+          MapAccess.get_raw(
+            reported,
+            :input,
+            reported?(usage, [:input, :prompt_tokens, :input_tokens, :promptTokenCount])
+          ),
+        output:
+          MapAccess.get_raw(
+            reported,
+            :output,
+            reported?(usage, [:output, :completion_tokens, :output_tokens, :candidatesTokenCount])
+          )
+      }
+    else
+      %{input: false, output: false}
+    end
+  end
+
+  defp usage_reported_valid?(nil), do: true
+
+  defp usage_reported_valid?(reported) when is_map(reported) do
+    Enum.all?([:input, :output], fn key ->
+      MapAccess.get_raw(reported, key, false) in [true, false]
+    end)
+  end
+
+  defp usage_reported_valid?(_reported), do: false
+
+  defp boolean_fact_valid?(value), do: value in [nil, true, false]
+
+  defp valid_token_count?(value), do: is_integer(value) and value >= 0
+
+  defp cache_counts_consistent?(usage, input, includes_cached) do
+    read = raw_cache_read(usage)
+    write = raw_cache_write(usage)
+
+    with {:ok, read_count} <- raw_count(read),
+         {:ok, write_count} <- raw_cache_write_count(write),
+         true <- not includes_cached or not is_number(input) or read_count + write_count <= input do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp raw_cache_write_count(groups) when is_map(groups) do
+    Enum.reduce_while(groups, {:ok, 0}, fn {_key, value}, {:ok, total} ->
+      case raw_count(value) do
+        {:ok, count} -> {:cont, {:ok, total + count}}
+        :error -> {:halt, :error}
+      end
+    end)
+  end
+
+  defp raw_cache_write_count(value), do: raw_count(value)
+
+  defp raw_count(nil), do: {:ok, 0}
+
+  defp raw_count(value) do
+    case safe_to_number(value) do
+      {:ok, count} when count >= 0 and (not is_float(value) or value == count) ->
+        {:ok, count}
+
+      _ ->
+        :error
+    end
   end
 
   @doc false
@@ -99,17 +231,15 @@ defmodule ReqLLM.Usage.Normalize do
 
   defp detect_input_includes_cached(usage) do
     case Map.get(usage, :input_includes_cached, Map.get(usage, "input_includes_cached")) do
-      flag when is_boolean(flag) -> flag
-      _ -> detect_input_includes_cached_from_format(usage)
+      nil -> detect_input_includes_cached_from_format(usage)
+      flag -> flag
     end
   end
 
   defp detect_input_includes_cached_from_format(usage) do
     has_openai_format =
-      get_in(usage, ["prompt_tokens_details", "cached_tokens"]) != nil or
-        get_in(usage, [:prompt_tokens_details, :cached_tokens]) != nil or
-        get_in(usage, ["input_tokens_details", "cached_tokens"]) != nil or
-        get_in(usage, [:input_tokens_details, :cached_tokens]) != nil
+      detail_count(usage, :prompt_tokens_details, :cached_tokens) != nil or
+        detail_count(usage, :input_tokens_details, :cached_tokens) != nil
 
     has_anthropic_format =
       Map.has_key?(usage, "cache_read_input_tokens") or
@@ -133,9 +263,10 @@ defmodule ReqLLM.Usage.Normalize do
   end
 
   defp get_add_reasoning_to_cost(usage) do
-    MapAccess.get(usage, :add_reasoning_to_cost) ||
-      MapAccess.get(usage, "add_reasoning_to_cost") ||
-      google_gemini_format?(usage)
+    case MapAccess.get_raw(usage, :add_reasoning_to_cost) do
+      nil -> google_gemini_format?(usage)
+      value -> value
+    end
   end
 
   defp resolve_tool_usage(usage) do
@@ -177,12 +308,9 @@ defmodule ReqLLM.Usage.Normalize do
 
   defp get_reasoning_tokens(usage) do
     reasoning =
-      get_in(usage, ["completion_tokens_details", "reasoning_tokens"]) ||
-        get_in(usage, [:completion_tokens_details, :reasoning_tokens]) ||
-        get_in(usage, ["output_tokens_details", "reasoning_tokens"]) ||
-        get_in(usage, [:output_tokens_details, :reasoning_tokens]) ||
-        get_in(usage, ["output_tokens_details", "thinking_tokens"]) ||
-        get_in(usage, [:output_tokens_details, :thinking_tokens]) ||
+      detail_count(usage, :completion_tokens_details, :reasoning_tokens) ||
+        detail_count(usage, :output_tokens_details, :reasoning_tokens) ||
+        detail_count(usage, :output_tokens_details, :thinking_tokens) ||
         MapAccess.get(usage, "reasoning_tokens") ||
         MapAccess.get(usage, :reasoning_tokens) ||
         MapAccess.get(usage, "reasoning_output_tokens") ||
@@ -195,21 +323,7 @@ defmodule ReqLLM.Usage.Normalize do
   end
 
   defp get_cached_input_tokens(usage, input, input_includes_cached) do
-    cached =
-      MapAccess.get(usage, :cache_read_input_tokens) ||
-        MapAccess.get(usage, "cache_read_input_tokens") ||
-        MapAccess.get(usage, :cacheReadInputTokens) ||
-        MapAccess.get(usage, "cacheReadInputTokens") ||
-        MapAccess.get(usage, :cacheReadInputTokenCount) ||
-        MapAccess.get(usage, "cacheReadInputTokenCount") ||
-        MapAccess.get(usage, :cached_input) ||
-        MapAccess.get(usage, "cached_input") ||
-        MapAccess.get(usage, :cached_tokens) ||
-        MapAccess.get(usage, "cached_tokens") ||
-        get_in(usage, ["prompt_tokens_details", "cached_tokens"]) ||
-        get_in(usage, [:prompt_tokens_details, :cached_tokens]) ||
-        get_in(usage, ["input_tokens_details", "cached_tokens"]) ||
-        get_in(usage, [:input_tokens_details, :cached_tokens])
+    cached = raw_cache_read(usage)
 
     if input_includes_cached do
       clamp_tokens(cached, input)
@@ -219,22 +333,13 @@ defmodule ReqLLM.Usage.Normalize do
   end
 
   defp get_cache_creation_tokens(usage, input, input_includes_cached) do
+    creation = raw_cache_write(usage)
+
     creation =
-      MapAccess.get(usage, :cache_creation_tokens) ||
-        MapAccess.get(usage, :cache_creation) ||
-        MapAccess.get(usage, :cache_write_tokens) ||
-        MapAccess.get(usage, :cache_creation_input_tokens) ||
-        MapAccess.get(usage, "cache_creation_input_tokens") ||
-        MapAccess.get(usage, :cacheWriteInputTokens) ||
-        MapAccess.get(usage, "cacheWriteInputTokens") ||
-        MapAccess.get(usage, :cacheWriteInputTokenCount) ||
-        MapAccess.get(usage, "cacheWriteInputTokenCount") ||
-        MapAccess.get(usage, :cache_write_input_tokens) ||
-        MapAccess.get(usage, "cache_write_input_tokens") ||
-        get_in(usage, ["prompt_tokens_details", "cache_write_tokens"]) ||
-        get_in(usage, [:prompt_tokens_details, :cache_write_tokens]) ||
-        get_in(usage, ["input_tokens_details", "cache_write_tokens"]) ||
-        get_in(usage, [:input_tokens_details, :cache_write_tokens])
+      case creation do
+        %{} = groups -> groups |> Map.values() |> Enum.map(&safe_to_int/1) |> Enum.sum()
+        value -> value
+      end
 
     if input_includes_cached do
       clamp_tokens(creation, input)
@@ -242,6 +347,94 @@ defmodule ReqLLM.Usage.Normalize do
       safe_to_int(creation)
     end
   end
+
+  defp raw_cache_read(usage) do
+    raw_cache_field(
+      usage,
+      [
+        :cache_read_tokens,
+        :cache_read_input_tokens,
+        :cacheReadInputTokens,
+        :cacheReadInputTokenCount,
+        :cached_input,
+        :cached_tokens
+      ],
+      :cached_tokens
+    )
+  end
+
+  defp raw_cache_write(usage) do
+    raw_cache_field(
+      usage,
+      [
+        :cache_write_tokens,
+        :cache_creation_tokens,
+        :cache_creation_input_tokens,
+        :cache_creation,
+        :cacheWriteInputTokens,
+        :cacheWriteInputTokenCount,
+        :cache_write_input_tokens
+      ],
+      :cache_write_tokens
+    )
+  end
+
+  defp raw_cache_field(usage, aliases, detail_key) do
+    values = Enum.map(aliases, &MapAccess.get_raw(usage, &1))
+
+    details =
+      Enum.map([:prompt_tokens_details, :input_tokens_details], fn field ->
+        usage |> MapAccess.get_raw(field) |> MapAccess.get_raw(detail_key)
+      end)
+
+    Enum.find(values ++ details, &(not is_nil(&1)))
+  end
+
+  defp cache_write_groups(usage) do
+    case MapAccess.get_raw(usage, :cache_write_tokens_by_ttl) do
+      nil ->
+        case MapAccess.get_raw(usage, :cache_creation) do
+          groups when is_map(groups) -> normalize_cache_write_groups(groups)
+          _ -> nil
+        end
+
+      groups when is_map(groups) ->
+        normalize_cache_write_groups(groups)
+
+      invalid ->
+        invalid
+    end
+  end
+
+  defp normalize_cache_write_groups(groups) do
+    Map.new(groups, fn {ttl, count} ->
+      {cache_ttl_key(ttl), normalize_counter(count)}
+    end)
+  end
+
+  defp cache_ttl_key(key) when key in [:ephemeral_5m_input_tokens, "ephemeral_5m_input_tokens"],
+    do: "5m"
+
+  defp cache_ttl_key(key) when key in [:ephemeral_1h_input_tokens, "ephemeral_1h_input_tokens"],
+    do: "1h"
+
+  defp cache_ttl_key(key) when is_atom(key), do: Atom.to_string(key)
+  defp cache_ttl_key(key), do: key
+
+  defp cache_write_groups_valid?(nil, _usage), do: true
+
+  defp cache_write_groups_valid?(groups, usage) when is_map(groups) do
+    source =
+      MapAccess.get_raw(usage, :cache_write_tokens_by_ttl) ||
+        MapAccess.get_raw(usage, :cache_creation)
+
+    map_size(groups) == map_size(source) and
+      Enum.all?(groups, fn {ttl, count} ->
+        is_binary(ttl) and is_integer(count) and count >= 0
+      end)
+  end
+
+  defp cache_write_groups_valid?(_, _usage), do: false
 
   defp safe_to_int(nil), do: 0
   defp safe_to_int(n) when is_integer(n), do: max(n, 0)

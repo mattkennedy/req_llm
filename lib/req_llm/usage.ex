@@ -15,12 +15,15 @@ defmodule ReqLLM.Usage do
     :total_tokens,
     :input,
     :output,
+    :cache_read_tokens,
+    :cache_write_tokens,
     :cached_tokens,
     :reasoning_tokens,
     :cache_creation_tokens,
     :reasoning,
     :cached_input,
-    :cache_creation
+    :cache_creation,
+    :compute_units
   ]
 
   @zero_usage %{
@@ -29,6 +32,8 @@ defmodule ReqLLM.Usage do
     total_tokens: 0,
     input: 0,
     output: 0,
+    cache_read_tokens: 0,
+    cache_write_tokens: 0,
     cached_tokens: 0,
     reasoning_tokens: 0,
     cache_creation_tokens: 0
@@ -45,6 +50,12 @@ defmodule ReqLLM.Usage do
   Also guarantees compatibility aliases:
   - `:input`
   - `:output`
+  - `:cached_tokens` for `:cache_read_tokens`
+  - `:cache_creation_tokens` for `:cache_write_tokens`
+
+  Prompt cache reads and writes are available as separate counters:
+  - `:cache_read_tokens`
+  - `:cache_write_tokens`
 
   Canonical counters accept numbers and base-10 integer strings. Malformed
   component counters remain visible instead of becoming zero. A malformed
@@ -55,10 +66,8 @@ defmodule ReqLLM.Usage do
   def normalize(usage) when is_map(usage) do
     normalized = Normalize.normalize(usage)
 
-    input_tokens = MapAccess.get(normalized, :input_tokens) || MapAccess.get(normalized, :input)
-
-    output_tokens =
-      MapAccess.get(normalized, :output_tokens) || MapAccess.get(normalized, :output)
+    input_tokens = Map.fetch!(normalized, :input_tokens)
+    output_tokens = Map.fetch!(normalized, :output_tokens)
 
     total_tokens =
       case MapAccess.get(normalized, :total_tokens) do
@@ -75,7 +84,17 @@ defmodule ReqLLM.Usage do
   end
 
   def normalize(_) do
-    Map.take(@zero_usage, [:input_tokens, :output_tokens, :total_tokens, :input, :output])
+    Map.take(@zero_usage, [
+      :input_tokens,
+      :output_tokens,
+      :total_tokens,
+      :input,
+      :output,
+      :cache_read_tokens,
+      :cache_write_tokens,
+      :cached_tokens,
+      :cache_creation_tokens
+    ])
   end
 
   @doc """
@@ -127,8 +146,15 @@ defmodule ReqLLM.Usage do
 
   defp normalize_counter_values(usage) do
     Map.new(usage, fn
-      {key, value} when key in @counter_keys -> {key, Normalize.normalize_counter(value)}
-      entry -> entry
+      {key, value} when key in @counter_keys ->
+        {key, Normalize.normalize_counter(value)}
+
+      {:cache_write_tokens_by_ttl, groups} when is_map(groups) ->
+        {:cache_write_tokens_by_ttl,
+         Map.new(groups, fn {ttl, count} -> {ttl, Normalize.normalize_counter(count)} end)}
+
+      entry ->
+        entry
     end)
   end
 
@@ -141,6 +167,26 @@ defmodule ReqLLM.Usage do
       true -> incoming
     end
   end
+
+  defp merge_value(:usage_reported, existing, incoming) do
+    Map.merge(existing, incoming, fn _key, old, new -> old or new end)
+  end
+
+  defp merge_value(:billing_usage_complete, existing, incoming) do
+    existing and incoming
+  end
+
+  defp merge_value(:cache_write_tokens_by_ttl, existing, incoming)
+       when is_map(existing) and is_map(incoming) do
+    Map.merge(existing, incoming, fn
+      _key, old, new when is_number(old) and is_number(new) -> max(old, new)
+      _key, old, nil -> old
+      _key, _old, new -> new
+    end)
+  end
+
+  defp merge_value(:cache_write_tokens_by_ttl, existing, nil) when is_map(existing),
+    do: existing
 
   defp merge_value(_key, existing, incoming) do
     if is_number(existing) and is_number(incoming), do: max(existing, incoming), else: incoming

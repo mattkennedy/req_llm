@@ -81,6 +81,7 @@ defmodule ReqLLM.StreamServer do
   defstruct [
     :provider_mod,
     :model,
+    :pricing_context,
     :http_task,
     :fixture_path,
     :fixture_backend,
@@ -89,11 +90,13 @@ defmodule ReqLLM.StreamServer do
     :protocol_parser,
     :protocol_state,
     :provider_state,
+    :transport_cancel,
     :telemetry,
     :pending_http_exit,
     pending_http_events: [],
     pending_retry_events: [],
     telemetry_pending?: false,
+    canonical_stream?: false,
     queue: :queue.new(),
     status: :init,
     consumer_refs: MapSet.new(),
@@ -159,14 +162,17 @@ defmodule ReqLLM.StreamServer do
     model = Keyword.fetch!(opts, :model)
     high_watermark = validate_high_watermark!(Keyword.get(opts, :high_watermark, 500))
 
+    canonical_stream? = Keyword.get(opts, :canonical_stream?, false)
+
     provider_state =
-      if function_exported?(provider_mod, :init_stream_state, 1) do
+      if not canonical_stream? and function_exported?(provider_mod, :init_stream_state, 1) do
         provider_mod.init_stream_state(model)
       end
 
     state = %__MODULE__{
       provider_mod: provider_mod,
       model: model,
+      pricing_context: Keyword.get(opts, :pricing_context),
       protocol_parser: Keyword.get(opts, :protocol_parser),
       provider_state: provider_state,
       fixture_path: Keyword.get(opts, :fixture_path),
@@ -181,7 +187,8 @@ defmodule ReqLLM.StreamServer do
       total_timeout_deadline:
         Keyword.get(opts, :total_timeout_deadline, Keyword.get(opts, :total_timeout, :infinity)),
       stream_idle_timeout: Keyword.get(opts, :stream_idle_timeout),
-      high_watermark: high_watermark
+      high_watermark: high_watermark,
+      canonical_stream?: canonical_stream?
     }
 
     GenServer.start_link(__MODULE__, state, opts)
@@ -295,6 +302,17 @@ defmodule ReqLLM.StreamServer do
     )
   end
 
+  @doc false
+  @spec start_in_process(server(), module(), LLMDB.Model.t(), ReqLLM.Context.t(), keyword()) ::
+          {:ok, pid(), nil, map()} | {:error, term()}
+  def start_in_process(server, provider_mod, model, context, opts) do
+    GenServer.call(
+      server,
+      {:start_in_process, provider_mod, model, context, opts},
+      :infinity
+    )
+  end
+
   @doc """
   Attach an HTTP task to the server for monitoring.
 
@@ -339,6 +357,12 @@ defmodule ReqLLM.StreamServer do
   @spec http_event(server(), term()) :: :ok
   def http_event(server, event) do
     GenServer.call(server, {:http_event, event}, :infinity)
+  end
+
+  @doc false
+  @spec in_process_event(server(), term()) :: :ok
+  def in_process_event(server, event) do
+    GenServer.call(server, {:http_event, normalize_in_process_event(event)}, :infinity)
   end
 
   @doc """
@@ -533,6 +557,41 @@ defmodule ReqLLM.StreamServer do
         }
 
         {:reply, {:ok, task_pid, http_context, canonical_json}, new_state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  @impl GenServer
+  def handle_call({:start_in_process, provider_mod, model, context, opts}, _from, state) do
+    defer_events? = Keyword.get(opts, :defer_http_events_until_telemetry?, false)
+    streamer_opts = Keyword.delete(opts, :defer_http_events_until_telemetry?)
+
+    case ReqLLM.Streaming.InProcessClient.start_stream(
+           provider_mod,
+           model,
+           context,
+           streamer_opts,
+           self()
+         ) do
+      {:ok, task_pid, cancel} ->
+        Process.monitor(task_pid)
+
+        new_state = %{
+          state
+          | http_task: task_pid,
+            transport_cancel: cancel,
+            status: :streaming,
+            http_context: nil,
+            canonical_json: %{},
+            object_json_mode?: false,
+            object_acc: [],
+            pending_http_events: [],
+            telemetry_pending?: defer_events?
+        }
+
+        {:reply, {:ok, task_pid, nil, %{}}, new_state}
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
@@ -766,6 +825,10 @@ defmodule ReqLLM.StreamServer do
     active_stream?(state) and backpressure_saturated?(state)
   end
 
+  defp backpressure_required?({:canonical_chunk, _chunk}, state) do
+    active_stream?(state) and backpressure_saturated?(state)
+  end
+
   defp backpressure_required?(_event, _state), do: false
 
   defp active_stream?(%{status: :done}), do: false
@@ -892,6 +955,36 @@ defmodule ReqLLM.StreamServer do
     else
       process_data_chunk(chunk, state)
     end
+  end
+
+  defp process_http_event({:canonical_chunk, %StreamChunk{} = chunk}, state) do
+    chunks = [chunk]
+
+    new_state =
+      state
+      |> then(&enqueue_chunks(chunks, &1))
+      |> reset_metadata_waiter_timeouts(chunks)
+      |> reset_stream_idle_timeout(chunks)
+
+    new_state =
+      if terminal_chunk?(chunk) do
+        finalize_stream_with_fixture(%{new_state | terminated?: true})
+      else
+        new_state
+      end
+
+    {:reply, :ok, reply_to_waiting_callers(new_state)}
+  end
+
+  defp process_http_event({:canonical_chunk, value}, state) do
+    reason = {:invalid_in_process_stream_item, value}
+
+    new_state =
+      state
+      |> finalize_failed_stream(reason)
+      |> reply_to_waiting_callers()
+
+    {:reply, :ok, new_state}
   end
 
   defp process_http_event(:done, %{http_status: status} = state)
@@ -1094,6 +1187,55 @@ defmodule ReqLLM.StreamServer do
 
   defp terminal_chunk?(_chunk), do: false
 
+  defp price_stream_usage(%{usage: usage} = metadata, state) do
+    context =
+      if state.model.provider == :openai do
+        url = state.http_context && state.http_context.url
+
+        ReqLLM.PricingContext.from_openai(
+          url,
+          Map.get(metadata, :provider_meta),
+          state.pricing_context
+        )
+      else
+        state.pricing_context
+      end
+
+    Map.put(
+      metadata,
+      :usage,
+      ReqLLM.Usage.Cost.apply(usage, state.model, pricing_context: context)
+    )
+  end
+
+  defp price_stream_usage(metadata, _state), do: metadata
+
+  defp provider_metadata(metadata) do
+    case ReqLLM.MapAccess.get_raw(metadata, :provider_meta) do
+      provider_meta when is_map(provider_meta) -> provider_meta
+      _ -> %{}
+    end
+  end
+
+  defp returned_service_tier?(provider_meta) do
+    Map.has_key?(provider_meta, :service_tier) or Map.has_key?(provider_meta, "service_tier")
+  end
+
+  defp merge_provider_metadata(existing, incoming) do
+    if returned_service_tier?(incoming) do
+      existing = Map.drop(existing, [:service_tier, "service_tier"])
+
+      incoming =
+        if Map.has_key?(incoming, :service_tier),
+          do: Map.delete(incoming, "service_tier"),
+          else: incoming
+
+      Map.merge(existing, incoming)
+    else
+      Map.merge(existing, incoming)
+    end
+  end
+
   defp enqueue_chunks(chunks, state) do
     {new_queue, updated_metadata, new_obj_acc, telemetry, message_acc, builtin_timing} =
       Enum.reduce(
@@ -1116,26 +1258,48 @@ defmodule ReqLLM.StreamServer do
 
                 usage = Map.get(chunk_meta, :usage)
 
-                meta_with_usage =
-                  if usage do
-                    normalized_usage = normalize_streaming_usage(usage, state.model)
+                merged_metadata =
+                  Map.merge(
+                    metadata,
+                    Map.drop(chunk_meta, [
+                      :usage,
+                      "usage",
+                      :builtin_tool_started,
+                      "builtin_tool_started"
+                    ])
+                  )
 
-                    Map.update(metadata, :usage, normalized_usage, fn existing ->
-                      ReqLLM.Usage.merge(existing, normalized_usage)
-                    end)
+                merged_metadata =
+                  if state.model.provider == :openai do
+                    provider_meta =
+                      merge_provider_metadata(
+                        provider_metadata(metadata),
+                        provider_metadata(chunk_meta)
+                      )
+
+                    merged_metadata
+                    |> Map.delete("provider_meta")
+                    |> Map.put(:provider_meta, provider_meta)
                   else
-                    metadata
+                    merged_metadata
                   end
 
-                Map.merge(
-                  meta_with_usage,
-                  Map.drop(chunk_meta, [
-                    :usage,
-                    "usage",
-                    :builtin_tool_started,
-                    "builtin_tool_started"
-                  ])
-                )
+                if usage do
+                  normalized_usage = ReqLLM.Usage.normalize(usage)
+
+                  merged_metadata
+                  |> Map.update(:usage, normalized_usage, fn existing ->
+                    ReqLLM.Usage.merge(existing, normalized_usage)
+                  end)
+                  |> price_stream_usage(state)
+                else
+                  if state.model.provider == :openai and
+                       returned_service_tier?(provider_metadata(chunk_meta)) do
+                    price_stream_usage(merged_metadata, state)
+                  else
+                    merged_metadata
+                  end
+                end
 
               _ ->
                 metadata
@@ -1263,7 +1427,7 @@ defmodule ReqLLM.StreamServer do
   end
 
   defp finalize_stream(state) do
-    state = state |> flush_protocol_state() |> flush_provider_state()
+    state = flush_stream_state(state)
 
     extra_flush_chunks =
       if state.object_json_mode? do
@@ -1307,7 +1471,7 @@ defmodule ReqLLM.StreamServer do
   defp finalize_cancelled_stream(%{status: {:error, _reason}} = state), do: state
 
   defp finalize_cancelled_stream(state) do
-    state = state |> flush_protocol_state() |> flush_provider_state()
+    state = flush_stream_state(state)
 
     metadata =
       state
@@ -1333,6 +1497,12 @@ defmodule ReqLLM.StreamServer do
     state
     |> Map.put(:provider_state, new_provider_state)
     |> then(&enqueue_chunks(flush_chunks, &1))
+  end
+
+  defp flush_stream_state(%{canonical_stream?: true} = state), do: state
+
+  defp flush_stream_state(state) do
+    state |> flush_protocol_state() |> flush_provider_state()
   end
 
   defp flush_protocol_state(state) do
@@ -1591,15 +1761,33 @@ defmodule ReqLLM.StreamServer do
   end
 
   defp cleanup_resources(state) do
-    state = state |> release_http_event_callers() |> cancel_timeout_budgets()
+    {transport_cancel, state} =
+      state
+      |> release_http_event_callers()
+      |> cancel_timeout_budgets()
+      |> pop_transport_cancel()
 
     # Kill HTTP task if running
     if state.http_task && Process.alive?(state.http_task) do
       Process.exit(state.http_task, :cancelled)
     end
 
+    ReqLLM.Streaming.InProcessClient.cancel_stream(transport_cancel)
     cancel_completion_cleanup(state)
   end
+
+  defp pop_transport_cancel(%{transport_cancel: nil} = state), do: {nil, state}
+
+  defp pop_transport_cancel(%{transport_cancel: cancel} = state) do
+    callback = if transport_cancel_required?(state), do: cancel
+    {callback, %{state | transport_cancel: nil}}
+  end
+
+  defp transport_cancel_required?(%{status: :done, metadata: metadata}) do
+    Map.get(metadata, :finish_reason) == :cancelled
+  end
+
+  defp transport_cancel_required?(_state), do: true
 
   defp handle_timeout_budget(state, kind, timeout) do
     error = ReqLLM.TimeoutBudget.error(kind, timeout)
@@ -1735,16 +1923,6 @@ defmodule ReqLLM.StreamServer do
     Failure.api_error(status, chunk, headers)
   end
 
-  # Normalize streaming usage data from provider format to ReqLLM format
-  # This mirrors the logic in ReqLLM.Step.Usage.fallback_extract_usage/1
-  defp normalize_streaming_usage(usage, model) when is_map(usage) do
-    usage
-    |> ReqLLM.Usage.normalize()
-    |> ReqLLM.Usage.Cost.apply(model, original_usage: usage, preserve_total_cost: true)
-  end
-
-  defp normalize_streaming_usage(usage, _model), do: usage
-
   defp maybe_emit_stream_stop(%{telemetry: nil} = state, _finish_reason), do: state
 
   # Partial assistant messages are attached on stream stop only — not on
@@ -1808,4 +1986,8 @@ defmodule ReqLLM.StreamServer do
   defp normalize_telemetry_stream_finish_reason("cancelled"), do: :cancelled
   defp normalize_telemetry_stream_finish_reason("incomplete"), do: :incomplete
   defp normalize_telemetry_stream_finish_reason(finish_reason), do: finish_reason
+
+  defp normalize_in_process_event({:chunk, chunk}), do: {:canonical_chunk, chunk}
+  defp normalize_in_process_event({:error, reason}), do: {:error, reason}
+  defp normalize_in_process_event(:done), do: :done
 end

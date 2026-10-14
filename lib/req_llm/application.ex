@@ -2,8 +2,8 @@ defmodule ReqLLM.Application do
   @moduledoc false
 
   @default_stream_pool_protocols [:http1]
-  @default_stream_pool_size 1
-  @default_stream_pool_count 8
+  @default_stream_pool_size 8
+  @default_stream_pool_count 1
 
   # Application supervisor for ReqLLM.
 
@@ -39,6 +39,7 @@ defmodule ReqLLM.Application do
       [
         {Finch, finch_config},
         {Task.Supervisor, name: ReqLLM.TaskSupervisor},
+        ReqLLM.OpenTelemetry.Storage,
         ReqLLM.Providers.GoogleVertex.TokenCache
       ] ++ dev_children()
 
@@ -56,8 +57,8 @@ defmodule ReqLLM.Application do
 
       config :req_llm,
         stream_pool_protocols: [:http1],
-        stream_pool_size: 1,
-        stream_pool_count: 16
+        stream_pool_size: 32,
+        stream_pool_count: 1
 
   Advanced users can replace the full Finch configuration by setting:
 
@@ -177,7 +178,8 @@ defmodule ReqLLM.Application do
       :set,
       :public,
       :named_table,
-      read_concurrency: true
+      read_concurrency: true,
+      write_concurrency: true
     ])
   end
 

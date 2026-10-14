@@ -1,7 +1,7 @@
 defmodule ReqLLM.MixProject do
   use Mix.Project
 
-  @version "1.24.0"
+  @version "1.28.0"
   @source_url "https://github.com/agentjido/req_llm"
 
   def project do
@@ -73,6 +73,7 @@ defmodule ReqLLM.MixProject do
           "guides/amazon_bedrock.md",
           "guides/cerebras.md",
           "guides/deepseek.md",
+          "guides/stepfun.md",
           "guides/fireworks_ai.md",
           "guides/meta.md",
           "guides/github_copilot.md",
@@ -128,6 +129,7 @@ defmodule ReqLLM.MixProject do
             "guides/amazon_bedrock.md",
             "guides/cerebras.md",
             "guides/deepseek.md",
+            "guides/stepfun.md",
             "guides/fireworks_ai.md",
             "guides/meta.md",
             "guides/github_copilot.md",
@@ -202,6 +204,7 @@ defmodule ReqLLM.MixProject do
   def cli do
     [
       preferred_envs: [
+        "req_llm.billing": :test,
         coveralls: :test,
         "coveralls.detail": :test,
         "coveralls.post": :test,
@@ -228,20 +231,21 @@ defmodule ReqLLM.MixProject do
       {:jason, "~> 1.4"},
       {:dotenvy, "~> 1.1"},
       {:nimble_options, "~> 1.1"},
-      {:req, "~> 0.5"},
+      {:req, "~> 0.6"},
+      {:finch, "~> 0.22"},
       {:goth, "~> 1.4", optional: true},
       {:ex_aws_auth, "~> 1.4", optional: true},
       {:server_sent_events, "~> 1.1.0"},
       {:splode, "~> 0.3.0"},
       {:websockex, "~> 0.5.1"},
-      {:zoi, "~> 0.14"},
+      {:zoi, "~> 0.18.11"},
       {:jsv, "~> 0.11"},
-      {:llm_db, ">= 2026.9.4 and < 2027.0.0"},
+      {:llm_db, "~> 2026.10.3"},
 
       # Dev/test dependencies
       {:bandit, "~> 1.8", only: [:dev, :test], runtime: false},
       {:tidewave, "~> 0.5", only: :dev, runtime: false},
-      {:ex_doc, "~> 0.31", only: :dev, runtime: false},
+      {:ex_doc, "~> 0.40.4", only: :dev, runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:excoveralls, "~> 0.18", only: [:dev, :test], runtime: false},
@@ -282,7 +286,7 @@ defmodule ReqLLM.MixProject do
         "dialyzer"
       ],
       q: ["quality"],
-      docs: ["docs --formatter html"],
+      docs: ["docs --formatter html --formatter markdown"],
       mc: ["req_llm.model_compat"],
       llm: ["req_llm.gen"],
       "test.livebooks": ["test.livebooks"]

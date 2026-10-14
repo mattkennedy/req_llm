@@ -9,6 +9,126 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- changelog -->
 
+## [v1.28.0](https://github.com/agentjido/req_llm/compare/v1.27.0...v1.28.0) (2026-10-09)
+
+
+
+
+### Features:
+
+* add StepFun chat and audio providers (#1087) by mikehostetler
+
+* openai: honour image detail on Responses API input_image parts (#1084) by KLoevengreen
+
+### Bug Fixes:
+
+* preserve Codex reasoning across tool turns (#1090) by mikehostetler
+
+* coverage: validate catalog community providers with live LLM API fixtures (#1089) by denys-rekun
+
+* preserve streamed cache TTLs and native OpenAI billing facts (#1081) by Matthew Neel
+
+* streaming: use concrete Mint HTTP2 type (#1083) by mikehostetler
+
+* openai_codex: decode terminal stream errors (#1082) by mikehostetler
+
+* deps: update Zoi and compatible Jido dependencies by mikehostetler
+
+## [v1.27.0](https://github.com/agentjido/req_llm/compare/v1.26.0...v1.27.0) (2026-10-08)
+
+
+
+
+### Features:
+
+* azure: support Chat Completions logprobs (#1073) by Arton Ragsdale
+
+* allow Gemini 3 object output with tools (#1077) by mvanhorn
+
+* openai: support Decisions evaluations (#1075) by mikehostetler
+
+### Bug Fixes:
+
+* schema: bound validator cache memory (#1078) by mikehostetler
+
+* redact unknown provider reasoning payloads (#1070) by Wu Shuwen
+
+* close shared contract gaps from design review (#1069) by mikehostetler
+
+* openai: enforce anonymous auth and exact streaming model identity (#1065) by Justin Smestad
+
+* openai: decode Responses refusals as text with content_filter finish reason (#1064) by Nickjgniklu
+
+* http: prevent non-streaming connection pool timeouts (#1067) by mikehostetler
+
+## [v1.26.0](https://github.com/agentjido/req_llm/compare/v1.25.0...v1.26.0) (2026-09-29)
+
+
+
+
+### Features:
+
+* openai: add DevDay Responses and model support (#1063) by mikehostetler
+
+### Bug Fixes:
+
+* openai: read nested error details from Responses stream error events (#1061) by Diaphel Thompson
+
+* bedrock: send output_config.effort for adaptive-thinking Claude models (#1055) by jhlee111
+
+* streaming: honor per-request proxy connection options (#1054) by mikehostetler
+
+## [v1.25.0](https://github.com/agentjido/req_llm/compare/v1.24.0...v1.25.0) (2026-09-25)
+
+
+
+
+### Features:
+
+* Responses API reasoning summaries, reasoning.context and compaction for OpenAI and Azure (#1048) by fv-teacherspace
+
+* price conditional LLMDB tariffs from complete usage (#1046) by houllette
+
+* Image streaming support for OpenAI (#1043) by Vasilis Spilka
+
+* openai: carry assistant phase on each output text part (#1047) by Mark Ericksen
+
+* streaming: support in-process providers (#1040) by mikehostetler
+
+* Add transparent option for openai images (#1037) by Vasilis Spilka
+
+* forward OpenRouter evaluation provider options (#1038) by fschucht
+
+* router: add dynamic model router spike (#1036) by mikehostetler
+
+* streaming: carry provider response ids on streamed responses (#1023) by dankentfield-sona
+
+* generation: dispatch catalog OpenAI chat gateways from execution metadata (#1028) by mikehostetler
+
+* support OpenRouter Jev evaluation (#1027) by mikehostetler
+
+### Bug Fixes:
+
+* anthropic: report Claude Code 2.1.282 on subscription OAuth requests (#1052) by neilberkman
+
+* preserve non-strict Responses tool schemas (#1049) by mikehostetler
+
+* deps: update Mint for security advisory by mikehostetler
+
+* usage: distinguish cache reads and writes (#1035) by mikehostetler
+
+* bedrock: surface mid-stream exceptions and map all Converse stop reasons (#1033) by adriencohen
+
+* bedrock: send serviceTier on Converse and honor explicit region (#1032) by adriencohen
+
+* anthropic: replay tool search blocks in place (#1034) by mikehostetler
+
+* deepseek: map reasoning effort levels to supported values (#1025) by Matthew Neel
+
+### Performance:
+
+* context: batch message assembly (#1031) by mikehostetler
+
 ## [v1.24.0](https://github.com/agentjido/req_llm/compare/v1.23.0...v1.24.0) (2026-09-17)
 
 
